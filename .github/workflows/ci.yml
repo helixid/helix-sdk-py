@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11", "3.12"]
+    steps:
+      - name: Run actions/checkout@v4
+        uses: actions/checkout@v4
+
+      - name: Run actions/setup-python@v5
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Install with all optional extras (cli, mcp, langchain, crewai) so
+      # every subpackage -- and its tests -- actually gets exercised, not
+      # just the core SDK.
+      - name: Install package and dev dependencies
+        run: pip install -e ".[dev,all]"
+
+      # tests/test_golden_vectors.py is the cross-language parity safety
+      # net; tests/test_delegation_flow_mocked.py exercises the full
+      # delegate()/VPBuilder/wallet flow against a mocked HTTP layer;
+      # tests/test_langchain_crewai.py exercises helix_mcp/helix_langchain/
+      # helix_crewai against the real installed langchain-core and crewai
+      # packages (not mocks of them); tests/test_cli.py runs the actual
+      # `helix` command tree end-to-end via Click's CliRunner against real
+      # wallet/status-list files on disk. None of these need network
+      # access or a running helix-api instance.
+      - name: Test
+        run: pytest -v
