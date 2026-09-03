@@ -47,13 +47,10 @@ re-copy the three JSON files here too, the same way `helix-sdk-js` does.
 ## Packages in this repo
 
 - **`helix_sdk`** -- core SDK (see Quick example below).
-- **`helix_cli`** -- `helix` command-line tool for platform operators
-  (DID/wallet/status-list/VC lifecycle, fully offline except `did:hedera`
-  anchoring, which is not yet ported -- see Known gaps). Install with the
-  `cli` extra: `pip install helixid-sdk-py[cli]`.
-- **`helix_mcp`** -- Model Context Protocol integration: server-side VP
-  verification middleware and client-side VP attachment. No extra
-  dependencies beyond the core SDK.
+- **`helix_mcp_middleware`** -- Model Context Protocol integration:
+  server-side VP verification middleware and client-side VP attachment.
+  Install with the `mcp-middleware` extra:
+  `pip install helixid-sdk-py[mcp-middleware]`.
 - **`helix_langchain`** -- LangChain integration: a tool wrapper that
   injects a signed VP into every tool call, plus scope-based tool
   filtering. Install with `pip install helixid-sdk-py[langchain]`.
@@ -118,39 +115,10 @@ integration test (`tests/live/agent-delegation.live.integration.test.ts`)
 
 ## CLI
 
-The `helix` command line tool (install with `pip install helixid-sdk-py[cli]`)
-covers the same platform-operator workflows as helix-sdk-js's `cli`
-package -- entirely offline, no running `helix-api` instance required:
-
-```bash
-export HELIX_WALLET_PASSPHRASE=your-passphrase
-
-# Create a did:web issuer wallet + its initial status list
-helix did create --method web --domain example.com --wallet issuer.json
-
-# Create a did:key agent wallet
-helix did create --method key --wallet agent.json
-
-# Issue an agent credential
-helix vc issue --agent-did did:key:z6Mk... --scopes read:orders,write:orders \
-  --expires 90d --status-list status-list.json \
-  --base-url https://example.com/.well-known/helix-status-list.json \
-  --wallet issuer.json --output agent-vc.json
-
-# Revoke it
-helix revoke --vc-id <vc-id> --status-list status-list.json --wallet issuer.json
-
-# Self-issue a dev-only credential directly into an agent wallet
-helix vc self-issue --scopes read:orders --expires 24h --wallet agent.json
-
-# Inspect a wallet (never prints the private key)
-helix wallet inspect --wallet agent.json
-```
-
-`helix did create --method hedera` is not yet implemented in this Python
-CLI (the `did-hedera` package hasn't been ported -- see Known gaps) and
-fails with a clear error rather than silently producing an unanchored
-wallet.
+There is no Python CLI. Platform-operator workflows (DID/wallet/status-list/
+VC lifecycle) are covered by `helix-sdk-js`'s `cli` package -- see
+`docs/decision-cli-mcp-scope.md` in the `helixid/helixid` repo for why the
+CLI has a single canonical implementation rather than one per SDK language.
 
 ## Testing
 
@@ -159,21 +127,24 @@ pip install -e ".[dev,all]"
 pytest
 ```
 
+`pytest` always runs with coverage (`[tool.pytest.ini_options]` in
+`pyproject.toml`) and fails under 60% -- the measured baseline as of
+2026-09-03, not a target. `helix-sdk-js`/`helix-api` enforce 90%
+lines/statements, 85% branches, 90% functions; closing this gap (some
+modules, like `did.py`, currently have no direct unit tests at all) is
+real follow-up work, not something this tooling change did on its own.
+
 - `tests/test_golden_vectors.py` -- cross-language crypto parity (no network).
 - `tests/test_delegation_flow_mocked.py` -- exercises the full
   `delegate()` / `VPBuilder` / wallet flow against a mocked HTTP layer that
   faithfully reproduces helix-api's real prepare/finalize contract,
   including asserting the delegator's private key never appears in any
   outgoing request body.
-- `tests/test_langchain_crewai.py` -- exercises `helix_mcp`,
+- `tests/test_framework_adapters.py` -- exercises `helix_mcp_middleware`,
   `helix_langchain`, and `helix_crewai` against the real installed
   `langchain-core` and `crewai` packages (not mocks of them), so a real
   interface drift in either framework would fail these tests. Skips
   gracefully on Python < 3.10, since both frameworks require it.
-- `tests/test_cli.py` -- runs the actual `helix` command tree end-to-end
-  via Click's `CliRunner`, against real wallet and status-list files on
-  disk (did:web/did:key creation, VC issuance, revocation, self-issuance,
-  wallet inspection, and the relevant error paths).
 
 There is currently no automated **live** integration test against a real
 `helix-api` instance in this repo's CI (see Known gaps) -- if you have a
@@ -197,12 +168,13 @@ example scripts above.
   choice -- most Python agent/automation call sites are synchronous -- not
   an oversight; an async variant can be added later without breaking this
   one.
-- **No `did:hedera` package yet.** `helix_cli`'s `did create --method
-  hedera` fails with a clear "not yet supported" error rather than
-  producing an unanchored wallet. DID resolution generally is always an
+- **No `did:hedera` package yet.** DID resolution generally is always an
   API call in this architecture (per `docs/proposal-sdk-api-only.md`), so
-  this is really about offline Hedera anchoring specifically, which the JS
-  CLI supports via a separate `did-hedera` package this repo hasn't ported.
+  this is really about offline Hedera anchoring specifically, which
+  `helix-sdk-js`'s `cli` package supports via a separate `did-hedera`
+  package this repo hasn't ported. Since the CLI itself is JS-only (see
+  `docs/decision-cli-mcp-scope.md`), this gap only matters if this SDK's
+  own local-signing primitives grow a `did:hedera` creation path.
 - **No `widget` package** (helix-sdk-js's browser-embeddable consent
   widget has no obvious Python equivalent and hasn't been attempted).
 - **`HelixIDCallbackHandler` in `helix_langchain` cannot rewrite tool

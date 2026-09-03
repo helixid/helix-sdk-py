@@ -4,8 +4,8 @@
 # You may obtain a copy of the License at
 #    http://www.apache.org/licenses/LICENSE-2.0
 """
-helix_mcp -- MCP (Model Context Protocol) integration for HelixID,
-mirroring helix-sdk-js's mcp package.
+helix_mcp_middleware -- MCP (Model Context Protocol) integration for
+HelixID, mirroring helix-sdk-js's mcp-middleware package.
 
 - helixid_mcp_middleware(): server-side, requires and verifies a signed VP
   on every incoming tool call.

@@ -19,13 +19,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.4",
+    "pytest-cov>=4.1",
     "langchain-core>=0.3; python_version >= '3.10'",
     "crewai>=1.0; python_version >= '3.10'",
 ]
-cli = [
-    "click>=8.1",
-]
-mcp = [
+mcp-middleware = [
     "mcp>=1.9,<2",
 ]
 langchain = [
@@ -35,18 +33,42 @@ crewai = [
     "crewai>=1.0; python_version >= '3.10'",
 ]
 all = [
-    "click>=8.1",
     "mcp>=1.9,<2",
     "langchain-core>=0.3; python_version >= '3.10'",
     "crewai>=1.0; python_version >= '3.10'",
 ]
 
-[project.scripts]
-helix = "helix_cli.cli:main"
-
 [project.urls]
 Homepage = "https://github.com/helixid/helix-sdk-py"
 Repository = "https://github.com/helixid/helix-sdk-py"
 
+[tool.setuptools]
+license-files = ["LICENSE"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+helix_sdk = ["py.typed"]
+helix_langchain = ["py.typed"]
+helix_crewai = ["py.typed"]
+helix_mcp_middleware = ["py.typed"]
+
+[tool.pytest.ini_options]
+addopts = [
+    "--cov=helix_sdk",
+    "--cov=helix_langchain",
+    "--cov=helix_crewai",
+    "--cov=helix_mcp_middleware",
+    "--cov-branch",
+    "--cov-report=term-missing",
+]
+
+[tool.coverage.report]
+# Measured baseline as of 2026-09-03 (63% overall) -- this gate exists to
+# catch regressions, not because 60% is a target. helix-sdk-js/helix-api
+# enforce 90% lines / 90% statements / 85% branches / 90% functions; closing
+# this gap toward that is real follow-up work, tracked separately from
+# wiring up the tooling itself. Some modules (did.py) currently have no
+# direct unit tests at all -- see the coverage report's per-file breakdown.
+fail_under = 60

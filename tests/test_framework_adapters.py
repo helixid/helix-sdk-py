@@ -5,7 +5,7 @@
 #    http://www.apache.org/licenses/LICENSE-2.0
 """
 Functional tests for the three framework-adapter packages
-(helix_mcp, helix_langchain, helix_crewai) against real AgentWallet files
+(helix_mcp_middleware, helix_langchain, helix_crewai) against real AgentWallet files
 and real langchain-core / crewai tool base classes -- not mocks of those
 frameworks, the actual installed packages, so a real interface drift
 (e.g. a BaseTool signature change) would fail these tests instead of
@@ -41,7 +41,7 @@ def wallet_with_credential():
 
 class TestMCP:
     def test_attach_helix_vp_adds_vp_to_input(self, wallet_with_credential) -> None:
-        from helix_mcp import attach_helix_vp, AttachHelixVPOptions
+        from helix_mcp_middleware import attach_helix_vp, AttachHelixVPOptions
 
         wallet_path, passphrase, did = wallet_with_credential
         tool_call = {"name": "get_orders", "input": {"orderId": "123"}}
@@ -60,7 +60,7 @@ class TestMCP:
         assert "_helixVP" not in tool_call["input"]
 
     def test_middleware_rejects_missing_vp(self) -> None:
-        from helix_mcp import helixid_mcp_middleware, MCPMiddlewareOptions
+        from helix_mcp_middleware import helixid_mcp_middleware, MCPMiddlewareOptions
         from helix_sdk.errors import VPMissingError
 
         fake_client = MagicMock()
@@ -69,7 +69,7 @@ class TestMCP:
             middleware({"name": "get_orders", "input": {}})
 
     def test_middleware_verifies_and_checks_scope(self) -> None:
-        from helix_mcp import helixid_mcp_middleware, MCPMiddlewareOptions
+        from helix_mcp_middleware import helixid_mcp_middleware, MCPMiddlewareOptions
         from helix_sdk.errors import InsufficientScopeError
 
         fake_client = MagicMock()

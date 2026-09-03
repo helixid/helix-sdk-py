@@ -7,7 +7,7 @@
 Shared "select a VC from a wallet and sign a VP for it" helper, factored
 out of the near-identical selectVC()/attach logic duplicated across
 helix-sdk-js's mcp/src/attach.ts and langchain/src/middleware.ts. Used by
-all three of this repo's framework adapters (helix_mcp, helix_langchain,
+all three of this repo's framework adapters (helix_mcp_middleware, helix_langchain,
 helix_crewai) so the selection rule stays in exactly one place.
 """
 
