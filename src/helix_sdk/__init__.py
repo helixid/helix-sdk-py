@@ -10,9 +10,14 @@ surface (see src/index.ts there).
 SDK-API-only architecture (docs/proposal-sdk-api-only.md): every SDK,
 in every language, depends only on the HelixID API -- never on a shared
 "core" package -- except for private-key operations that must stay local:
-keygen, sign, canonical-hash, VPBuilder.sign(), and self_issue_vc() (dev
-flow). verify_vp(), delegation-VC building, DID resolution, and status
-checks are all API calls made through HelixClient.
+keygen, sign, canonical-hash, VPBuilder.sign(). verify_vp(), delegation-VC
+building, DID resolution, and status checks are all API calls made through
+HelixClient.
+
+Agent self-custody has been retired: onboarding (HelixClient.onboard_agent())
+is server-side keygen now, no local keypair, no wallet file. AgentWallet and
+its encrypted-file load()/save() remain for other actors' key storage (e.g.
+an issuer's own key material), not for agent onboarding.
 """
 
 from __future__ import annotations
@@ -44,7 +49,6 @@ from .keys import (
     public_key_to_multibase,
     multibase_to_public_key_hex,
 )
-from .self_signed import self_issue_vc, SelfIssueOptions
 
 # Errors
 from .errors import (  # noqa: F401
@@ -128,8 +132,6 @@ __all__ = [
     "verify_signature",
     "public_key_to_multibase",
     "multibase_to_public_key_hex",
-    "self_issue_vc",
-    "SelfIssueOptions",
     "HelixError",
     "map_api_error",
     "codes",

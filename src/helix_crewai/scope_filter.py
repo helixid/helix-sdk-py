@@ -11,14 +11,20 @@ has no built-in metadata/required-scope field, so this checks a plain
 BaseTool subclass with `required_scope: str = "read:orders"`), defaulting
 to allow when absent -- same default-allow rule as the LangChain and JS
 versions.
+
+Agent self-custody has been retired -- there is no local wallet file to
+read credentialSubject.privilegeScopes from anymore. list_vcs() already
+returns scopes directly on each summary, so this is one API call.
 """
 
 from __future__ import annotations
 
-from typing import List, TypeVar
+from typing import TYPE_CHECKING, List, TypeVar
 
-from helix_sdk import AgentWallet
-from helix_sdk.errors import NoCredentialInWalletError
+from helix_sdk.tool_vp import get_agent_scopes
+
+if TYPE_CHECKING:
+    from helix_sdk import HelixClient
 
 try:
     from crewai.tools import BaseTool
@@ -31,14 +37,8 @@ except ImportError as exc:  # pragma: no cover - exercised only without the opti
 T = TypeVar("T", bound=BaseTool)
 
 
-def filter_crewai_tools_by_scope(
-    tools: List[T], wallet_file_path: str, wallet_passphrase: str
-) -> List[T]:
-    wallet = AgentWallet.load(wallet_file_path, wallet_passphrase)
-    vcs = wallet.credentials
-    if not vcs:
-        raise NoCredentialInWalletError("No credential in wallet. Run enrollment first.")
-    scopes = vcs[0].get("credentialSubject", {}).get("privilegeScopes", [])
+def filter_crewai_tools_by_scope(tools: List[T], client: "HelixClient", agent_did: str) -> List[T]:
+    scopes = get_agent_scopes(client, agent_did)
 
     def allowed(tool: T) -> bool:
         required_scope = getattr(tool, "required_scope", None)

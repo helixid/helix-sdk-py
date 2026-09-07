@@ -11,15 +11,21 @@ Verified directly against the installed `crewai` package's actual
 not assumed by analogy. CrewAI's `BaseTool._run(*args, **kwargs)` has the
 same shape as LangChain Python's, so `helix_id_crewai_tool()` mirrors
 `helix_langchain.middleware.helix_id_tool_wrapper()` almost exactly.
+
+Agent self-custody has been retired: signing is a server-side call
+(client.sign_vp()) now, not a local wallet load + VPBuilder.sign().
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Optional, TypeVar
 
 from pydantic import PrivateAttr
 
 from helix_sdk.tool_vp import build_signed_vp
+
+if TYPE_CHECKING:
+    from helix_sdk import HelixClient
 
 try:
     from crewai.tools import BaseTool
@@ -34,8 +40,8 @@ T = TypeVar("T", bound=BaseTool)
 
 def helix_id_crewai_tool(
     tool: T,
-    wallet_file_path: str,
-    wallet_passphrase: str,
+    client: "HelixClient",
+    agent_did: str,
     target_service: str,
     user_did: Optional[str] = None,
 ) -> BaseTool:
@@ -45,15 +51,13 @@ def helix_id_crewai_tool(
 
     class _HelixIDWrappedCrewAITool(BaseTool):
         _wrapped: Any = PrivateAttr()
-        _wallet_file_path: str = PrivateAttr()
-        _wallet_passphrase: str = PrivateAttr()
+        _client: Any = PrivateAttr()
+        _agent_did: str = PrivateAttr()
         _target_service: str = PrivateAttr()
         _user_did: Optional[str] = PrivateAttr()
 
         def _run(self, *args: Any, **kwargs: Any) -> Any:
-            vp = build_signed_vp(
-                self._wallet_file_path, self._wallet_passphrase, self._target_service, self._user_did
-            )
+            vp = build_signed_vp(self._client, self._agent_did, self._target_service, self._user_did)
             kwargs["_helixVP"] = vp
             return self._wrapped._run(*args, **kwargs)
 
@@ -61,8 +65,8 @@ def helix_id_crewai_tool(
         name=tool.name, description=tool.description, args_schema=tool.args_schema
     )
     object.__setattr__(wrapped, "_wrapped", tool)
-    object.__setattr__(wrapped, "_wallet_file_path", wallet_file_path)
-    object.__setattr__(wrapped, "_wallet_passphrase", wallet_passphrase)
+    object.__setattr__(wrapped, "_client", client)
+    object.__setattr__(wrapped, "_agent_did", agent_did)
     object.__setattr__(wrapped, "_target_service", target_service)
     object.__setattr__(wrapped, "_user_did", user_did)
     return wrapped

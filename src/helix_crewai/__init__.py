@@ -15,12 +15,14 @@ assumed by analogy.
 
 Usage:
 
+    from helix_sdk import HelixClient
     from helix_crewai import helix_id_crewai_tool
 
+    client = HelixClient("https://api.example.com", admin_api_key=os.environ["HELIX_ADMIN_API_KEY"])
     protected_tool = helix_id_crewai_tool(
         my_orders_tool,
-        wallet_file_path="agent-wallet.json",
-        wallet_passphrase=os.environ["HELIX_WALLET_PASSPHRASE"],
+        client,
+        agent_did="did:key:z...",
         target_service="https://api.example.com/v1/tools/orders",
     )
     crew = Crew(agents=[...], tasks=[...], tools=[protected_tool])

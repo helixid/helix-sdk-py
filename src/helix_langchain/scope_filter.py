@@ -6,14 +6,20 @@
 """
 filter_tools_by_scope(), ported from helix-sdk-js's
 langchain/src/scope-filter.ts.
+
+Agent self-custody has been retired -- there is no local wallet file to
+read credentialSubject.privilegeScopes from anymore. list_vcs() already
+returns scopes directly on each summary, so this is one API call.
 """
 
 from __future__ import annotations
 
-from typing import Any, List, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, List, Protocol, runtime_checkable
 
-from helix_sdk import AgentWallet
-from helix_sdk.errors import NoCredentialInWalletError
+from helix_sdk.tool_vp import get_agent_scopes
+
+if TYPE_CHECKING:
+    from helix_sdk import HelixClient
 
 
 @runtime_checkable
@@ -21,16 +27,8 @@ class StructuredTool(Protocol):
     name: str
 
 
-def filter_tools_by_scope(
-    tools: List[Any], wallet_file_path: str, wallet_passphrase: str
-) -> List[Any]:
-    wallet = AgentWallet.load(wallet_file_path, wallet_passphrase)
-    vcs = wallet.credentials
-    if not vcs:
-        raise NoCredentialInWalletError("No credential in wallet. Run enrollment first.")
-    vc = vcs[0]
-
-    scopes = vc.get("credentialSubject", {}).get("privilegeScopes", [])
+def filter_tools_by_scope(tools: List[Any], client: "HelixClient", agent_did: str) -> List[Any]:
+    scopes = get_agent_scopes(client, agent_did)
 
     def allowed(tool: Any) -> bool:
         # LangChain tools carry required-scope metadata inconsistently

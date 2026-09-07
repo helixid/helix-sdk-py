@@ -17,14 +17,11 @@ and onboarding endpoints hand back.
 
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlencode
 
 from . import jwt as helix_jwt
 from . import keys
-from . import vp_crypto
 from .errors import SDKOnlyModeNoAPIError
 from .http_adapter import HttpAdapter
 
@@ -34,13 +31,6 @@ def _query_string(params: Dict[str, Any]) -> str:
     if not filtered:
         return ""
     return "?" + urlencode(filtered)
-
-
-@dataclass
-class PendingKeyPair:
-    public_key: str
-    private_key: str
-    did_create_signing_payload_hex: Optional[str] = None
 
 
 class HelixClient:
@@ -59,7 +49,6 @@ class HelixClient:
         self._http: Optional[HttpAdapter] = (
             None if self._sdk_only_mode else HttpAdapter(base_url, admin_api_key)
         )
-        self._pending_key_pair: Optional[PendingKeyPair] = None
 
     # -- DID lifecycle ------------------------------------------------------
 
@@ -247,67 +236,47 @@ class HelixClient:
     def verify_session_token(self, token: str, public_key_hex: str) -> Dict[str, Any]:
         return helix_jwt.verify_jwt(token, public_key_hex)
 
-    # -- Onboarding / enrollment ----------------------------------------------
+    # -- Onboarding ------------------------------------------------------------
 
-    def request_onboarding_challenge(
-        self, bootstrap_token: str, domains: Optional[List[str]] = None
-    ) -> Dict[str, Any]:
+    def onboard_agent(self, enrollment_token: str, domains: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Onboards an agent in one call -- agent self-custody has been
+        retired. The server generates and holds the private key itself; no
+        local keypair, no wallet file. Returns {agentDid, vcId} only.
+        `enrollment_token` must already exist (POST /v1/enrollment-tokens,
+        not exposed as an SDK method -- an agent-owner action, not something
+        the onboarding agent itself does)."""
         self._assert_api_configured()
-        key_pair = keys.generate_key_pair()
-        self._pending_key_pair = PendingKeyPair(public_key=key_pair.public_key, private_key=key_pair.private_key)
-        challenge = self._http_required().post(
+        return self._http_required().post(
             "/v1/onboard",
-            {"enrollmentToken": bootstrap_token, "publicKeyHex": key_pair.public_key, "domains": domains or []},
+            {"enrollmentToken": enrollment_token, "domains": domains or []},
         )
-        self._pending_key_pair.did_create_signing_payload_hex = challenge.get("didCreateSigningPayloadHex")
-        return challenge
 
-    def complete_onboarding(self, challenge_id: str, nonce: str) -> Dict[str, Any]:
-        """Returns the onboarding result (agentDid, vc, vcId) plus the
-        freshly generated keypair -- unlike the JS SDK's
-        completeOnboarding(), which writes an encrypted wallet file
-        directly, this returns everything so the caller decides how (or
-        whether) to persist it; see wallet.py's AgentWallet for an
-        equivalent encrypted-file helper."""
+    def sign_vp(
+        self,
+        did: str,
+        target_service: str,
+        user_did: Optional[str] = None,
+        grant_vc: Optional[Dict[str, Any]] = None,
+        vc_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Signs a VP on behalf of a server-custody agent -- the caller
+        never has, and never can have, the private key, so this is an API
+        call instead of local VPBuilder signing. The server looks up the
+        agent's active HelixAgentCredential itself; pass vc_id to pin a
+        specific one instead (e.g. right after a renewal, when more than
+        one is active). grant_vc is an SP-issued DelegationGrantCredential
+        the caller already holds -- not secret material, just data to
+        include -- for the consent-grant flow."""
         self._assert_api_configured()
-        if self._pending_key_pair is None:
-            raise RuntimeError("No pending onboarding keypair")
-        signature = vp_crypto.sign_bytes(bytes.fromhex(nonce), self._pending_key_pair.private_key)
-        did_create_signature = self._sign_pending_did_create_payload()
-        result = self._http_required().post(
-            "/v1/onboard/verify",
-            {"challengeId": challenge_id, "signature": signature, "didCreateSignature": did_create_signature},
-        )
-        key_pair = self._pending_key_pair
-        self._pending_key_pair = None
-        return {
-            "agentDid": result["agentDid"],
-            "vc": result["vc"],
-            "vcId": result["vcId"],
-            "publicKeyHex": key_pair.public_key,
-            "privateKeyHex": key_pair.private_key,
-        }
-
-    def enroll(self, bootstrap_token: str, agent_did: str, agent_private_key_hex: str) -> Dict[str, Any]:
-        self._assert_api_configured()
-        timestamp = int(time.time() * 1000)
-        import json
-
-        proof_payload = json.dumps(
-            {"bootstrapToken": bootstrap_token, "agentDid": agent_did, "timestamp": timestamp},
-            separators=(",", ":"),
-        )
-        proof_signature = keys.sign_data(proof_payload, agent_private_key_hex)
-        response = self._http_required().post(
-            "/v1/enroll",
-            {
-                "bootstrapToken": bootstrap_token,
-                "agentDid": agent_did,
-                "timestamp": timestamp,
-                "proofSignature": proof_signature,
-            },
-        )
-        return response["vc"]
+        body: Dict[str, Any] = {"targetService": target_service}
+        if user_did is not None:
+            body["userDid"] = user_did
+        if grant_vc is not None:
+            body["grantVC"] = grant_vc
+        if vc_id is not None:
+            body["vcId"] = vc_id
+        result = self._http_required().post(f"/v1/agents/{quote(did, safe='')}/vp", body)
+        return result["signedVP"]
 
     def request_user_challenge(self, user_did: str) -> Dict[str, Any]:
         return self._http_required().post("/v1/challenges", {"did": user_did, "purpose": "user_verification"})
@@ -316,14 +285,6 @@ class HelixClient:
         return self._http_required().post(f"/v1/challenges/{quote(challenge_id, safe='')}/verify", {"signature": signature})
 
     # -- internals ------------------------------------------------------------
-
-    def _sign_pending_did_create_payload(self) -> Optional[str]:
-        if self._pending_key_pair is None or not self._pending_key_pair.did_create_signing_payload_hex:
-            return None
-        return vp_crypto.sign_bytes(
-            bytes.fromhex(self._pending_key_pair.did_create_signing_payload_hex),
-            self._pending_key_pair.private_key,
-        )
 
     def _assert_api_configured(self) -> None:
         if self._sdk_only_mode:

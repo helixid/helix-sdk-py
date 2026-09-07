@@ -16,9 +16,7 @@ from .types import AttachHelixVPOptions, MCPToolCall
 
 
 def attach_helix_vp(tool_call: MCPToolCall, options: AttachHelixVPOptions) -> MCPToolCall:
-    vp = build_signed_vp(
-        options.wallet_file_path, options.wallet_passphrase, options.target_service, options.user_did
-    )
+    vp = build_signed_vp(options.client, options.agent_did, options.target_service, options.user_did)
     result = dict(tool_call)
     result["input"] = {**(tool_call.get("input") or {}), "_helixVP": vp}
     return result

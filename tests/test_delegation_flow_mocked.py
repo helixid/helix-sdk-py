@@ -57,8 +57,32 @@ from helix_sdk.errors import (
     CredentialNotForThisAgentError,
     MaxDelegationDepthExceededError,
 )
-from helix_sdk.self_signed import self_issue_vc, SelfIssueOptions
 from helix_sdk.vp_crypto import hash_canonical_payload, to_canonical_json
+import uuid
+
+
+def _build_agent_vc(did: str, scopes: List[str], max_delegation_depth: int = 0) -> Dict[str, Any]:
+    """Agent self-issuance is gone -- a hand-built VC stands in for what
+    self_issue_vc() used to produce. Nothing in these tests checks this
+    VC's own proof (add_credential() only checks credentialSubject.id and
+    dedups by id; the FakeServer below only reads credentialSubject
+    fields), so no real signature is needed here."""
+    return {
+        "@context": ["https://www.w3.org/ns/credentials/v2", "https://helixid.io/contexts/v1"],
+        "id": f"vc:helix:test:{uuid.uuid4()}",
+        "type": ["VerifiableCredential", "HelixAgentCredential"],
+        "issuer": did,
+        "validFrom": "2026-01-01T00:00:00.000Z",
+        "validUntil": "2026-01-01T01:00:00.000Z",
+        "credentialSubject": {
+            "id": did,
+            "type": "HelixAgent",
+            "privilegeScopes": scopes,
+            "agentName": did,
+            "delegationDepth": 0,
+            "maxDelegationDepth": max_delegation_depth,
+        },
+    }
 
 
 class FakeResponse:
@@ -168,11 +192,7 @@ def _make_delegator_wallet(wallet_dir: str, client: HelixClient, max_depth: int 
         passphrase="test-pass-delegator",
     )
     wallet.save(wallet.wallet_path)
-    root_vc = self_issue_vc(
-        SelfIssueOptions(scopes=["read:orders", "write:orders"], max_delegation_depth=max_depth),
-        did,
-        key_pair.private_key,
-    )
+    root_vc = _build_agent_vc(did, ["read:orders", "write:orders"], max_delegation_depth=max_depth)
     wallet.add_credential(root_vc)
     return wallet
 
@@ -233,7 +253,7 @@ class TestVPBuilderAgainstWalletCredentials:
         did = f"did:key:{public_key_to_multibase(key_pair.public_key)}"
         wallet = AgentWallet(private_key_hex=key_pair.private_key, did_value=did)
 
-        vc = self_issue_vc(SelfIssueOptions(scopes=["read:orders"]), did, key_pair.private_key)
+        vc = _build_agent_vc(did, ["read:orders"])
         wallet.wallet_credentials = []
         # Bypass add_credential's client-audit best-effort call by adding directly:
         from helix_sdk.wallet import WalletCredential
@@ -282,7 +302,7 @@ class TestWalletEncryptedPersistence:
 
         other_key_pair = generate_key_pair()
         other_did = f"did:key:{public_key_to_multibase(other_key_pair.public_key)}"
-        vc = self_issue_vc(SelfIssueOptions(scopes=["read:orders"]), other_did, other_key_pair.private_key)
+        vc = _build_agent_vc(other_did, ["read:orders"])
 
         with pytest.raises(CredentialNotForThisAgentError):
             wallet.add_credential(vc)
