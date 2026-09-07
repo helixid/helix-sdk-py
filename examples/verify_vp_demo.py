@@ -9,8 +9,10 @@ VP verification demo -- Python equivalent of helix-server's
 examples/verify-vp.ts, scope-check.ts, and revocation-check.ts combined
 into one script.
 
-  1. Onboard a fresh agent, mint its VC, build and sign a VP (VPBuilder.sign()
-     -- local signing).
+  1. Onboard a fresh agent in one call (server-side keygen -- agent
+     self-custody has been retired, no local key, no wallet file) and sign
+     a VP for it via the server (client.sign_vp() -- also an API call, for
+     the same reason).
   2. Verify the VP via POST /v1/vp/verify (API call) and inspect
      effectiveScopes with check_scope()/require_scope().
   3. Revoke the agent's VC via the admin API and show the next verification
@@ -29,19 +31,14 @@ from __future__ import annotations
 
 import json as jsonlib
 import os
-import shutil
 import sys
-import tempfile
 import urllib.request
 
 from helix_sdk import (
-    AgentWallet,
     HelixClient,
-    VPBuilder,
     check_scope,
     require_scope,
     InsufficientScopeError,
-    VCRevokedError,
     HelixError,
 )
 
@@ -67,72 +64,52 @@ def main() -> int:
     print(f"API: {api_url}\n")
 
     client = HelixClient(api_url, admin_api_key=admin_api_key)
-    wallet_dir = tempfile.mkdtemp(prefix="helix-py-verify-demo-")
+
+    print("[Step 1] Onboard a fresh agent with scope 'read:orders' (server-side keygen)")
+    token = create_enrollment_token(
+        api_url,
+        agentName="Python Verify Demo Agent",
+        requestedScopes=["read:orders"],
+        requestedDomains=["https://py-verify-demo.agent.example.com"],
+    )
+    onboarding = client.onboard_agent(token, ["https://py-verify-demo.agent.example.com"])
+    agent_did = onboarding["agentDid"]
+    vc_id = onboarding["vcId"]
+    print(f"  agent DID: {agent_did}")
+    print(f"  VC id: {vc_id}\n")
+
+    print("[Step 2] Sign a VP for the agent via the server (client.sign_vp())")
+    vp = client.sign_vp(agent_did, target_service)
+    print(f"  VP id: {vp['id']}\n")
+
+    print("[Step 3] Verify the VP via POST /v1/vp/verify")
+    result = client.verify_vp(vp)
+    print(f"  valid: {result['valid']}")
+    print(f"  effectiveScopes: {result.get('effectiveScopes')}\n")
+
+    print("[Step 4] Scope checks against the verification result (local, no API call)")
+    print(f"  check_scope('read:orders'): {check_scope(result, 'read:orders')}")
+    print(f"  check_scope('write:orders'): {check_scope(result, 'write:orders')}")
+    try:
+        require_scope(result, "write:orders")
+        print("  ERROR: expected require_scope to raise")
+        return 1
+    except InsufficientScopeError as exc:
+        print(f"  require_scope('write:orders') raised as expected: {exc.code}\n")
+
+    print("[Step 5] Revoke the VC via the admin API, then verify again")
+    client.revoke_vc(vc_id)
+    print("  VC revoked")
 
     try:
-        print("[Step 1] Onboard a fresh agent with scope 'read:orders'")
-        token = create_enrollment_token(
-            api_url,
-            agentName="Python Verify Demo Agent",
-            requestedScopes=["read:orders"],
-            requestedDomains=["https://py-verify-demo.agent.example.com"],
-        )
-        challenge = client.request_onboarding_challenge(
-            token, ["https://py-verify-demo.agent.example.com"]
-        )
-        onboarding = client.complete_onboarding(challenge["challengeId"], challenge["nonce"])
+        client.verify_vp(vp)
+        print("  ERROR: expected verification to fail after revocation")
+        return 1
+    except HelixError as exc:
+        print(f"  Verification after revocation failed as expected: {exc.code}")
 
-        wallet_path = os.path.join(wallet_dir, "verify-demo-agent.json")
-        wallet = AgentWallet(
-            client=client,
-            private_key_hex=onboarding["privateKeyHex"],
-            did_value=onboarding["agentDid"],
-            wallet_path=wallet_path,
-            passphrase="verify-demo-passphrase",
-        )
-        wallet.save(wallet_path)
-        wallet.add_credential(onboarding["vc"])
-        print(f"  agent DID: {wallet.get_did()}")
-        print(f"  VC id: {onboarding['vcId']}\n")
-
-        print("[Step 2] Build and sign a VP locally (VPBuilder.sign())")
-        vp = VPBuilder(
-            credentials=wallet.credentials,
-            holder_did=wallet.get_did(),
-            target_service=target_service,
-        ).sign(wallet.get_private_key_hex(), f"{wallet.get_did()}#key-1")
-        print(f"  VP id: {vp['id']}\n")
-
-        print("[Step 3] Verify the VP via POST /v1/vp/verify")
-        result = client.verify_vp(vp)
-        print(f"  valid: {result['valid']}")
-        print(f"  effectiveScopes: {result.get('effectiveScopes')}\n")
-
-        print("[Step 4] Scope checks against the verification result (local, no API call)")
-        print(f"  check_scope('read:orders'): {check_scope(result, 'read:orders')}")
-        print(f"  check_scope('write:orders'): {check_scope(result, 'write:orders')}")
-        try:
-            require_scope(result, "write:orders")
-            print("  ERROR: expected require_scope to raise")
-            return 1
-        except InsufficientScopeError as exc:
-            print(f"  require_scope('write:orders') raised as expected: {exc.code}\n")
-
-        print("[Step 5] Revoke the VC via the admin API, then verify again")
-        client.revoke_vc(onboarding["vcId"])
-        print("  VC revoked")
-
-        try:
-            client.verify_vp(vp)
-            print("  ERROR: expected verification to fail after revocation")
-            return 1
-        except HelixError as exc:
-            print(f"  Verification after revocation failed as expected: {exc.code}")
-
-        print("\n=== Demo complete ===")
-        return 0
-    finally:
-        shutil.rmtree(wallet_dir, ignore_errors=True)
+    print("\n=== Demo complete ===")
+    return 0
 
 
 if __name__ == "__main__":

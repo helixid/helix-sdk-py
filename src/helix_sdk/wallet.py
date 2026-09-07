@@ -27,10 +27,9 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-from . import keys, self_signed
+from . import keys
 from .client import HelixClient
 from .errors import CredentialAlreadyInWalletError, CredentialNotForThisAgentError
-from .self_signed import SelfIssueOptions
 
 _PBKDF2_ITERATIONS = 100_000
 _KEY_LEN = 32
@@ -289,13 +288,6 @@ class AgentWallet:
         except Exception:  # noqa: BLE001
             pass
 
-    def self_issue_vc(self, options: SelfIssueOptions) -> Dict[str, Any]:
-        if not self.did_value or not self.private_key_hex:
-            raise RuntimeError("Wallet has no DID or private key")
-        vc = self_signed.self_issue_vc(options, self.did_value, self.private_key_hex)
-        self.add_credential(vc)
-        return vc
-
     def select_grant(self, issuer_did: str, user_did: str) -> Optional[WalletCredential]:
         """Selects the most recent DelegationGrantCredential issued by the
         given SP for the given user."""
@@ -319,24 +311,3 @@ class AgentWallet:
             return None
         return max(candidates, key=lambda c: c.added_at)
 
-    @staticmethod
-    def generate_keypair() -> keys.KeyPair:
-        return keys.generate_key_pair()
-
-    @classmethod
-    def from_keypair_and_credential(
-        cls, keypair: keys.KeyPair, vc: Union[str, Dict[str, Any]]
-    ) -> "AgentWallet":
-        parsed = json.loads(vc) if isinstance(vc, str) else vc
-        vc_id = parsed.get("id")
-        if not vc_id:
-            raise ValueError("VC has no id")
-        subject = parsed.get("credentialSubject", {})
-        did = f"did:key:{keys.public_key_to_multibase(keypair.public_key)}"
-        if subject.get("id") != did:
-            raise CredentialNotForThisAgentError()
-        return cls(
-            did_value=did,
-            private_key_hex=keypair.private_key,
-            wallet_credentials=[WalletCredential.from_vc(vc_id, vc)],
-        )

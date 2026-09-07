@@ -18,16 +18,21 @@ offered as a LangChain-native alternative to the JS `HelixIDMiddleware`
 (a bespoke `RunnableConfigLike` object, which has no direct Python
 equivalent since LangChain Python's callback system is class-based, not
 an ad-hoc `{ callbacks: [...] }` literal).
+
+Agent self-custody has been retired: signing is a server-side call
+(client.sign_vp()) now, not a local wallet load + VPBuilder.sign().
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Optional, TypeVar
 
 from pydantic import PrivateAttr
 
-from helix_sdk import AgentWallet
 from helix_sdk.tool_vp import build_signed_vp, encode_base64url_json
+
+if TYPE_CHECKING:
+    from helix_sdk import HelixClient
 
 try:
     from langchain_core.tools import BaseTool
@@ -43,8 +48,8 @@ T = TypeVar("T", bound=BaseTool)
 
 def helix_id_tool_wrapper(
     tool: T,
-    wallet_file_path: str,
-    wallet_passphrase: str,
+    client: "HelixClient",
+    agent_did: str,
     target_service: str,
     user_did: Optional[str] = None,
 ) -> BaseTool:
@@ -54,62 +59,48 @@ def helix_id_tool_wrapper(
 
     class _HelixIDWrappedTool(BaseTool):
         _wrapped: Any = PrivateAttr()
-        _wallet_file_path: str = PrivateAttr()
-        _wallet_passphrase: str = PrivateAttr()
+        _client: Any = PrivateAttr()
+        _agent_did: str = PrivateAttr()
         _target_service: str = PrivateAttr()
         _user_did: Optional[str] = PrivateAttr()
 
         def _run(self, *args: Any, **kwargs: Any) -> Any:
-            vp = build_signed_vp(
-                self._wallet_file_path, self._wallet_passphrase, self._target_service, self._user_did
-            )
+            vp = build_signed_vp(self._client, self._agent_did, self._target_service, self._user_did)
             kwargs["_helixVP"] = vp
             return self._wrapped._run(*args, **kwargs)
 
     wrapped = _HelixIDWrappedTool(name=tool.name, description=tool.description, args_schema=tool.args_schema)
     object.__setattr__(wrapped, "_wrapped", tool)
-    object.__setattr__(wrapped, "_wallet_file_path", wallet_file_path)
-    object.__setattr__(wrapped, "_wallet_passphrase", wallet_passphrase)
+    object.__setattr__(wrapped, "_client", client)
+    object.__setattr__(wrapped, "_agent_did", agent_did)
     object.__setattr__(wrapped, "_target_service", target_service)
     object.__setattr__(wrapped, "_user_did", user_did)
     return wrapped
 
 
 class HelixIDCallbackHandler(BaseCallbackHandler):
-    """A LangChain-native callback handler that attaches a signed VP to
-    every tool's input at `on_tool_start`, caching the loaded wallet
-    across calls. Functionally equivalent to helix-sdk-js's
-    HelixIDMiddleware(), adapted to LangChain Python's class-based
-    callback system rather than an ad-hoc RunnableConfigLike literal."""
+    """A LangChain-native callback handler, offered for parity with the JS
+    HelixIDMiddleware() shape. Kept for observability/logging use cases --
+    LangChain Python's on_tool_start receives the raw input string/dict,
+    not a mutable object the callback can rewrite before the tool runs
+    (unlike the JS RunnableConfigLike.handleToolStart contract), so real
+    VP injection happens in helix_id_tool_wrapper() above, not here."""
 
     def __init__(
         self,
-        wallet_file_path: str,
-        wallet_passphrase: str,
+        client: "HelixClient",
+        agent_did: str,
         target_service: str,
         user_did: Optional[str] = None,
     ) -> None:
         super().__init__()
-        self._wallet_file_path = wallet_file_path
-        self._wallet_passphrase = wallet_passphrase
+        self._client = client
+        self._agent_did = agent_did
         self._target_service = target_service
         self._user_did = user_did
-        self._wallet: Optional[AgentWallet] = None
-
-    def _get_wallet(self) -> AgentWallet:
-        if self._wallet is None:
-            self._wallet = AgentWallet.load(self._wallet_file_path, self._wallet_passphrase)
-        return self._wallet
 
     def on_tool_start(self, serialized: Any, input_str: str, **kwargs: Any) -> None:
-        # LangChain's on_tool_start receives the raw input string/dict, not
-        # a mutable object the callback can rewrite before the tool runs
-        # (unlike the JS RunnableConfigLike.handleToolStart contract) --
-        # Python callbacks are notification hooks, not interceptors. Real
-        # VP injection therefore happens in helix_id_tool_wrapper() above;
-        # this handler is kept for observability/logging use cases and to
-        # eagerly warm the wallet cache, and is documented as such.
-        self._get_wallet()
+        pass
 
 
 def encode_base64url_json_public(value: Any) -> str:

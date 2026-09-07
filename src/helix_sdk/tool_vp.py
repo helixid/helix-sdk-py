@@ -4,50 +4,44 @@
 # You may obtain a copy of the License at
 #    http://www.apache.org/licenses/LICENSE-2.0
 """
-Shared "select a VC from a wallet and sign a VP for it" helper, factored
-out of the near-identical selectVC()/attach logic duplicated across
-helix-sdk-js's mcp/src/attach.ts and langchain/src/middleware.ts. Used by
-all three of this repo's framework adapters (helix_mcp_middleware, helix_langchain,
-helix_crewai) so the selection rule stays in exactly one place.
+Shared helpers used by all three of this repo's framework adapters
+(helix_mcp_middleware, helix_langchain, helix_crewai), factored out so the
+logic stays in exactly one place.
+
+Agent self-custody has been retired: there is no wallet file to load and
+no local key to sign with, so attaching a VP to an outbound tool call is
+now a server-side call (client.sign_vp()) instead of loading a wallet and
+signing locally with VPBuilder. Credential selection (which VC to sign
+with) happens server-side too.
 """
 
 from __future__ import annotations
 
 import base64
 import json
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from .wallet import AgentWallet
-from .vp_builder import VPBuilder
-from .errors import NoCredentialInWalletError
-
-
-def select_vc(wallet: AgentWallet, target_service: str) -> Dict[str, Any]:
-    vcs = wallet.credentials
-    if not vcs:
-        raise NoCredentialInWalletError("No credential in wallet. Run enrollment first.")
-    if len(vcs) == 1:
-        return vcs[0]
-    for vc in vcs:
-        if vc.get("targetService") == target_service:
-            return vc
-    return vcs[0]
+if TYPE_CHECKING:
+    from .client import HelixClient
 
 
 def build_signed_vp(
-    wallet_file_path: str,
-    wallet_passphrase: str,
+    client: "HelixClient",
+    agent_did: str,
     target_service: str,
     user_did: Optional[str] = None,
 ) -> Dict[str, Any]:
-    wallet = AgentWallet.load(wallet_file_path, wallet_passphrase)
-    vc = select_vc(wallet, target_service)
-    return VPBuilder(
-        credentials=[vc],
-        holder_did=wallet.get_did(),
-        target_service=target_service,
-        user_did=user_did or "did:key:anonymous",
-    ).sign(wallet.get_private_key_hex(), f"{wallet.get_did()}#key-1")
+    return client.sign_vp(agent_did, target_service, user_did=user_did)
+
+
+def get_agent_scopes(client: "HelixClient", agent_did: str) -> List[str]:
+    """Scopes for the agent's one active HelixAgentCredential --
+    list_vcs() already returns them directly, so no separate VC fetch or
+    wallet read is needed."""
+    active_vcs = client.list_vcs(subject_did=agent_did, status="active")
+    if not active_vcs:
+        raise RuntimeError("No active credential for this agent. Run onboarding first.")
+    return active_vcs[0].get("scopes", [])
 
 
 def encode_base64url_json(value: Any) -> str:

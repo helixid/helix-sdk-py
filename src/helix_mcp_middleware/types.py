@@ -30,7 +30,11 @@ class MCPMiddlewareOptions:
 
 @dataclass
 class AttachHelixVPOptions:
-    wallet_passphrase: str
-    wallet_file_path: str
+    """Agent self-custody has been retired -- signing happens server-side
+    via `client`, not a local wallet. `agent_did` is the agent's DID,
+    previously implied by which wallet file was loaded."""
+
+    client: HelixClient
+    agent_did: str
     target_service: str
     user_did: Optional[str] = None

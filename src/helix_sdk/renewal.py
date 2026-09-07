@@ -8,10 +8,19 @@ renew_agent_vc(), ported from helix-sdk-js's src/renewal.ts.
 
 Renews an agent's own VC via the API's prepare/finalize endpoints. Distinct
 from HelixClient.renew_vc(), which is fully server-signed -- this path is
-for VCs the agent itself signed (e.g. via self_issue_vc()), so the renewal
-must be re-signed by the same key. Payload construction -- window/
-revocation/renewal-count checks included -- happens server-side; only the
-signature is produced locally.
+for VCs the agent itself signed, so the renewal must be re-signed by the
+same key. Payload construction -- window/revocation/renewal-count checks
+included -- happens server-side; only the signature is produced locally.
+
+KNOWN GAP, not fixed as part of the server-custody migration: agent
+self-custody has been retired, so no onboarding path produces a wallet
+holding a real, self-signed VC + key anymore -- this function's only
+legitimate input can no longer exist. Same unresolved gap as agent-to-agent
+delegation (see helix-core's
+tests/live/agent-delegation.live.integration.test.ts) -- needs its own
+design decision (server-custody VC re-signing) before this path is
+meaningful again. Left in place rather than deleted since removing it was
+never part of that decision either.
 """
 
 from __future__ import annotations
