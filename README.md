@@ -14,6 +14,21 @@ keygen, sign, canonical-hash, `VPBuilder.sign()`, and `self_issue_vc()` (a
 dev-only flow). Verification, delegation-VC construction, DID resolution, and
 status checks are all API calls made through `HelixClient`.
 
+## Documentation
+
+Full documentation is at **[docs.helixid.dev](https://docs.helixid.dev)** — concepts,
+guides, and reference. This README covers only what is specific to this repository.
+
+| | |
+|---|---|
+| **Start here** | [Introduction](https://docs.helixid.dev/) |
+| **Concepts** | [The Trust Stack](https://docs.helixid.dev/concepts/trust-stack) · [Two-Issuer Model](https://docs.helixid.dev/concepts/two-issuer-model) · [Delegation](https://docs.helixid.dev/concepts/delegation) · [Revocation](https://docs.helixid.dev/concepts/revocation) |
+| **Get started** | [Quick Start](https://docs.helixid.dev/get-started/quick-start) · [Installation & Modes](https://docs.helixid.dev/get-started/installation-and-modes) |
+| **Contributing** | [How to Contribute](https://docs.helixid.dev/contributing/how-to-contribute) · [`CONTRIBUTING.md`](CONTRIBUTING.md) |
+| **Security** | [Reporting a Vulnerability](https://docs.helixid.dev/security/reporting-a-vulnerability) · [`SECURITY.md`](SECURITY.md) |
+
+---
+
 ## Status: v0.1.0, early
 
 This is the first release. Core local-signing primitives and the full
@@ -106,10 +121,10 @@ HELIX_ADMIN_API_KEY=your-admin-key \
 python examples/agent_delegation_demo.py
 ```
 
-These are **not** ports of `helix-server/examples/delegation-demo.ts` --
-that file imports `buildDelegationVC` from the retired `@helixid/core`
-package and is a known, not-yet-rewritten broken example. These scripts
-instead follow the current, correct pattern used by helix-api's own live
+These are **not** ports of the older TypeScript `delegation-demo.ts`, which
+imports `buildDelegationVC` directly and is a known, not-yet-rewritten broken
+example. These scripts instead follow the current, correct pattern used by
+helix-api's own live
 integration test (`tests/live/agent-delegation.live.integration.test.ts`)
 -- `delegate()` + the prepare/finalize API, not a local `buildDelegationVC()`.
 
@@ -189,6 +204,19 @@ example scripts above.
   `docs/decision-sdk-py-scope.md`, this SDK's version should track the JS
   SDK's; that mapping strategy hasn't been decided yet, so this starts at
   `0.1.0` independently.
+
+## The HelixID ecosystem
+
+| Repository | What it is |
+|---|---|
+| [helixid](https://github.com/helixid/helixid) | HelixID API — the issuer and verifier service |
+| [helix-core](https://github.com/helixid/helix-core) | `@helixid/core` — crypto, schemas, resolver, verification primitives |
+| [helix-sdk-js](https://github.com/helixid/helix-sdk-js) | JS/TS SDK, CLI, LangChain + MCP middleware, consent widget |
+| **helix-sdk-py** — you are here | `helixid-sdk-py` — the Python SDK |
+| [helix-console](https://github.com/helixid/helix-console) | Operator Console SPA |
+| [helix-wiki](https://github.com/helixid/helix-wiki) | Source for [docs.helixid.dev](https://docs.helixid.dev) |
+
+---
 
 ## License
 
