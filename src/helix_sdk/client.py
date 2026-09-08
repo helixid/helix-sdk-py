@@ -327,6 +327,48 @@ class HelixClient:
         result = self._http_required().post(f"/v1/agents/{quote(did, safe='')}/vp", body)
         return result["signedVP"]
 
+    def delegate_authority(
+        self,
+        did: str,
+        to: str,
+        scopes: List[str],
+        expires_in: int,
+        vc_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Delegates a slice of a server-custody agent's authority to another
+        DID -- the custodial counterpart to a wallet-based delegate(), which
+        needed the delegator's own private key and so has nothing legitimate
+        to call since agent self-custody was retired. Same trust boundary as
+        sign_vp(): this is an API call that authorizes HelixID to sign on the
+        delegator's behalf, not a local signature.
+
+        Mirrors sign_vp()'s two modes: enterprise (self._api_key set) hits
+        the account-scoped custodial route; core/OSS hits the admin-key-gated
+        route. Pass vc_id to pin which of the delegator's active credentials
+        to delegate from."""
+        self._assert_api_configured()
+        body: Dict[str, Any] = {"to": to, "scopes": scopes, "expiresIn": expires_in}
+        if vc_id is not None:
+            body["vcId"] = vc_id
+
+        if self._api_key:
+            response = requests.post(
+                f"{self._base_url}/v1/custodial-agents/{quote(did, safe='')}/delegate",
+                json=body,
+                headers={"content-type": "application/json", "authorization": f"Bearer {self._api_key}"},
+                timeout=30.0,
+            )
+            try:
+                data = response.json()
+            except ValueError:
+                data = {}
+            if not response.ok:
+                raise map_api_error({**(data if isinstance(data, dict) else {}), "status": response.status_code})
+            return data["delegatedVC"]
+
+        result = self._http_required().post(f"/v1/agents/{quote(did, safe='')}/delegate", body)
+        return result["delegatedVC"]
+
     def request_user_challenge(self, user_did: str) -> Dict[str, Any]:
         return self._http_required().post("/v1/challenges", {"did": user_did, "purpose": "user_verification"})
 
