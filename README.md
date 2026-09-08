@@ -10,9 +10,15 @@ This is the Python counterpart to
 `docs/proposal-retire-core-package.md` in the `helixid/helixid` repo): every
 SDK, in every language, depends only on the HelixID API -- never on a shared
 "core" package -- except for private-key operations that must stay local:
-keygen, sign, canonical-hash, `VPBuilder.sign()`, and `self_issue_vc()` (a
-dev-only flow). Verification, delegation-VC construction, DID resolution, and
-status checks are all API calls made through `HelixClient`.
+keygen, sign, canonical-hash and `VPBuilder.sign()`, which issuers and Service
+Providers still use to sign with their own keys. Verification, delegation-VC
+construction, DID resolution, and status checks are all API calls made through
+`HelixClient`.
+
+**Agents hold no keys.** Agent self-custody has been retired: the server
+generates an agent's keypair during onboarding and holds the private key, so
+onboarding, presenting and delegating are all API calls
+(`onboard_agent()`, `sign_vp()`, `delegate_authority()`).
 
 ## Documentation
 
@@ -78,40 +84,42 @@ Install everything at once with `pip install helixid-sdk-py[all]`.
 ## Quick example
 
 ```python
-from helix_sdk import AgentWallet, HelixClient, VPBuilder, delegate
+from helix_sdk import HelixClient
 
-client = HelixClient("https://your-helix-api.example.com")
-
-# ... onboard an agent (see examples/agent_delegation_demo.py for the full
-# enrollment-token -> challenge -> onboard flow) ...
-
-sub_agent_vc = delegate(
-    delegator_wallet,
-    to=sub_agent_wallet.get_did(),
-    scopes=["read:orders"],
-    expires_in=3600,
+client = HelixClient(
+    "https://your-helix-api.example.com",
+    admin_api_key="...",  # signing is admin-gated in OSS
 )
 
-vp = VPBuilder(
-    credentials=[sub_agent_vc],
-    holder_did=sub_agent_wallet.get_did(),
-    target_service="https://api.example.com/v1/tools/orders",
-).sign(sub_agent_wallet.get_private_key_hex(), f"{sub_agent_wallet.get_did()}#key-1")
+# The enrollment token is minted beforehand by the agent's owner
+# (POST /v1/enrollment-tokens) -- not by the agent itself.
+onboarding = client.onboard_agent(token, ["https://agent.example.com"])
+agent_did = onboarding["agentDid"]
+
+# Signing is an API call: the caller never has the agent's private key.
+vp = client.sign_vp(agent_did, "https://api.example.com/v1/tools/orders")
 
 result = client.verify_vp(vp)
 print(result["valid"], result["effectiveScopes"])
 ```
 
+See `examples/verify_vp_demo.py` for this flow end to end, including scope
+checks and a revoked-credential rejection.
+
 ## Examples
 
 See `examples/`:
 
-- `agent_delegation_demo.py` -- onboards a delegator and a sub-agent,
-  delegates a scope subset via `delegate()`, builds and signs a VP, verifies
-  it via the API, and shows a delegation-depth violation being rejected.
-- `verify_vp_demo.py` -- onboards an agent, builds/signs/verifies a VP,
-  exercises `check_scope()`/`require_scope()`, then revokes the VC and shows
-  the next verification attempt fail with `VC_REVOKED`.
+- `verify_vp_demo.py` -- onboards an agent with `onboard_agent()`, signs a VP
+  through `sign_vp()`, verifies it, exercises `check_scope()`/`require_scope()`,
+  then revokes the VC and shows the next verification attempt fail with
+  `VC_REVOKED`.
+- `agent_delegation_demo.py` -- **currently a stub that exits non-zero.** It
+  was blocked out when self-custody was retired, on the grounds that
+  agent-to-agent delegation had no server-custody design yet. That is no longer
+  true: `HelixClient.delegate_authority()` landed in the following commit and
+  is what the TypeScript demos now use. Rewriting this example against it is
+  outstanding.
 
 Both require a running `helix-api` instance:
 
@@ -121,12 +129,12 @@ HELIX_ADMIN_API_KEY=your-admin-key \
 python examples/agent_delegation_demo.py
 ```
 
-These are **not** ports of the older TypeScript `delegation-demo.ts`, which
-imports `buildDelegationVC` directly and is a known, not-yet-rewritten broken
-example. These scripts instead follow the current, correct pattern used by
-helix-api's own live
-integration test (`tests/live/agent-delegation.live.integration.test.ts`)
--- `delegate()` + the prepare/finalize API, not a local `buildDelegationVC()`.
+The TypeScript side has since been migrated too: `helixid`'s
+`examples/delegation-demo.ts` and its live integration test
+(`tests/live/agent-delegation.live.integration.test.ts`) both use
+`delegateAuthority()` -- the server signs on the delegator's behalf, since no
+caller holds an agent's key any more. `delegate_authority()` here is the
+Python equivalent.
 
 ## CLI
 
