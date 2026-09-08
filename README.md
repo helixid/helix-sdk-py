@@ -114,12 +114,10 @@ See `examples/`:
   through `sign_vp()`, verifies it, exercises `check_scope()`/`require_scope()`,
   then revokes the VC and shows the next verification attempt fail with
   `VC_REVOKED`.
-- `agent_delegation_demo.py` -- **currently a stub that exits non-zero.** It
-  was blocked out when self-custody was retired, on the grounds that
-  agent-to-agent delegation had no server-custody design yet. That is no longer
-  true: `HelixClient.delegate_authority()` landed in the following commit and
-  is what the TypeScript demos now use. Rewriting this example against it is
-  outstanding.
+- `agent_delegation_demo.py` -- onboards a delegator and a sub-agent, delegates
+  a scope subset with `delegate_authority()`, has the sub-agent present the
+  delegated credential, and shows a further delegation being refused because
+  the sub-agent has no delegation authority of its own.
 
 Both require a running `helix-api` instance:
 
