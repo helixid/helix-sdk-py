@@ -17,13 +17,21 @@ and onboarding endpoints hand back.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlencode
 
+import requests
+
 from . import jwt as helix_jwt
 from . import keys
-from .errors import SDKOnlyModeNoAPIError
+from .errors import SDKOnlyModeNoAPIError, map_api_error
 from .http_adapter import HttpAdapter
+
+# Used only when api_key is given with no explicit base_url -- see
+# HelixClient.__init__. Not a claim that any fixed URL is "the" enterprise
+# instance; just the default port any local helix-api listens on.
+_DEFAULT_ENTERPRISE_URL = "http://localhost:3000"
 
 
 def _query_string(params: Dict[str, Any]) -> str:
@@ -39,15 +47,36 @@ class HelixClient:
         HelixClient()                         # SDK-only mode: local signing
                                                # helpers work, API calls raise
                                                # SDKOnlyModeNoAPIError.
-        HelixClient(base_url)                 # normal mode.
-        HelixClient(base_url, admin_api_key=...)
+        HelixClient(base_url)                 # OSS/core mode.
+        HelixClient(base_url, admin_api_key=...)   # OSS/core, admin-gated calls.
+        HelixClient(api_key=...)              # Enterprise mode -- account-scoped
+                                               # API key (see
+                                               # helix-server-enterprise's
+                                               # POST /v1/account/api-keys), sent
+                                               # as the bearer token directly, no
+                                               # login call. base_url defaults to
+                                               # $HELIX_API_URL or localhost:3000
+                                               # when omitted here.
     """
 
-    def __init__(self, base_url: Optional[str] = None, admin_api_key: Optional[str] = None) -> None:
-        self._sdk_only_mode = base_url is None
-        self._api_audit_enabled = base_url is not None and bool(admin_api_key)
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        admin_api_key: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ) -> None:
+        resolved_base_url = base_url
+        if resolved_base_url is None and api_key:
+            resolved_base_url = os.environ.get("HELIX_API_URL") or _DEFAULT_ENTERPRISE_URL
+
+        self._sdk_only_mode = resolved_base_url is None
+        self._api_audit_enabled = resolved_base_url is not None and bool(admin_api_key)
+        self._base_url = (
+            resolved_base_url[:-1] if resolved_base_url and resolved_base_url.endswith("/") else resolved_base_url
+        )
+        self._api_key = api_key
         self._http: Optional[HttpAdapter] = (
-            None if self._sdk_only_mode else HttpAdapter(base_url, admin_api_key)
+            None if self._sdk_only_mode else HttpAdapter(resolved_base_url, admin_api_key)
         )
 
     # -- DID lifecycle ------------------------------------------------------
@@ -266,7 +295,11 @@ class HelixClient:
         specific one instead (e.g. right after a renewal, when more than
         one is active). grant_vc is an SP-issued DelegationGrantCredential
         the caller already holds -- not secret material, just data to
-        include -- for the consent-grant flow."""
+        include -- for the consent-grant flow.
+
+        Enterprise mode (self._api_key set): custodial signing is
+        account-scoped, a different route + auth than core's admin-key-gated
+        /v1/agents/:did/vp -- see HelixClient.__init__'s api_key doc."""
         self._assert_api_configured()
         body: Dict[str, Any] = {"targetService": target_service}
         if user_did is not None:
@@ -275,6 +308,22 @@ class HelixClient:
             body["grantVC"] = grant_vc
         if vc_id is not None:
             body["vcId"] = vc_id
+
+        if self._api_key:
+            response = requests.post(
+                f"{self._base_url}/v1/custodial-agents/{quote(did, safe='')}/vp",
+                json=body,
+                headers={"content-type": "application/json", "authorization": f"Bearer {self._api_key}"},
+                timeout=30.0,
+            )
+            try:
+                data = response.json()
+            except ValueError:
+                data = {}
+            if not response.ok:
+                raise map_api_error({**(data if isinstance(data, dict) else {}), "status": response.status_code})
+            return data["signedVP"]
+
         result = self._http_required().post(f"/v1/agents/{quote(did, safe='')}/vp", body)
         return result["signedVP"]
 
