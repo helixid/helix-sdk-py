@@ -165,7 +165,7 @@ This appends a `Signed-off-by: Your Name <your.email@example.com>` line. Our CI 
 - [ ] Run `pytest` locally and pass
 - [ ] Add or update tests — no untested code merges
 - [ ] Update docs if you changed public API
-- [ ] Note any public API change in the PR description — consumers install from git and track `main`
+- [ ] PR title (or commits) follows [Conventional Commits](https://www.conventionalcommits.org/) — release-please parses it for versioning/changelog
 - [ ] Every commit is DCO-signed
 
 ### PR Description
@@ -248,8 +248,20 @@ We acknowledge within 48 hours, triage within 7 business days, and practice coor
 
 ## Release Process
 
-`helixid-sdk-py` is **not published to PyPI**. Consumers install it straight from
-this repository:
+`helixid-sdk-py` is published to PyPI as a **public package**, versioned with
+[release-please](https://github.com/googleapis/release-please) — the closest
+Python equivalent of the changesets flow `helix-core`/`helix-sdk-js` use.
+
+Use [Conventional Commits](https://www.conventionalcommits.org/) in your PR title
+or commits; release-please parses them to decide the next version and to write
+`CHANGELOG.md`. On every push to `main` it opens/updates a
+`chore(main): release X.Y.Z` PR that bumps `pyproject.toml` and
+`src/helix_sdk/__init__.py`'s `__version__`. Nothing is published until a
+maintainer merges that PR — merging tags the release and triggers
+`.github/workflows/release.yml`'s publish job, which builds and uploads to PyPI.
+
+Until the first PyPI release ships, or as a fallback, consumers can still install
+straight from this repository:
 
 ```bash
 pip install "helixid-sdk-py @ git+https://github.com/helixid/helix-sdk-py"
@@ -257,9 +269,6 @@ pip install "helixid-sdk-py @ git+https://github.com/helixid/helix-sdk-py"
 
 Extras work the same way — for example
 `"helixid-sdk-py[mcp-middleware] @ git+https://github.com/helixid/helix-sdk-py"`.
-
-**`main` is the release channel.** Anything merged is immediately reachable by
-every consumer, so breaking changes need to be called out in the PR.
 
 ---
 

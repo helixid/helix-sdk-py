@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "packages": {
+    ".": {
+      "release-type": "python",
+      "package-name": "helixid-sdk-py",
+      "extra-files": [
+        {
+          "type": "python",
+          "path": "src/helix_sdk/__init__.py"
+        }
+      ]
+    }
+  }
+}
