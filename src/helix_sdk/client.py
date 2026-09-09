@@ -17,7 +17,6 @@ and onboarding endpoints hand back.
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlencode
 
@@ -29,9 +28,8 @@ from .errors import SDKOnlyModeNoAPIError, map_api_error
 from .http_adapter import HttpAdapter
 
 # Used only when api_key is given with no explicit base_url -- see
-# HelixClient.__init__. Not a claim that any fixed URL is "the" enterprise
-# instance; just the default port any local helix-api listens on.
-_DEFAULT_ENTERPRISE_URL = "http://localhost:3000"
+# HelixClient.__init__. The hosted HelixID enterprise API.
+_DEFAULT_ENTERPRISE_URL = "https://api.helixid.dev"
 
 
 def _query_string(params: Dict[str, Any]) -> str:
@@ -55,8 +53,8 @@ class HelixClient:
                                                # POST /v1/account/api-keys), sent
                                                # as the bearer token directly, no
                                                # login call. base_url defaults to
-                                               # $HELIX_API_URL or localhost:3000
-                                               # when omitted here.
+                                               # the hosted enterprise API when
+                                               # omitted here.
     """
 
     def __init__(
@@ -67,7 +65,7 @@ class HelixClient:
     ) -> None:
         resolved_base_url = base_url
         if resolved_base_url is None and api_key:
-            resolved_base_url = os.environ.get("HELIX_API_URL") or _DEFAULT_ENTERPRISE_URL
+            resolved_base_url = _DEFAULT_ENTERPRISE_URL
 
         self._sdk_only_mode = resolved_base_url is None
         self._api_audit_enabled = resolved_base_url is not None and bool(admin_api_key)

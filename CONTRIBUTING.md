@@ -260,15 +260,11 @@ or commits; release-please parses them to decide the next version and to write
 maintainer merges that PR — merging tags the release and triggers
 `.github/workflows/release.yml`'s publish job, which builds and uploads to PyPI.
 
-Until the first PyPI release ships, or as a fallback, consumers can still install
-straight from this repository:
-
 ```bash
-pip install "helixid-sdk-py @ git+https://github.com/helixid/helix-sdk-py"
+pip install helixid-sdk-py
 ```
 
-Extras work the same way — for example
-`"helixid-sdk-py[mcp-middleware] @ git+https://github.com/helixid/helix-sdk-py"`.
+Extras work the same way — for example `pip install "helixid-sdk-py[mcp-middleware]"`.
 
 ---
 
