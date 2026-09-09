@@ -6,7 +6,7 @@
       "package-name": "helixid-sdk-py",
       "extra-files": [
         {
-          "type": "python",
+          "type": "generic",
           "path": "src/helix_sdk/__init__.py"
         }
       ]
