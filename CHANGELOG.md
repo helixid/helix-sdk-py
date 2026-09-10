@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.0](https://github.com/helixid/helix-sdk-py/compare/helixid-sdk-py-v0.1.1...helixid-sdk-py-v1.0.0) (2026-09-09)
+
+
+### ⚠ BREAKING CHANGES
+
+* HelixClient no longer reads HELIX_API_URL from the environment; pass base_url explicitly to override the hosted default.
+
+### Features
+
+* default HelixClient's enterprise base_url to the hosted API ([98ba09b](https://github.com/helixid/helix-sdk-py/commit/98ba09b5d1cee9576ccc23263712f1a5ecc6e66d))
+
 ## [0.1.1](https://github.com/helixid/helix-sdk-py/compare/helixid-sdk-py-v0.1.0...helixid-sdk-py-v0.1.1) (2026-09-09)
 
 

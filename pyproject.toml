@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "helixid-sdk-py"
-version = "0.1.1"
+version = "1.0.0"
 description = "Python SDK for HelixID -- decentralized agent identity via DID/VC."
 readme = "README.md"
 requires-python = ">=3.9"
