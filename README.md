@@ -35,7 +35,7 @@ guides, and reference. This README covers only what is specific to this reposito
 
 ---
 
-## Status: v0.1.0, early
+## Status: v0.1.1, early
 
 This is the first release. Core local-signing primitives and the full
 `HelixClient` API surface are implemented and tested; a few areas are
@@ -93,6 +93,7 @@ client = HelixClient(
 
 # The enrollment token is minted beforehand by the agent's owner
 # (POST /v1/enrollment-tokens) -- not by the agent itself.
+token = "..."  # minted via POST /v1/enrollment-tokens
 onboarding = client.onboard_agent(token, ["https://agent.example.com"])
 agent_did = onboarding["agentDid"]
 
