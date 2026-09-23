@@ -158,30 +158,8 @@ class HelixClient:
     # -- prepare/finalize: see docs/proposal-sdk-api-only.md. prepare()
     # returns an unsigned payload + hash; the caller signs the hash locally
     # (private key never leaves the client) and finalize() attaches the
-    # signature. See delegation.py / grant.py / renewal.py for the full
-    # sign-and-submit flows built on top of these.
-
-    def prepare_delegation(
-        self, delegator_did: str, from_vc: Dict[str, Any], to: str, scopes: List[str], expires_in: int
-    ) -> Dict[str, Any]:
-        return self._http_required().post(
-            "/v1/vcs/delegation/prepare",
-            {
-                "delegatorDid": delegator_did,
-                "fromVC": from_vc,
-                "to": to,
-                "scopes": scopes,
-                "expiresIn": expires_in,
-            },
-        )
-
-    def finalize_delegation(
-        self, token: str, verification_method: str, signature_hex: str
-    ) -> Dict[str, Any]:
-        return self._http_required().post(
-            "/v1/vcs/delegation/finalize",
-            {"token": token, "verificationMethod": verification_method, "signatureHex": signature_hex},
-        )
+    # signature. See grant.py for the full sign-and-submit flow built on
+    # top of these (SP-side, not agent self-custody).
 
     def prepare_grant(self, **input: Any) -> Dict[str, Any]:
         return self._http_required().post("/v1/vcs/grant/prepare", input)
@@ -189,17 +167,6 @@ class HelixClient:
     def finalize_grant(self, token: str, verification_method: str, signature_hex: str) -> Dict[str, Any]:
         return self._http_required().post(
             "/v1/vcs/grant/finalize",
-            {"token": token, "verificationMethod": verification_method, "signatureHex": signature_hex},
-        )
-
-    def prepare_agent_renewal(self, **input: Any) -> Dict[str, Any]:
-        return self._http_required().post("/v1/vcs/agent-renewal/prepare", input)
-
-    def finalize_agent_renewal(
-        self, token: str, verification_method: str, signature_hex: str
-    ) -> Dict[str, Any]:
-        return self._http_required().post(
-            "/v1/vcs/agent-renewal/finalize",
             {"token": token, "verificationMethod": verification_method, "signatureHex": signature_hex},
         )
 

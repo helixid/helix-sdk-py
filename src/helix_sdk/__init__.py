@@ -25,8 +25,6 @@ from __future__ import annotations
 # Agent
 from .wallet import AgentWallet, WalletCredential
 from .vp_builder import VPBuilder, VPBuilderSignOverrides
-from .delegation import delegate
-from .renewal import renew_agent_vc
 
 # Issuer / SP
 from .grant import issue_grant, IssuerKeyMaterial
@@ -114,8 +112,6 @@ __all__ = [
     "WalletCredential",
     "VPBuilder",
     "VPBuilderSignOverrides",
-    "delegate",
-    "renew_agent_vc",
     "issue_grant",
     "IssuerKeyMaterial",
     "verify_vp",
