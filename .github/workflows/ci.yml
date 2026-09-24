@@ -30,8 +30,9 @@ jobs:
         run: pip install -e ".[dev,all]"
 
       # tests/test_golden_vectors.py is the cross-language parity safety
-      # net; tests/test_delegation_flow_mocked.py exercises the full
-      # delegate()/VPBuilder/wallet flow against a mocked HTTP layer;
+      # net; tests/test_client.py pins HelixClient's custodial routes
+      # (onboard/sign_vp/delegate_authority) against a stubbed HTTP layer;
+      # tests/test_wallet.py covers AgentWallet persistence and VPBuilder;
       # tests/test_framework_adapters.py exercises helix_mcp_middleware/
       # helix_langchain/helix_crewai against the real installed
       # langchain-core and crewai packages (not mocks of them). None of
