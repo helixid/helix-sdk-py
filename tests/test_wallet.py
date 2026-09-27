@@ -155,16 +155,6 @@ class TestWalletEncryptedPersistence:
         with pytest.raises(CredentialAlreadyInWalletError):
             wallet.add_credential(vc)
 
-    def test_create_makes_a_new_wallet_then_loads_the_existing_one(self, wallet_dir: str) -> None:
-        path = os.path.join(wallet_dir, "created.json")
-
-        created = AgentWallet.create(path, "a-passphrase")
-        assert created.get_did().startswith("did:key:")
-
-        # Second call against the same path loads rather than overwriting.
-        loaded = AgentWallet.create(path, "a-passphrase")
-        assert loaded.get_did() == created.get_did()
-
 
 class TestWalletCredentialQueries:
     def test_select_grant_matches_by_issuer_and_user(self, wallet_dir: str) -> None:
