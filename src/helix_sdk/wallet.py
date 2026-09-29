@@ -235,21 +235,6 @@ class AgentWallet:
             updated_at=stored.get("updatedAt"),
         )
 
-    @classmethod
-    def create(cls, wallet_path: str, passphrase: str, client: Optional[HelixClient] = None) -> "AgentWallet":
-        if Path(wallet_path).exists():
-            return cls.load(wallet_path, passphrase, client)
-        key_pair = keys.generate_key_pair()
-        wallet = cls(
-            client=client,
-            private_key_hex=key_pair.private_key,
-            did_value=f"did:key:{keys.public_key_to_multibase(key_pair.public_key)}",
-            wallet_path=wallet_path,
-            passphrase=passphrase,
-        )
-        wallet.save(wallet_path)
-        return wallet
-
     # -- credential management --------------------------------------------------
 
     def add_credential(self, vc: Dict[str, Any]) -> None:

@@ -157,11 +157,10 @@ modules, like `did.py`, currently have no direct unit tests at all) is
 real follow-up work, not something this tooling change did on its own.
 
 - `tests/test_golden_vectors.py` -- cross-language crypto parity (no network).
-- `tests/test_delegation_flow_mocked.py` -- exercises the full
-  `delegate()` / `VPBuilder` / wallet flow against a mocked HTTP layer that
-  faithfully reproduces helix-api's real prepare/finalize contract,
-  including asserting the delegator's private key never appears in any
-  outgoing request body.
+- `tests/test_wallet.py` -- `AgentWallet` encrypted persistence, credential
+  storage/queries, and `VPBuilder` local-signing round trip. (`delegate()`
+  and its mocked-HTTP tests were removed along with the rest of agent
+  self-custody.)
 - `tests/test_framework_adapters.py` -- exercises `helix_mcp_middleware`,
   `helix_langchain`, and `helix_crewai` against the real installed
   `langchain-core` and `crewai` packages (not mocks of them), so a real
