@@ -59,9 +59,10 @@ class RecordedCall:
 
 @pytest.fixture
 def http(monkeypatch: pytest.MonkeyPatch):
-    """Stubs requests.request (HttpAdapter) and requests.post (enterprise
-    custodial routes). Queue responses with http.respond(); inspect calls via
-    http.calls."""
+    """Stubs requests.request, which every HelixClient call goes through
+    (HttpAdapter). requests.post is stubbed too so nothing can reach the
+    network by another path. Queue responses with http.respond(); inspect
+    calls via http.calls."""
 
     class Stub:
         def __init__(self) -> None:
@@ -244,3 +245,58 @@ class TestEnterpriseMode:
         http.respond(500)
         with pytest.raises(InternalError):
             method(HelixClient(BASE_URL, api_key="hak_test"))
+
+    @pytest.mark.parametrize(
+        "call, method, path",
+        [
+            (lambda c: c.verify_vp({"id": "vp-1"}), "POST", "/v1/vp/verify"),
+            (lambda c: c.get_audit_log(), "GET", "/v1/audit-log"),
+            (lambda c: c.list_vcs(), "GET", "/v1/vcs"),
+            (lambda c: c.resolve_did(AGENT_DID), "GET", "/v1/dids/did%3Aweb%3Ahelix.test%3Aagents%3Aa1"),
+            (lambda c: c.revoke_vc("vc-1"), "POST", "/v1/vcs/vc-1/revoke"),
+        ],
+    )
+    def test_every_call_carries_the_account_key(self, http, call, method, path) -> None:
+        # Not just sign_vp/delegate_authority: without the key the server has
+        # no account to attribute a verification to, and refuses the rest.
+        http.respond(200, {})
+        call(HelixClient(BASE_URL, api_key="hak_test"))
+
+        sent = http.calls[0]
+        assert (sent.method, sent.url) == (method, f"{BASE_URL}{path}")
+        assert sent.headers["authorization"] == "Bearer hak_test"
+        assert "x-admin-api-key" not in sent.headers
+
+    def test_admin_key_mode_sends_no_bearer_token(self, http) -> None:
+        http.respond(200, [])
+        HelixClient(BASE_URL, admin_api_key="admin").get_audit_log()
+        assert http.calls[0].headers == {"x-admin-api-key": "admin"}
+
+    def test_get_audit_log_passes_the_paging_and_agent_filters(self, http) -> None:
+        http.respond(200, [])
+        HelixClient(BASE_URL, api_key="hak_test").get_audit_log(
+            event_type="VP_REJECTED", before="2026-06-01T00:00:00.000Z", agent_did=AGENT_DID, limit=10
+        )
+        assert http.calls[0].url == (
+            f"{BASE_URL}/v1/audit-log?eventType=VP_REJECTED&before=2026-06-01T00%3A00%3A00.000Z"
+            "&agentDid=did%3Aweb%3Ahelix.test%3Aagents%3Aa1&limit=10"
+        )
+
+    def test_consent_audit_is_posted_with_the_account_key(self, http) -> None:
+        http.respond(201, {"recorded": True})
+        HelixClient(BASE_URL, api_key="hak_test").record_consent_granted_audit(vcId="vc-1", agentDid=AGENT_DID)
+
+        sent = http.calls[0]
+        assert sent.url == f"{BASE_URL}/v1/audit-log/consent-granted"
+        assert sent.headers["authorization"] == "Bearer hak_test"
+        assert sent.json["vcId"] == "vc-1"
+
+    def test_consent_audit_is_skipped_without_any_credential(self, http) -> None:
+        HelixClient(BASE_URL).record_consent_granted_audit(vcId="vc-1", agentDid=AGENT_DID)
+        assert http.calls == []
+
+    def test_consent_audit_failure_never_reaches_the_caller(self, http) -> None:
+        http.respond(500)
+        HelixClient(BASE_URL, api_key="hak_test").record_consent_granted_audit(vcId="vc-1", agentDid=AGENT_DID)
+        assert len(http.calls) == 1
+

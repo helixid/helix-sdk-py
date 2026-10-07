@@ -24,9 +24,19 @@ from .errors import map_api_error
 
 
 class HttpAdapter:
-    def __init__(self, base_url: str, admin_api_key: Optional[str] = None, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        admin_api_key: Optional[str] = None,
+        timeout: float = 30.0,
+        api_key: Optional[str] = None,
+    ) -> None:
         self._base_url = base_url[:-1] if base_url.endswith("/") else base_url
         self._admin_api_key = admin_api_key
+        # Enterprise mode: the account API key, sent as the bearer token on
+        # every call to the HelixID API so the server knows which account
+        # is asking.
+        self._api_key = api_key
         self._timeout = timeout
 
     def has_admin_api_key(self) -> bool:
@@ -42,12 +52,16 @@ class HttpAdapter:
         return self._request("DELETE", path)
 
     def _request(self, method: str, path: str, body: Optional[Any] = None) -> Any:
-        url = path if path.startswith("http") else f"{self._base_url}{path}"
+        external = path.startswith("http")
+        url = path if external else f"{self._base_url}{path}"
         headers = {}
         if body is not None:
             headers["content-type"] = "application/json"
         if self._admin_api_key:
             headers["x-admin-api-key"] = self._admin_api_key
+        # Never sent to an absolute URL, which is some other host.
+        if self._api_key and not external:
+            headers["authorization"] = f"Bearer {self._api_key}"
 
         response = requests.request(
             method, url, json=body if body is not None else None, headers=headers, timeout=self._timeout
