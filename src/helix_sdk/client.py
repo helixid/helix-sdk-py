@@ -20,11 +20,10 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlencode
 
-import requests
 
 from . import jwt as helix_jwt
 from . import keys
-from .errors import SDKOnlyModeNoAPIError, map_api_error
+from .errors import SDKOnlyModeNoAPIError
 from .http_adapter import HttpAdapter
 
 # Used only when api_key is given with no explicit base_url -- see
@@ -51,8 +50,9 @@ class HelixClient:
                                                # API key (see
                                                # helix-server-enterprise's
                                                # POST /v1/account/api-keys), sent
-                                               # as the bearer token directly, no
-                                               # login call. base_url defaults to
+                                               # as the bearer token on every
+                                               # call, no login call. base_url
+                                               # defaults to
                                                # the hosted enterprise API when
                                                # omitted here.
     """
@@ -68,13 +68,15 @@ class HelixClient:
             resolved_base_url = _DEFAULT_ENTERPRISE_URL
 
         self._sdk_only_mode = resolved_base_url is None
-        self._api_audit_enabled = resolved_base_url is not None and bool(admin_api_key)
+        # Audit posting needs a credential the server will accept: the admin
+        # key in OSS/core mode, the account API key in enterprise mode.
+        self._api_audit_enabled = resolved_base_url is not None and bool(admin_api_key or api_key)
         self._base_url = (
             resolved_base_url[:-1] if resolved_base_url and resolved_base_url.endswith("/") else resolved_base_url
         )
         self._api_key = api_key
         self._http: Optional[HttpAdapter] = (
-            None if self._sdk_only_mode else HttpAdapter(resolved_base_url, admin_api_key)
+            None if self._sdk_only_mode else HttpAdapter(resolved_base_url, admin_api_key, api_key=api_key)
         )
 
     # -- DID lifecycle ------------------------------------------------------
@@ -186,8 +188,16 @@ class HelixClient:
         event_type: Optional[str] = None,
         since: Optional[str] = None,
         limit: Optional[int] = None,
+        before: Optional[str] = None,
+        agent_did: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        qs = _query_string({"eventType": event_type, "since": since, "limit": limit})
+        """Newest-first audit events. In enterprise mode these are the
+        calling account's own. before (an ISO timestamp; pass the last
+        row's) pages back, and agent_did narrows to one agent -- both are
+        enterprise-only filters that core ignores."""
+        qs = _query_string(
+            {"eventType": event_type, "since": since, "before": before, "agentDid": agent_did, "limit": limit}
+        )
         return self._http_required().get(f"/v1/audit-log{qs}")
 
     def record_consent_granted_audit(self, **entry: Any) -> None:
@@ -211,7 +221,9 @@ class HelixClient:
         expected_target_service: Optional[str] = None,
         allow_self_signed: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        """Verifies a VP via POST /v1/vp/verify. Signature check,
+        """Verifies a VP via POST /v1/vp/verify. In enterprise mode the
+        call carries the account API key, so the verification is recorded
+        against the verifying account as well as the agent's. Signature check,
         delegation-chain walk, expiry, target service, and revocation all
         happen server-side, with VP_VERIFIED/VP_REJECTED audit logging
         handled there too -- there is no local fallback, by design (see
@@ -274,22 +286,8 @@ class HelixClient:
         if vc_id is not None:
             body["vcId"] = vc_id
 
-        if self._api_key:
-            response = requests.post(
-                f"{self._base_url}/v1/custodial-agents/{quote(did, safe='')}/vp",
-                json=body,
-                headers={"content-type": "application/json", "authorization": f"Bearer {self._api_key}"},
-                timeout=30.0,
-            )
-            try:
-                data = response.json()
-            except ValueError:
-                data = {}
-            if not response.ok:
-                raise map_api_error({**(data if isinstance(data, dict) else {}), "status": response.status_code})
-            return data["signedVP"]
-
-        result = self._http_required().post(f"/v1/agents/{quote(did, safe='')}/vp", body)
+        route = "custodial-agents" if self._api_key else "agents"
+        result = self._http_required().post(f"/v1/{route}/{quote(did, safe='')}/vp", body)
         return result["signedVP"]
 
     def delegate_authority(
@@ -316,22 +314,8 @@ class HelixClient:
         if vc_id is not None:
             body["vcId"] = vc_id
 
-        if self._api_key:
-            response = requests.post(
-                f"{self._base_url}/v1/custodial-agents/{quote(did, safe='')}/delegate",
-                json=body,
-                headers={"content-type": "application/json", "authorization": f"Bearer {self._api_key}"},
-                timeout=30.0,
-            )
-            try:
-                data = response.json()
-            except ValueError:
-                data = {}
-            if not response.ok:
-                raise map_api_error({**(data if isinstance(data, dict) else {}), "status": response.status_code})
-            return data["delegatedVC"]
-
-        result = self._http_required().post(f"/v1/agents/{quote(did, safe='')}/delegate", body)
+        route = "custodial-agents" if self._api_key else "agents"
+        result = self._http_required().post(f"/v1/{route}/{quote(did, safe='')}/delegate", body)
         return result["delegatedVC"]
 
     def request_user_challenge(self, user_did: str) -> Dict[str, Any]:
