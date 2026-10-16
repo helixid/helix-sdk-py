@@ -155,20 +155,52 @@ class HelixClient:
         response = self._http_required().get(f"/v1/vcs/{quote(vc['id'], safe='')}/status")
         return response["status"]
 
-    # -- prepare/finalize: see docs/proposal-sdk-api-only.md. prepare()
-    # returns an unsigned payload + hash; the caller signs the hash locally
-    # (private key never leaves the client) and finalize() attaches the
-    # signature. See grant.py for the full sign-and-submit flow built on
-    # top of these (SP-side, not agent self-custody).
+    # -- Service Providers ---------------------------------------------------
+    # Services hold no keys: the server mints the service DID, keeps its key,
+    # and signs consent grants on the service's behalf -- the same custody
+    # model as agents (onboard_agent / sign_vp / delegate_authority).
 
-    def prepare_grant(self, **input: Any) -> Dict[str, Any]:
-        return self._http_required().post("/v1/vcs/grant/prepare", input)
+    def create_service(
+        self,
+        service_name: str,
+        display_name: str,
+        verified_domain: str,
+        api_endpoint: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Enrolls a service on a self-hosted server (admin key). Hosted
+        accounts enroll through the console / account API instead.
+        Returns {serviceDid, serviceName}."""
+        body: Dict[str, Any] = {
+            "serviceName": service_name,
+            "displayName": display_name,
+            "verifiedDomain": verified_domain,
+        }
+        if api_endpoint is not None:
+            body["apiEndpoint"] = api_endpoint
+        return self._http_required().post("/v1/services", body)
 
-    def finalize_grant(self, token: str, verification_method: str, signature_hex: str) -> Dict[str, Any]:
-        return self._http_required().post(
-            "/v1/vcs/grant/finalize",
-            {"token": token, "verificationMethod": verification_method, "signatureHex": signature_hex},
-        )
+    def issue_service_delegation_grant(
+        self,
+        service_did: str,
+        agent_did: str,
+        user_did: str,
+        scopes: List[str],
+        durability: str = "standing",
+    ) -> Dict[str, Any]:
+        """Issues a DelegationGrantCredential from `service_did` to `agent_did`
+        on `user_did`'s behalf: built, signed with the service's server-held
+        key and stored with a revocable status-list entry, in one call.
+        `user_did` is recorded as given, never resolved. Revoke with
+        revoke_vc(). Returns the signed grant VC."""
+        body = {
+            "serviceDid": service_did,
+            "agentDid": agent_did,
+            "userDid": user_did,
+            "scopes": scopes,
+            "durability": durability,
+        }
+        result = self._http_required().post("/v1/service-delegation-grants", body)
+        return result["grantVC"]
 
     # -- Status lists ---------------------------------------------------------
 

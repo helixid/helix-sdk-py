@@ -129,6 +129,36 @@ class TestCoreMode:
         assert call.url == f"{BASE_URL}/v1/agents/did%3Aweb%3Ahelix.test%3Aagents%3Aa1/vp"
         assert call.json == {"targetService": "orders", "userDid": "did:web:user", "grantVC": grant, "vcId": "vc-2"}
 
+    def test_create_service_posts_to_v1_services(self, http) -> None:
+        http.respond(201, {"serviceDid": "did:web:helix.test:services:s1", "serviceName": "orders"})
+        client = HelixClient(BASE_URL, admin_api_key="admin")
+
+        result = client.create_service("orders", "Orders", "https://orders.example")
+
+        assert result["serviceDid"] == "did:web:helix.test:services:s1"
+        call = http.calls[0]
+        assert (call.method, call.url) == ("POST", f"{BASE_URL}/v1/services")
+        assert call.json == {"serviceName": "orders", "displayName": "Orders", "verifiedDomain": "https://orders.example"}
+
+    def test_issue_service_delegation_grant_unwraps_the_grant(self, http) -> None:
+        http.respond(201, {"grantVC": {"id": "vc:helix:grant:1", "issuer": "did:web:helix.test:services:s1"}})
+        client = HelixClient(BASE_URL, admin_api_key="admin")
+
+        grant = client.issue_service_delegation_grant(
+            "did:web:helix.test:services:s1", AGENT_DID, "did:web:mock.local:users:alice", ["read:calendar"]
+        )
+
+        assert grant["id"] == "vc:helix:grant:1"
+        call = http.calls[0]
+        assert (call.method, call.url) == ("POST", f"{BASE_URL}/v1/service-delegation-grants")
+        assert call.json == {
+            "serviceDid": "did:web:helix.test:services:s1",
+            "agentDid": AGENT_DID,
+            "userDid": "did:web:mock.local:users:alice",
+            "scopes": ["read:calendar"],
+            "durability": "standing",
+        }
+
     def test_sign_vp_omits_unset_optional_fields(self, http) -> None:
         http.respond(200, {"signedVP": {"id": "vp-1"}})
         HelixClient(BASE_URL, admin_api_key="admin").sign_vp(AGENT_DID, "orders")

@@ -26,9 +26,6 @@ from __future__ import annotations
 from .wallet import AgentWallet, WalletCredential
 from .vp_builder import VPBuilder, VPBuilderSignOverrides
 
-# Issuer / SP
-from .grant import issue_grant, IssuerKeyMaterial
-
 # Verifier
 from .verify import verify_vp
 from .scope import check_scope, require_scope
@@ -112,8 +109,6 @@ __all__ = [
     "WalletCredential",
     "VPBuilder",
     "VPBuilderSignOverrides",
-    "issue_grant",
-    "IssuerKeyMaterial",
     "verify_vp",
     "check_scope",
     "require_scope",
