@@ -91,12 +91,6 @@ client = HelixClient(
     admin_api_key="...",  # signing is admin-gated in OSS
 )
 
-# The enrollment token is minted beforehand by the agent's owner
-# (POST /v1/enrollment-tokens) -- not by the agent itself.
-token = "..."  # minted via POST /v1/enrollment-tokens
-onboarding = client.onboard_agent(token, ["https://agent.example.com"])
-agent_did = onboarding["agentDid"]
-
 # Signing is an API call: the caller never has the agent's private key.
 vp = client.sign_vp(agent_did, "https://api.example.com/v1/tools/orders")
 
