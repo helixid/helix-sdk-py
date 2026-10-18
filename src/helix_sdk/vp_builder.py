@@ -51,8 +51,8 @@ class VPBuilderSignOverrides:
 
 @dataclass
 class VPBuilder:
-    """1 or 2 credentials: exactly one agent-authority VC, optionally one
-    consent grant."""
+    """Exactly one agent-authority VC, plus any number of consent grants
+    (the verifier takes the union of their scopes)."""
 
     credentials: List[Dict[str, Any]]
     holder_did: str
@@ -61,18 +61,14 @@ class VPBuilder:
 
     def __post_init__(self) -> None:
         credentials = self.credentials
-        if not isinstance(credentials, list) or not (1 <= len(credentials) <= 2):
-            raise VPInvalidStructureError("VP must carry 1 or 2 credentials")
+        if not isinstance(credentials, list) or len(credentials) < 1:
+            raise VPInvalidStructureError("VP must carry at least one credential")
         agent_entries = [vc for vc in credentials if _is_agent_authority_type(vc)]
         grant_entries = [vc for vc in credentials if _is_grant_type(vc)]
-        if (
-            len(agent_entries) != 1
-            or len(grant_entries) > 1
-            or len(agent_entries) + len(grant_entries) != len(credentials)
-        ):
+        if len(agent_entries) != 1 or len(agent_entries) + len(grant_entries) != len(credentials):
             raise VPInvalidStructureError(
                 "VP credential array must contain exactly one agent-authority "
-                "credential and at most one consent grant"
+                "credential, and otherwise only consent grants"
             )
 
     def sign(
