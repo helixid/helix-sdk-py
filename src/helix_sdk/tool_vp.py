@@ -19,7 +19,11 @@ from __future__ import annotations
 
 import base64
 import json
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
+
+from .vp_transport import helix_vp_headers
 
 if TYPE_CHECKING:
     from .client import HelixClient
@@ -32,6 +36,27 @@ def build_signed_vp(
     user_did: Optional[str] = None,
 ) -> Dict[str, Any]:
     return client.sign_vp(agent_did, target_service, user_did=user_did)
+
+
+# The VP for the tool call in progress. Wrapped tools read it from here and
+# send it as the X-Helix-VP header; it never goes into the tool's arguments,
+# so it stays out of the model's view.
+_current_vp_headers: ContextVar[Dict[str, str]] = ContextVar("helix_vp_headers", default={})
+
+
+@contextmanager
+def helix_vp_context(vp: Dict[str, Any]) -> Iterator[None]:
+    token = _current_vp_headers.set(helix_vp_headers(vp))
+    try:
+        yield
+    finally:
+        _current_vp_headers.reset(token)
+
+
+def current_helix_vp_headers() -> Dict[str, str]:
+    """The headers to send with the protected request made inside a wrapped
+    tool: {"X-Helix-VP": <base64url VP>}. Empty outside a wrapped call."""
+    return dict(_current_vp_headers.get())
 
 
 def get_agent_scopes(client: "HelixClient", agent_did: str) -> List[str]:

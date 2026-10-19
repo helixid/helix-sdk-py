@@ -36,8 +36,9 @@ def fake_client_and_did():
 
 
 class TestMCP:
-    def test_attach_helix_vp_adds_vp_to_input(self, fake_client_and_did) -> None:
+    def test_attach_helix_vp_adds_vp_to_meta(self, fake_client_and_did) -> None:
         from helix_mcp_middleware import attach_helix_vp, AttachHelixVPOptions
+        from helix_sdk import decode_helix_vp
 
         client, did = fake_client_and_did
         tool_call = {"name": "get_orders", "input": {"orderId": "123"}}
@@ -45,12 +46,12 @@ class TestMCP:
             tool_call,
             AttachHelixVPOptions(client=client, agent_did=did, target_service="https://svc.example.invalid"),
         )
-        assert result["input"]["orderId"] == "123"
-        assert result["input"]["_helixVP"]["holder"] == did
+        assert result["input"] == {"orderId": "123"}
+        assert decode_helix_vp(result["_meta"]["x-helix-vp"])["holder"] == did
         client.sign_vp.assert_called_once_with(did, "https://svc.example.invalid", user_did=None)
         # Original tool_call must be untouched (shallow-copy semantics,
         # matching the JS spread-based implementation).
-        assert "_helixVP" not in tool_call["input"]
+        assert "_meta" not in tool_call
 
     def test_middleware_rejects_missing_vp(self) -> None:
         from helix_mcp_middleware import helixid_mcp_middleware, MCPMiddlewareOptions
@@ -61,8 +62,40 @@ class TestMCP:
         with pytest.raises(VPMissingError):
             middleware({"name": "get_orders", "input": {}})
 
+    def test_middleware_ignores_vp_in_tool_arguments(self) -> None:
+        from helix_mcp_middleware import helixid_mcp_middleware, MCPMiddlewareOptions
+        from helix_sdk.errors import VPMissingError
+
+        fake_client = MagicMock()
+        middleware = helixid_mcp_middleware(MCPMiddlewareOptions(client=fake_client))
+        with pytest.raises(VPMissingError):
+            middleware({"name": "get_orders", "input": {"_helixVP": {"id": "vp:1"}}})
+        fake_client.verify_vp.assert_not_called()
+
+    def test_middleware_rejects_malformed_meta_vp(self) -> None:
+        from helix_mcp_middleware import helixid_mcp_middleware, MCPMiddlewareOptions
+        from helix_sdk.errors import VPInvalidStructureError
+
+        middleware = helixid_mcp_middleware(MCPMiddlewareOptions(client=MagicMock()))
+        with pytest.raises(VPInvalidStructureError):
+            middleware({"name": "get_orders", "_meta": {"x-helix-vp": "not json"}})
+
+    def test_middleware_reads_x_helix_vp_header(self) -> None:
+        from helix_mcp_middleware import helixid_mcp_middleware, MCPMiddlewareOptions
+        from helix_sdk import encode_helix_vp
+
+        fake_client = MagicMock()
+        fake_client.verify_vp.return_value = {"valid": True, "effectiveScopes": ["read:orders"]}
+        middleware = helixid_mcp_middleware(
+            MCPMiddlewareOptions(client=fake_client, required_scopes=["read:orders"])
+        )
+        call = {"name": "get_orders", "headers": {"x-helix-vp": encode_helix_vp({"id": "vp:1"})}}
+        assert middleware(call) is call
+        assert fake_client.verify_vp.call_args.args[0] == {"id": "vp:1"}
+
     def test_middleware_verifies_and_checks_scope(self) -> None:
         from helix_mcp_middleware import helixid_mcp_middleware, MCPMiddlewareOptions
+        from helix_sdk import encode_helix_vp
         from helix_sdk.errors import InsufficientScopeError
 
         fake_client = MagicMock()
@@ -71,17 +104,18 @@ class TestMCP:
             MCPMiddlewareOptions(client=fake_client, required_scopes=["write:orders"])
         )
         with pytest.raises(InsufficientScopeError):
-            middleware({"name": "get_orders", "input": {"_helixVP": {"id": "vp:1"}}})
+            middleware({"name": "get_orders", "_meta": {"x-helix-vp": encode_helix_vp({"id": "vp:1"})}})
 
         fake_client.verify_vp.assert_called_once()
 
 
 class TestLangChain:
-    def test_tool_wrapper_injects_vp_and_delegates(self, fake_client_and_did) -> None:
+    def test_tool_wrapper_exposes_vp_header_and_delegates(self, fake_client_and_did) -> None:
         pytest.importorskip("langchain_core", reason="langchain-core requires Python >= 3.10")
         from langchain_core.tools import BaseTool
         from pydantic import BaseModel, Field
-        from helix_langchain import helix_id_tool_wrapper
+        from helix_langchain import helix_id_tool_wrapper, current_helix_vp_headers
+        from helix_sdk import decode_helix_vp
 
         client, did = fake_client_and_did
 
@@ -97,13 +131,16 @@ class TestLangChain:
 
             def _run(self, *args: Any, **kwargs: Any) -> Any:
                 captured.update(kwargs)
+                captured["headers"] = current_helix_vp_headers()
                 return "ok"
 
         wrapped = helix_id_tool_wrapper(RealTool(), client, did, target_service="https://svc.example.invalid")
         result = wrapped.run({"order_id": "123"})
         assert result == "ok"
         assert captured["order_id"] == "123"
-        assert captured["_helixVP"]["holder"] == did
+        assert "_helixVP" not in captured
+        assert decode_helix_vp(captured["headers"]["X-Helix-VP"])["holder"] == did
+        assert current_helix_vp_headers() == {}
 
     def test_filter_tools_by_scope(self, fake_client_and_did) -> None:
         pytest.importorskip("langchain_core", reason="langchain-core requires Python >= 3.10")
@@ -126,11 +163,12 @@ class TestLangChain:
 
 
 class TestCrewAI:
-    def test_crewai_tool_wrapper_injects_vp_and_delegates(self, fake_client_and_did) -> None:
+    def test_crewai_tool_wrapper_exposes_vp_header_and_delegates(self, fake_client_and_did) -> None:
         pytest.importorskip("crewai", reason="crewai requires Python >= 3.10")
         from crewai.tools import BaseTool
         from pydantic import BaseModel, Field
-        from helix_crewai import helix_id_crewai_tool
+        from helix_crewai import helix_id_crewai_tool, current_helix_vp_headers
+        from helix_sdk import decode_helix_vp
 
         client, did = fake_client_and_did
 
@@ -146,13 +184,16 @@ class TestCrewAI:
 
             def _run(self, *args: Any, **kwargs: Any) -> Any:
                 captured.update(kwargs)
+                captured["headers"] = current_helix_vp_headers()
                 return "ok"
 
         wrapped = helix_id_crewai_tool(RealTool(), client, did, target_service="https://svc.example.invalid")
         result = wrapped.run(order_id="123")
         assert result == "ok"
         assert captured["order_id"] == "123"
-        assert captured["_helixVP"]["holder"] == did
+        assert "_helixVP" not in captured
+        assert decode_helix_vp(captured["headers"]["X-Helix-VP"])["holder"] == did
+        assert current_helix_vp_headers() == {}
 
     def test_filter_crewai_tools_by_scope(self, fake_client_and_did) -> None:
         pytest.importorskip("crewai", reason="crewai requires Python >= 3.10")

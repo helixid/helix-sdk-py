@@ -120,14 +120,13 @@ class TestCoreMode:
     def test_sign_vp_hits_the_admin_route_with_optional_fields(self, http) -> None:
         http.respond(200, {"signedVP": {"id": "vp-1"}})
         client = HelixClient(BASE_URL, admin_api_key="admin")
-        grant = {"id": "grant-1"}
 
-        vp = client.sign_vp(AGENT_DID, "orders", user_did="did:web:user", grant_vc=grant, vc_id="vc-2")
+        vp = client.sign_vp(AGENT_DID, "orders", user_did="did:web:user")
 
         assert vp == {"id": "vp-1"}
         call = http.calls[0]
         assert call.url == f"{BASE_URL}/v1/agents/did%3Aweb%3Ahelix.test%3Aagents%3Aa1/vp"
-        assert call.json == {"targetService": "orders", "userDid": "did:web:user", "grantVC": grant, "vcId": "vc-2"}
+        assert call.json == {"targetService": "orders", "userDid": "did:web:user"}
 
     def test_create_service_posts_to_v1_services(self, http) -> None:
         http.respond(201, {"serviceDid": "did:web:helix.test:services:s1", "serviceName": "orders"})
@@ -254,13 +253,13 @@ class TestEnterpriseMode:
         http.respond(200, {"signedVP": {"id": "vp-1"}})
         client = HelixClient(BASE_URL, api_key="hak_test")
 
-        vp = client.sign_vp(AGENT_DID, "orders", vc_id="vc-2")
+        vp = client.sign_vp(AGENT_DID, "orders")
 
         assert vp == {"id": "vp-1"}
         call = http.calls[0]
         assert call.url == f"{BASE_URL}/v1/custodial-agents/did%3Aweb%3Ahelix.test%3Aagents%3Aa1/vp"
         assert call.headers["authorization"] == "Bearer hak_test"
-        assert call.json == {"targetService": "orders", "vcId": "vc-2"}
+        assert call.json == {"targetService": "orders"}
 
     def test_every_call_carries_the_bearer_token_not_an_admin_header(self, http) -> None:
         # The grant route and the VC lifecycle routes used to go out with no

@@ -32,8 +32,10 @@ from __future__ import annotations
 
 from .middleware import helix_id_crewai_tool
 from .scope_filter import filter_crewai_tools_by_scope
+from helix_sdk.tool_vp import current_helix_vp_headers
 
 __all__ = [
     "helix_id_crewai_tool",
+    "current_helix_vp_headers",
     "filter_crewai_tools_by_scope",
 ]

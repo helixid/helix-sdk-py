@@ -15,7 +15,9 @@ from helix_sdk import HelixClient
 MCPToolCall = Dict[str, Any]
 """A dict with at least 'name' and 'input' keys, matching the JS
 MCPToolCall interface's structural typing (input is an untyped
-Record<string, unknown> on both sides)."""
+Record<string, unknown> on both sides). The VP is carried in '_meta' (the
+MCP request's params._meta, key "x-helix-vp") or, over HTTP, in 'headers'
+(X-Helix-VP) -- never in 'input'."""
 
 
 @dataclass

@@ -300,23 +300,18 @@ class HelixClient:
         did: str,
         target_service: str,
         user_did: Optional[str] = None,
-        grant_vc: Optional[Dict[str, Any]] = None,
-        vc_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Signs a VP on behalf of a server-custody agent -- the caller
         never has, and never can have, the private key, so this is an API
-        call instead of local VPBuilder signing. The server looks up the
-        agent's active HelixAgentCredential itself; pass vc_id to pin a
-        specific one instead (e.g. right after a renewal, when more than
-        one is active).
+        call instead of local VPBuilder signing. The server picks the
+        credentials from the DIDs alone: every active HelixAgentCredential
+        the agent holds (its own, plus any delegated to it).
 
         `target_service` is the DID of the service the VP is for. With a
         `user_did` the agent is acting on that user's behalf, and the server
         attaches every active DelegationGrantCredential that service issued
         to this agent for that user; none at all raises
-        CONSENT_GRANT_NOT_FOUND, meaning the user has not consented yet. A
-        caller that already holds a grant may pass it as grant_vc instead
-        of having it looked up.
+        CONSENT_GRANT_NOT_FOUND, meaning the user has not consented yet.
 
         Enterprise mode (self._api_key set): custodial signing is
         account-scoped, so this targets /v1/custodial-agents/:did/vp instead
@@ -326,10 +321,6 @@ class HelixClient:
         body: Dict[str, Any] = {"targetService": target_service}
         if user_did is not None:
             body["userDid"] = user_did
-        if grant_vc is not None:
-            body["grantVC"] = grant_vc
-        if vc_id is not None:
-            body["vcId"] = vc_id
 
         route = "custodial-agents" if self._api_key else "agents"
         result = self._http_required().post(f"/v1/{route}/{quote(did, safe='')}/vp", body)
@@ -342,6 +333,7 @@ class HelixClient:
         scopes: List[str],
         expires_in: int,
         vc_id: Optional[str] = None,
+        revoke_existing: bool = False,
     ) -> Dict[str, Any]:
         """Delegates a slice of a server-custody agent's authority to another
         DID -- the custodial counterpart to a wallet-based delegate(), which
@@ -353,11 +345,17 @@ class HelixClient:
         Mirrors sign_vp()'s two modes: enterprise (self._api_key set) hits
         the account-scoped custodial route; core/OSS hits the admin-key-gated
         route. Auth is the adapter's job either way. Pass vc_id to pin which
-        of the delegator's active credentials to delegate from."""
+        of the delegator's active credentials to delegate from.
+
+        Same rule as every stored credential: delegating the same scopes
+        again refreshes the earlier delegation, other scopes stand beside
+        it, `revoke_existing` clears the others."""
         self._assert_api_configured()
         body: Dict[str, Any] = {"to": to, "scopes": scopes, "expiresIn": expires_in}
         if vc_id is not None:
             body["vcId"] = vc_id
+        if revoke_existing:
+            body["revokeExisting"] = True
 
         route = "custodial-agents" if self._api_key else "agents"
         result = self._http_required().post(f"/v1/{route}/{quote(did, safe='')}/delegate", body)

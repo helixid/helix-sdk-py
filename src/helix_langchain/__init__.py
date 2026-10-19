@@ -14,9 +14,11 @@ from __future__ import annotations
 
 from .middleware import helix_id_tool_wrapper, HelixIDCallbackHandler, encode_base64url_json_public
 from .scope_filter import filter_tools_by_scope
+from helix_sdk.tool_vp import current_helix_vp_headers
 
 __all__ = [
     "helix_id_tool_wrapper",
+    "current_helix_vp_headers",
     "HelixIDCallbackHandler",
     "encode_base64url_json_public",
     "filter_tools_by_scope",

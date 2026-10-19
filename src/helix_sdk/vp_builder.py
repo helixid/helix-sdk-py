@@ -51,8 +51,8 @@ class VPBuilderSignOverrides:
 
 @dataclass
 class VPBuilder:
-    """Exactly one agent-authority VC, plus any number of consent grants
-    (the verifier takes the union of their scopes)."""
+    """At least one agent-authority VC, plus any number of consent grants
+    (the verifier takes the union of each kind's scopes)."""
 
     credentials: List[Dict[str, Any]]
     holder_did: str
@@ -65,9 +65,9 @@ class VPBuilder:
             raise VPInvalidStructureError("VP must carry at least one credential")
         agent_entries = [vc for vc in credentials if _is_agent_authority_type(vc)]
         grant_entries = [vc for vc in credentials if _is_grant_type(vc)]
-        if len(agent_entries) != 1 or len(agent_entries) + len(grant_entries) != len(credentials):
+        if len(agent_entries) < 1 or len(agent_entries) + len(grant_entries) != len(credentials):
             raise VPInvalidStructureError(
-                "VP credential array must contain exactly one agent-authority "
+                "VP credential array must contain at least one agent-authority "
                 "credential, and otherwise only consent grants"
             )
 

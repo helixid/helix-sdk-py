@@ -69,11 +69,15 @@ re-copy the three JSON files here too, the same way `helix-sdk-js` does.
 
 - **`helix_sdk`** -- core SDK (see Quick example below).
 - **`helix_mcp_middleware`** -- Model Context Protocol integration:
-  server-side VP verification middleware and client-side VP attachment.
+  server-side VP verification middleware and client-side VP attachment
+  (the VP rides in the request's `params._meta["x-helix-vp"]`, or the
+  `X-Helix-VP` header over HTTP, never in tool arguments).
   Install with the `mcp-middleware` extra:
   `pip install helixid-sdk-py[mcp-middleware]`.
 - **`helix_langchain`** -- LangChain integration: a tool wrapper that
-  injects a signed VP into every tool call, plus scope-based tool
+  signs a fresh VP for every tool call and exposes it to the tool via
+  `current_helix_vp_headers()` (an `X-Helix-VP` header for the tool's
+  outbound request; tool input is untouched), plus scope-based tool
   filtering. Install with `pip install helixid-sdk-py[langchain]`.
 - **`helix_crewai`** -- CrewAI integration, following the same pattern as
   `helix_langchain`. There is no CrewAI counterpart in `helix-sdk-js` --
@@ -192,14 +196,13 @@ example scripts above.
   own local-signing primitives grow a `did:hedera` creation path.
 - **No `widget` package** (helix-sdk-js's browser-embeddable consent
   widget has no obvious Python equivalent and hasn't been attempted).
-- **`HelixIDCallbackHandler` in `helix_langchain` cannot rewrite tool
-  input before execution** -- documented in its own docstring. LangChain
+- **`HelixIDCallbackHandler` in `helix_langchain` is a no-op.** LangChain
   Python's `on_tool_start` callback is a notification hook, not an
-  interceptor (unlike the JS SDK's bespoke `RunnableConfigLike.
-  handleToolStart`, which really can mutate input first). Real VP
-  injection happens through `helix_id_tool_wrapper()` instead; the
-  callback handler is offered for observability/wallet-warming only. This
-  is a genuine LangChain Python API constraint, not an incomplete port.
+  interceptor, and VPs no longer travel in tool input anyway. VP signing
+  happens in `helix_id_tool_wrapper()`, which hands the VP to the tool
+  through `current_helix_vp_headers()`; the callback handler is kept only
+  for observability use. (The JS SDK has dropped its callback form,
+  `HelixIDMiddleware`, entirely.)
 - **Version numbering does not yet track `helix-sdk-js`'s version.** Per
   `docs/decision-sdk-py-scope.md`, this SDK's version should track the JS
   SDK's; that mapping strategy hasn't been decided yet, so this starts at

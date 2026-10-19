@@ -101,10 +101,26 @@ from .errors import (  # noqa: F401
     InsufficientScopeError,
 )
 from . import codes  # noqa: F401
+from .vp_transport import (
+    HELIX_VP_HEADER,
+    HELIX_VP_META_KEY,
+    encode_helix_vp,
+    decode_helix_vp,
+    helix_vp_headers,
+    read_helix_vp_header,
+    read_helix_vp_meta,
+)
 
 __version__ = "1.0.0"  # x-release-please-version
 
 __all__ = [
+    "HELIX_VP_HEADER",
+    "HELIX_VP_META_KEY",
+    "encode_helix_vp",
+    "decode_helix_vp",
+    "helix_vp_headers",
+    "read_helix_vp_header",
+    "read_helix_vp_meta",
     "AgentWallet",
     "WalletCredential",
     "VPBuilder",

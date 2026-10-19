@@ -8,8 +8,9 @@ Server-side MCP tool-call verification middleware, ported from
 helix-sdk-js's mcp/src/middleware.ts.
 
 Wrap an MCP tool handler with this to require every incoming tool call to
-carry a valid, API-verified `_helixVP` -- and optionally to require
-specific privilege scopes.
+carry a valid, API-verified VP in `_meta["x-helix-vp"]` or the X-Helix-VP
+header -- and optionally to require specific privilege scopes. Tool
+arguments are never consulted.
 """
 
 from __future__ import annotations
@@ -18,13 +19,14 @@ from typing import Callable
 
 from helix_sdk import require_scope, verify_vp
 from helix_sdk.errors import VPMissingError, VPVerificationFailedError
+from helix_sdk.vp_transport import read_helix_vp_header, read_helix_vp_meta
 
 from .types import MCPMiddlewareOptions, MCPToolCall
 
 
 def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCall], MCPToolCall]:
     def middleware(tool_call: MCPToolCall) -> MCPToolCall:
-        vp = (tool_call.get("input") or {}).get("_helixVP")
+        vp = read_helix_vp_meta(tool_call.get("_meta")) or read_helix_vp_header(tool_call.get("headers"))
         if not vp:
             raise VPMissingError()
 
