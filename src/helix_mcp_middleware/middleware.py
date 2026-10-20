@@ -30,7 +30,12 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
         if not vp:
             raise VPMissingError()
 
-        result = verify_vp(vp, options.client, allow_self_signed=options.allow_self_signed)
+        result = verify_vp(
+            vp,
+            options.client,
+            expected_target_service=options.expected_target_service,
+            allow_self_signed=options.allow_self_signed,
+        )
 
         if not result.get("valid"):
             error_message = result.get("error")

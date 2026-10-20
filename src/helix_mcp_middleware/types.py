@@ -28,6 +28,9 @@ class MCPMiddlewareOptions:
     client: HelixClient
     required_scopes: List[str] = field(default_factory=list)
     allow_self_signed: bool = False
+    # This server's own DID. When set, a VP signed for any other service is
+    # rejected, so a VP meant for one service can't be replayed against another.
+    expected_target_service: Optional[str] = None
 
 
 @dataclass

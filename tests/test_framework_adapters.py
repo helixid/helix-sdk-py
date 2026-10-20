@@ -108,6 +108,21 @@ class TestMCP:
 
         fake_client.verify_vp.assert_called_once()
 
+    def test_middleware_passes_expected_target_service(self) -> None:
+        from helix_mcp_middleware import helixid_mcp_middleware, MCPMiddlewareOptions
+        from helix_sdk import encode_helix_vp
+
+        fake_client = MagicMock()
+        fake_client.verify_vp.return_value = {"valid": True, "effectiveScopes": []}
+        middleware = helixid_mcp_middleware(
+            MCPMiddlewareOptions(client=fake_client, expected_target_service="did:web:svc.example.invalid")
+        )
+        middleware({"name": "get_orders", "_meta": {"x-helix-vp": encode_helix_vp({"id": "vp:1"})}})
+
+        assert (
+            fake_client.verify_vp.call_args.kwargs["expected_target_service"] == "did:web:svc.example.invalid"
+        )
+
 
 class TestLangChain:
     def test_tool_wrapper_exposes_vp_header_and_delegates(self, fake_client_and_did) -> None:
