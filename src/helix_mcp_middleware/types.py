@@ -23,7 +23,7 @@ MCP request's params._meta, key "x-helix-vp") or, over HTTP, in 'headers'
 @dataclass
 class MCPMiddlewareOptions:
     """Required now that verification calls the API (see
-    docs/proposal-sdk-api-only.md) rather than verifying locally."""
+    the SDK-API-only design) rather than verifying locally."""
 
     client: HelixClient
     required_scopes: List[str] = field(default_factory=list)

@@ -6,8 +6,7 @@ and Verifiable Presentation verification.
 
 This is the Python counterpart to
 [`helix-sdk-js`](https://github.com/helixid/helix-sdk-js), following the same
-**SDK-API-only** architecture (see `docs/proposal-sdk-api-only.md` and
-`docs/proposal-retire-core-package.md` in the `helixid/helixid` repo): every
+**SDK-API-only** architecture: every
 SDK, in every language, depends only on the HelixID API -- never on a shared
 "core" package -- except for private-key operations that must stay local:
 keygen, sign, canonical-hash and `VPBuilder.sign()`, which issuers and Service
@@ -136,8 +135,7 @@ Python equivalent.
 ## CLI
 
 There is no Python CLI. Platform-operator workflows (DID/wallet/status-list/
-VC lifecycle) are covered by `helix-sdk-js`'s `cli` package -- see
-`docs/decision-cli-mcp-scope.md` in the `helixid/helixid` repo for why the
+VC lifecycle) are covered by `helix-sdk-js`'s `cli` package -- the
 CLI has a single canonical implementation rather than one per SDK language.
 
 ## Testing
@@ -188,11 +186,10 @@ example scripts above.
   an oversight; an async variant can be added later without breaking this
   one.
 - **No `did:hedera` package yet.** DID resolution generally is always an
-  API call in this architecture (per `docs/proposal-sdk-api-only.md`), so
+  API call in this architecture, so
   this is really about offline Hedera anchoring specifically, which
   `helix-sdk-js`'s `cli` package supports via a separate `did-hedera`
-  package this repo hasn't ported. Since the CLI itself is JS-only (see
-  `docs/decision-cli-mcp-scope.md`), this gap only matters if this SDK's
+  package this repo hasn't ported. Since the CLI itself is JS-only, this gap only matters if this SDK's
   own local-signing primitives grow a `did:hedera` creation path.
 - **No `widget` package** (helix-sdk-js's browser-embeddable consent
   widget has no obvious Python equivalent and hasn't been attempted).
@@ -203,8 +200,7 @@ example scripts above.
   through `current_helix_vp_headers()`; the callback handler is kept only
   for observability use. (The JS SDK has dropped its callback form,
   `HelixIDMiddleware`, entirely.)
-- **Version numbering does not yet track `helix-sdk-js`'s version.** Per
-  `docs/decision-sdk-py-scope.md`, this SDK's version should track the JS
+- **Version numbering does not yet track `helix-sdk-js`'s version.** This SDK's version should track the JS
   SDK's; that mapping strategy hasn't been decided yet, so this starts at
   `0.1.0` independently.
 

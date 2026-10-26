@@ -7,7 +7,7 @@
 helix_sdk -- Python SDK for HelixID, mirroring helix-sdk-js's public API
 surface (see src/index.ts there).
 
-SDK-API-only architecture (docs/proposal-sdk-api-only.md): every SDK,
+SDK-API-only architecture (the SDK-API-only design): every SDK,
 in every language, depends only on the HelixID API -- never on a shared
 "core" package -- except for private-key operations that must stay local:
 keygen, sign, canonical-hash, VPBuilder.sign(). verify_vp(), delegation-VC

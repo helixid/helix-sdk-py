@@ -7,7 +7,7 @@
 VPBuilder, ported from helix-sdk-js's src/core/vp-builder-impl.ts.
 
 VPBuilder.sign() is local-signing logic -- one of the explicit carveouts
-that stays client-side per docs/proposal-sdk-api-only.md (private-key
+that stays client-side per the SDK-API-only design (private-key
 operations never call the API). Every other SDK operation on a VP
 (verification) goes through HelixClient instead; see verify.py.
 

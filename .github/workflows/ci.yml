@@ -24,8 +24,7 @@ jobs:
       # Install with all optional extras (mcp-middleware, langchain, crewai)
       # so every subpackage -- and its tests -- actually gets exercised, not
       # just the core SDK. There is no Python CLI to test here; the `helix`
-      # CLI has a single canonical implementation in helix-sdk-js (see
-      # docs/decision-cli-mcp-scope.md in the helixid/helixid repo).
+      # CLI has a single canonical implementation in helix-sdk-js.
       - name: Install package and dev dependencies
         run: pip install -e ".[dev,all]"
 
