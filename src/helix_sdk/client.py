@@ -6,7 +6,7 @@
 """
 HelixClient, ported from helix-sdk-js's src/client/HelixClient.ts.
 
-Per docs/proposal-sdk-api-only.md, every operation here is a plain HTTP
+Per the SDK-API-only design, every operation here is a plain HTTP
 call to helix-api -- verification, delegation/grant/renewal payload
 construction, DID resolution, and status checks all live server-side.
 The only local computation this client does is generating the local
@@ -196,6 +196,7 @@ class HelixClient:
         scopes: List[str],
         durability: str = "standing",
         revoke_existing: bool = False,
+        allow_delegation: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Issues a DelegationGrantCredential from `service_did` to `agent_did`
         on `user_did`'s behalf: built, signed with the service's server-held
@@ -207,7 +208,13 @@ class HelixClient:
         different scope set is a new grant beside the existing ones, unless
         `revoke_existing` asks for those to be revoked too. sign_vp() finds
         and presents every active grant for the triple, so the caller need
-        not hold the returned VC. Revoke one with revoke_vc()."""
+        not hold the returned VC. Revoke one with revoke_vc().
+
+        `scopes` may only hold scopes the agent was onboarded with (plus
+        `accept-terms`); see get_agent_scopes(). `allow_delegation` says
+        whether the consent also covers agents this agent delegates to;
+        None leaves the grant without the flag, which verifiers treat as
+        allowed."""
         body = {
             "serviceDid": service_did,
             "agentDid": agent_did,
@@ -217,8 +224,19 @@ class HelixClient:
         }
         if revoke_existing:
             body["revokeExisting"] = True
+        if allow_delegation is not None:
+            body["allowDelegation"] = allow_delegation
         result = self._http_required().post("/v1/service-delegation-grants", body)
         return result["grantVC"]
+
+    def get_agent_scopes(self, service_did: str, agent_did: str) -> Dict[str, Any]:
+        """The scopes `agent_did` holds as itself, from its own active
+        onboarding credentials (never those delegated to it), for
+        `service_did`'s consent screen. Grant issuance refuses any scope
+        outside this set. Returns {"agentDid": ..., "scopes": [...]}."""
+        self._assert_api_configured()
+        qs = _query_string({"serviceDid": service_did, "agentDid": agent_did})
+        return self._http_required().get(f"/v1/service-delegation-grants/agent-scopes{qs}")
 
     # -- Status lists ---------------------------------------------------------
 
@@ -265,7 +283,7 @@ class HelixClient:
         delegation-chain walk, expiry, target service, and revocation all
         happen server-side, with VP_VERIFIED/VP_REJECTED audit logging
         handled there too -- there is no local fallback, by design (see
-        docs/proposal-sdk-api-only.md)."""
+        the SDK-API-only design)."""
         body: Dict[str, Any] = {"signedVP": vp}
         if expected_target_service is not None:
             body["expectedTargetService"] = expected_target_service

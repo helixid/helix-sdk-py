@@ -172,6 +172,35 @@ class TestCoreMode:
 
         assert http.calls[0].json["revokeExisting"] is True
 
+    def test_issue_service_delegation_grant_sends_allow_delegation_only_when_given(self, http) -> None:
+        http.respond(201, {"grantVC": {"id": "vc:helix:grant:3"}})
+        http.respond(201, {"grantVC": {"id": "vc:helix:grant:4"}})
+        client = HelixClient(BASE_URL, admin_api_key="admin")
+
+        client.issue_service_delegation_grant(
+            "did:web:helix.test:services:s1", AGENT_DID, "did:web:mock.local:users:alice", ["read:calendar"],
+            allow_delegation=False,
+        )
+        client.issue_service_delegation_grant(
+            "did:web:helix.test:services:s1", AGENT_DID, "did:web:mock.local:users:alice", ["read:calendar"],
+        )
+
+        assert http.calls[0].json["allowDelegation"] is False
+        assert "allowDelegation" not in http.calls[1].json
+
+    def test_get_agent_scopes_reads_the_agent_scopes_for_a_service(self, http) -> None:
+        http.respond(200, {"agentDid": AGENT_DID, "scopes": ["read:calendar"]})
+        client = HelixClient(BASE_URL, admin_api_key="admin")
+
+        result = client.get_agent_scopes("did:web:helix.test:services:s1", AGENT_DID)
+
+        assert result == {"agentDid": AGENT_DID, "scopes": ["read:calendar"]}
+        call = http.calls[0]
+        assert call.method == "GET"
+        assert call.url.startswith(f"{BASE_URL}/v1/service-delegation-grants/agent-scopes?")
+        assert "serviceDid=did%3Aweb%3Ahelix.test%3Aservices%3As1" in call.url
+        assert f"agentDid={AGENT_DID.replace(':', '%3A')}" in call.url
+
     def test_sign_vp_omits_unset_optional_fields(self, http) -> None:
         http.respond(200, {"signedVP": {"id": "vp-1"}})
         HelixClient(BASE_URL, admin_api_key="admin").sign_vp(AGENT_DID, "orders")
