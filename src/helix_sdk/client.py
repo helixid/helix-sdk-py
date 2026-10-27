@@ -6,7 +6,7 @@
 """
 HelixClient, ported from helix-sdk-js's src/client/HelixClient.ts.
 
-Per docs/proposal-sdk-api-only.md, every operation here is a plain HTTP
+Per the SDK-API-only design, every operation here is a plain HTTP
 call to helix-api -- verification, delegation/grant/renewal payload
 construction, DID resolution, and status checks all live server-side.
 The only local computation this client does is generating the local
@@ -20,11 +20,9 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlencode
 
-import requests
-
 from . import jwt as helix_jwt
 from . import keys
-from .errors import SDKOnlyModeNoAPIError, map_api_error
+from .errors import SDKOnlyModeNoAPIError
 from .http_adapter import HttpAdapter
 
 # Used only when api_key is given with no explicit base_url -- see
@@ -68,13 +66,16 @@ class HelixClient:
             resolved_base_url = _DEFAULT_ENTERPRISE_URL
 
         self._sdk_only_mode = resolved_base_url is None
-        self._api_audit_enabled = resolved_base_url is not None and bool(admin_api_key)
+        self._api_audit_enabled = resolved_base_url is not None and bool(admin_api_key or api_key)
         self._base_url = (
             resolved_base_url[:-1] if resolved_base_url and resolved_base_url.endswith("/") else resolved_base_url
         )
         self._api_key = api_key
+        # The adapter sends whichever credential was given on every call, so
+        # enterprise (api_key) and core (admin_api_key) differ only in which
+        # routes a method targets, never in how it authenticates.
         self._http: Optional[HttpAdapter] = (
-            None if self._sdk_only_mode else HttpAdapter(resolved_base_url, admin_api_key)
+            None if self._sdk_only_mode else HttpAdapter(resolved_base_url, admin_api_key, api_key=api_key)
         )
 
     # -- DID lifecycle ------------------------------------------------------
@@ -151,24 +152,91 @@ class HelixClient:
             overrides["expiresInSeconds"] = expires_in_seconds
         return self._http_required().post(f"/v1/vcs/{quote(vc_id, safe='')}/renew", overrides)
 
+    def register_vc(self, vc: Dict[str, Any]) -> Dict[str, Any]:
+        """Registers a VC that was signed outside the platform (an SP-signed
+        DelegationGrantCredential, typically) so the server holds it and
+        can list/revoke/renew it. The server verifies the proof. Distinct
+        from issue_vc(), which has the platform sign a new VC. Returns
+        {vcId, alreadyRegistered}; idempotent by vc id."""
+        return self._http_required().post("/v1/vcs/register", {"vc": vc})
+
     def check_vc_status(self, vc: Dict[str, Any]) -> str:
         response = self._http_required().get(f"/v1/vcs/{quote(vc['id'], safe='')}/status")
         return response["status"]
 
-    # -- prepare/finalize: see docs/proposal-sdk-api-only.md. prepare()
-    # returns an unsigned payload + hash; the caller signs the hash locally
-    # (private key never leaves the client) and finalize() attaches the
-    # signature. See grant.py for the full sign-and-submit flow built on
-    # top of these (SP-side, not agent self-custody).
+    # -- Service Providers ---------------------------------------------------
+    # Services hold no keys: the server mints the service DID, keeps its key,
+    # and signs consent grants on the service's behalf -- the same custody
+    # model as agents (onboard_agent / sign_vp / delegate_authority).
 
-    def prepare_grant(self, **input: Any) -> Dict[str, Any]:
-        return self._http_required().post("/v1/vcs/grant/prepare", input)
+    def create_service(
+        self,
+        service_name: str,
+        display_name: str,
+        verified_domain: str,
+        api_endpoint: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Enrolls a service on a self-hosted server (admin key). Hosted
+        accounts enroll through the console / account API instead.
+        Returns {serviceDid, serviceName}."""
+        body: Dict[str, Any] = {
+            "serviceName": service_name,
+            "displayName": display_name,
+            "verifiedDomain": verified_domain,
+        }
+        if api_endpoint is not None:
+            body["apiEndpoint"] = api_endpoint
+        return self._http_required().post("/v1/services", body)
 
-    def finalize_grant(self, token: str, verification_method: str, signature_hex: str) -> Dict[str, Any]:
-        return self._http_required().post(
-            "/v1/vcs/grant/finalize",
-            {"token": token, "verificationMethod": verification_method, "signatureHex": signature_hex},
-        )
+    def issue_service_delegation_grant(
+        self,
+        service_did: str,
+        agent_did: str,
+        user_did: str,
+        scopes: List[str],
+        durability: str = "standing",
+        revoke_existing: bool = False,
+        allow_delegation: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Issues a DelegationGrantCredential from `service_did` to `agent_did`
+        on `user_did`'s behalf: built, signed with the service's server-held
+        key and stored with a revocable status-list entry, in one call.
+        `user_did` is recorded as given, never resolved.
+
+        One grant per (user, agent, service, scope set): consenting again to
+        exactly the scopes an active grant carries refreshes that grant; a
+        different scope set is a new grant beside the existing ones, unless
+        `revoke_existing` asks for those to be revoked too. sign_vp() finds
+        and presents every active grant for the triple, so the caller need
+        not hold the returned VC. Revoke one with revoke_vc().
+
+        `scopes` may only hold scopes the agent was onboarded with (plus
+        `accept-terms`); see get_agent_scopes(). `allow_delegation` says
+        whether the consent also covers agents this agent delegates to;
+        None leaves the grant without the flag, which verifiers treat as
+        allowed."""
+        body = {
+            "serviceDid": service_did,
+            "agentDid": agent_did,
+            "userDid": user_did,
+            "scopes": scopes,
+            "durability": durability,
+        }
+        if revoke_existing:
+            body["revokeExisting"] = True
+        if allow_delegation is not None:
+            body["allowDelegation"] = allow_delegation
+        result = self._http_required().post("/v1/service-delegation-grants", body)
+        return result["grantVC"]
+
+    def get_agent_scopes(self, service_did: str, agent_did: str) -> Dict[str, Any]:
+        """The scopes `agent_did` holds as itself, from its own active
+        onboarding credentials (never those delegated to it), for
+        `service_did`'s consent screen. Grant issuance refuses any scope
+        outside this set. Returns {"agentDid": ..., "scopes": [...]}."""
+        self._assert_api_configured()
+        qs = _query_string({"serviceDid": service_did, "agentDid": agent_did})
+        return self._http_required().get(f"/v1/service-delegation-grants/agent-scopes{qs}")
 
     # -- Status lists ---------------------------------------------------------
 
@@ -215,7 +283,7 @@ class HelixClient:
         delegation-chain walk, expiry, target service, and revocation all
         happen server-side, with VP_VERIFIED/VP_REJECTED audit logging
         handled there too -- there is no local fallback, by design (see
-        docs/proposal-sdk-api-only.md)."""
+        the SDK-API-only design)."""
         body: Dict[str, Any] = {"signedVP": vp}
         if expected_target_service is not None:
             body["expectedTargetService"] = expected_target_service
@@ -250,46 +318,30 @@ class HelixClient:
         did: str,
         target_service: str,
         user_did: Optional[str] = None,
-        grant_vc: Optional[Dict[str, Any]] = None,
-        vc_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Signs a VP on behalf of a server-custody agent -- the caller
         never has, and never can have, the private key, so this is an API
-        call instead of local VPBuilder signing. The server looks up the
-        agent's active HelixAgentCredential itself; pass vc_id to pin a
-        specific one instead (e.g. right after a renewal, when more than
-        one is active). grant_vc is an SP-issued DelegationGrantCredential
-        the caller already holds -- not secret material, just data to
-        include -- for the consent-grant flow.
+        call instead of local VPBuilder signing. The server picks the
+        credentials from the DIDs alone: every active HelixAgentCredential
+        the agent holds (its own, plus any delegated to it).
+
+        `target_service` is the DID of the service the VP is for. With a
+        `user_did` the agent is acting on that user's behalf, and the server
+        attaches every active DelegationGrantCredential that service issued
+        to this agent for that user; none at all raises
+        CONSENT_GRANT_NOT_FOUND, meaning the user has not consented yet.
 
         Enterprise mode (self._api_key set): custodial signing is
-        account-scoped, a different route + auth than core's admin-key-gated
-        /v1/agents/:did/vp -- see HelixClient.__init__'s api_key doc."""
+        account-scoped, so this targets /v1/custodial-agents/:did/vp instead
+        of core's admin-key-gated /v1/agents/:did/vp. The bearer token itself
+        is sent by HttpAdapter, like every other call."""
         self._assert_api_configured()
         body: Dict[str, Any] = {"targetService": target_service}
         if user_did is not None:
             body["userDid"] = user_did
-        if grant_vc is not None:
-            body["grantVC"] = grant_vc
-        if vc_id is not None:
-            body["vcId"] = vc_id
 
-        if self._api_key:
-            response = requests.post(
-                f"{self._base_url}/v1/custodial-agents/{quote(did, safe='')}/vp",
-                json=body,
-                headers={"content-type": "application/json", "authorization": f"Bearer {self._api_key}"},
-                timeout=30.0,
-            )
-            try:
-                data = response.json()
-            except ValueError:
-                data = {}
-            if not response.ok:
-                raise map_api_error({**(data if isinstance(data, dict) else {}), "status": response.status_code})
-            return data["signedVP"]
-
-        result = self._http_required().post(f"/v1/agents/{quote(did, safe='')}/vp", body)
+        route = "custodial-agents" if self._api_key else "agents"
+        result = self._http_required().post(f"/v1/{route}/{quote(did, safe='')}/vp", body)
         return result["signedVP"]
 
     def delegate_authority(
@@ -299,6 +351,7 @@ class HelixClient:
         scopes: List[str],
         expires_in: int,
         vc_id: Optional[str] = None,
+        revoke_existing: bool = False,
     ) -> Dict[str, Any]:
         """Delegates a slice of a server-custody agent's authority to another
         DID -- the custodial counterpart to a wallet-based delegate(), which
@@ -309,29 +362,21 @@ class HelixClient:
 
         Mirrors sign_vp()'s two modes: enterprise (self._api_key set) hits
         the account-scoped custodial route; core/OSS hits the admin-key-gated
-        route. Pass vc_id to pin which of the delegator's active credentials
-        to delegate from."""
+        route. Auth is the adapter's job either way. Pass vc_id to pin which
+        of the delegator's active credentials to delegate from.
+
+        Same rule as every stored credential: delegating the same scopes
+        again refreshes the earlier delegation, other scopes stand beside
+        it, `revoke_existing` clears the others."""
         self._assert_api_configured()
         body: Dict[str, Any] = {"to": to, "scopes": scopes, "expiresIn": expires_in}
         if vc_id is not None:
             body["vcId"] = vc_id
+        if revoke_existing:
+            body["revokeExisting"] = True
 
-        if self._api_key:
-            response = requests.post(
-                f"{self._base_url}/v1/custodial-agents/{quote(did, safe='')}/delegate",
-                json=body,
-                headers={"content-type": "application/json", "authorization": f"Bearer {self._api_key}"},
-                timeout=30.0,
-            )
-            try:
-                data = response.json()
-            except ValueError:
-                data = {}
-            if not response.ok:
-                raise map_api_error({**(data if isinstance(data, dict) else {}), "status": response.status_code})
-            return data["delegatedVC"]
-
-        result = self._http_required().post(f"/v1/agents/{quote(did, safe='')}/delegate", body)
+        route = "custodial-agents" if self._api_key else "agents"
+        result = self._http_required().post(f"/v1/{route}/{quote(did, safe='')}/delegate", body)
         return result["delegatedVC"]
 
     def request_user_challenge(self, user_did: str) -> Dict[str, Any]:

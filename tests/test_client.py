@@ -120,14 +120,86 @@ class TestCoreMode:
     def test_sign_vp_hits_the_admin_route_with_optional_fields(self, http) -> None:
         http.respond(200, {"signedVP": {"id": "vp-1"}})
         client = HelixClient(BASE_URL, admin_api_key="admin")
-        grant = {"id": "grant-1"}
 
-        vp = client.sign_vp(AGENT_DID, "orders", user_did="did:web:user", grant_vc=grant, vc_id="vc-2")
+        vp = client.sign_vp(AGENT_DID, "orders", user_did="did:web:user")
 
         assert vp == {"id": "vp-1"}
         call = http.calls[0]
         assert call.url == f"{BASE_URL}/v1/agents/did%3Aweb%3Ahelix.test%3Aagents%3Aa1/vp"
-        assert call.json == {"targetService": "orders", "userDid": "did:web:user", "grantVC": grant, "vcId": "vc-2"}
+        assert call.json == {"targetService": "orders", "userDid": "did:web:user"}
+
+    def test_create_service_posts_to_v1_services(self, http) -> None:
+        http.respond(201, {"serviceDid": "did:web:helix.test:services:s1", "serviceName": "orders"})
+        client = HelixClient(BASE_URL, admin_api_key="admin")
+
+        result = client.create_service("orders", "Orders", "https://orders.example")
+
+        assert result["serviceDid"] == "did:web:helix.test:services:s1"
+        call = http.calls[0]
+        assert (call.method, call.url) == ("POST", f"{BASE_URL}/v1/services")
+        assert call.json == {"serviceName": "orders", "displayName": "Orders", "verifiedDomain": "https://orders.example"}
+
+    def test_issue_service_delegation_grant_unwraps_the_grant(self, http) -> None:
+        http.respond(201, {"grantVC": {"id": "vc:helix:grant:1", "issuer": "did:web:helix.test:services:s1"}})
+        client = HelixClient(BASE_URL, admin_api_key="admin")
+
+        grant = client.issue_service_delegation_grant(
+            "did:web:helix.test:services:s1", AGENT_DID, "did:web:mock.local:users:alice", ["read:calendar"]
+        )
+
+        assert grant["id"] == "vc:helix:grant:1"
+        call = http.calls[0]
+        assert (call.method, call.url) == ("POST", f"{BASE_URL}/v1/service-delegation-grants")
+        assert call.json == {
+            "serviceDid": "did:web:helix.test:services:s1",
+            "agentDid": AGENT_DID,
+            "userDid": "did:web:mock.local:users:alice",
+            "scopes": ["read:calendar"],
+            "durability": "standing",
+        }
+
+    def test_issue_service_delegation_grant_sends_revoke_existing_only_when_asked(self, http) -> None:
+        http.respond(201, {"grantVC": {"id": "vc:helix:grant:2"}})
+        client = HelixClient(BASE_URL, admin_api_key="admin")
+
+        client.issue_service_delegation_grant(
+            "did:web:helix.test:services:s1",
+            AGENT_DID,
+            "did:web:mock.local:users:alice",
+            ["read:calendar"],
+            revoke_existing=True,
+        )
+
+        assert http.calls[0].json["revokeExisting"] is True
+
+    def test_issue_service_delegation_grant_sends_allow_delegation_only_when_given(self, http) -> None:
+        http.respond(201, {"grantVC": {"id": "vc:helix:grant:3"}})
+        http.respond(201, {"grantVC": {"id": "vc:helix:grant:4"}})
+        client = HelixClient(BASE_URL, admin_api_key="admin")
+
+        client.issue_service_delegation_grant(
+            "did:web:helix.test:services:s1", AGENT_DID, "did:web:mock.local:users:alice", ["read:calendar"],
+            allow_delegation=False,
+        )
+        client.issue_service_delegation_grant(
+            "did:web:helix.test:services:s1", AGENT_DID, "did:web:mock.local:users:alice", ["read:calendar"],
+        )
+
+        assert http.calls[0].json["allowDelegation"] is False
+        assert "allowDelegation" not in http.calls[1].json
+
+    def test_get_agent_scopes_reads_the_agent_scopes_for_a_service(self, http) -> None:
+        http.respond(200, {"agentDid": AGENT_DID, "scopes": ["read:calendar"]})
+        client = HelixClient(BASE_URL, admin_api_key="admin")
+
+        result = client.get_agent_scopes("did:web:helix.test:services:s1", AGENT_DID)
+
+        assert result == {"agentDid": AGENT_DID, "scopes": ["read:calendar"]}
+        call = http.calls[0]
+        assert call.method == "GET"
+        assert call.url.startswith(f"{BASE_URL}/v1/service-delegation-grants/agent-scopes?")
+        assert "serviceDid=did%3Aweb%3Ahelix.test%3Aservices%3As1" in call.url
+        assert f"agentDid={AGENT_DID.replace(':', '%3A')}" in call.url
 
     def test_sign_vp_omits_unset_optional_fields(self, http) -> None:
         http.respond(200, {"signedVP": {"id": "vp-1"}})
@@ -185,6 +257,14 @@ class TestCoreMode:
         assert http.calls[0].url == f"{BASE_URL}/v1/vcs?subjectDid=did%3Aweb%3Ahelix.test%3Aagents%3Aa1&status=active"
         assert http.calls[1].url == f"{BASE_URL}/v1/vcs"
 
+    def test_register_vc_uses_the_admin_header(self, http) -> None:
+        http.respond(200, {"vcId": "vc-grant", "alreadyRegistered": True})
+        HelixClient(BASE_URL, admin_api_key="admin").register_vc({"id": "vc-grant"})
+        call = http.calls[0]
+        assert call.url == f"{BASE_URL}/v1/vcs/register"
+        assert call.headers["x-admin-api-key"] == "admin"
+        assert "authorization" not in call.headers
+
     def test_renew_vc_sends_only_given_overrides(self, http) -> None:
         http.respond(200, {"vcId": "vc-2"})
         HelixClient(BASE_URL, admin_api_key="admin").renew_vc("vc-1", expires_in_seconds=60)
@@ -202,13 +282,45 @@ class TestEnterpriseMode:
         http.respond(200, {"signedVP": {"id": "vp-1"}})
         client = HelixClient(BASE_URL, api_key="hak_test")
 
-        vp = client.sign_vp(AGENT_DID, "orders", vc_id="vc-2")
+        vp = client.sign_vp(AGENT_DID, "orders")
 
         assert vp == {"id": "vp-1"}
         call = http.calls[0]
         assert call.url == f"{BASE_URL}/v1/custodial-agents/did%3Aweb%3Ahelix.test%3Aagents%3Aa1/vp"
         assert call.headers["authorization"] == "Bearer hak_test"
-        assert call.json == {"targetService": "orders", "vcId": "vc-2"}
+        assert call.json == {"targetService": "orders"}
+
+    def test_every_call_carries_the_bearer_token_not_an_admin_header(self, http) -> None:
+        # The grant route and the VC lifecycle routes used to go out with no
+        # credential at all in enterprise mode (only the custodial routes
+        # set the bearer token), so enterprise answered 403.
+        http.respond(201, {"grantVC": {"id": "vc-grant"}})
+        client = HelixClient(BASE_URL, api_key="hak_test")
+
+        vc = client.issue_service_delegation_grant("did:web:sp", AGENT_DID, "did:key:z6Mkuser", ["read:orders"])
+
+        assert vc == {"id": "vc-grant"}
+        call = http.calls[0]
+        assert call.url == f"{BASE_URL}/v1/service-delegation-grants"
+        assert call.headers["authorization"] == "Bearer hak_test"
+        assert "x-admin-api-key" not in call.headers
+
+    def test_register_vc_posts_the_signed_credential(self, http) -> None:
+        http.respond(201, {"vcId": "vc-grant", "alreadyRegistered": False})
+        client = HelixClient(BASE_URL, api_key="hak_test")
+
+        result = client.register_vc({"id": "vc-grant", "proof": {}})
+
+        assert result == {"vcId": "vc-grant", "alreadyRegistered": False}
+        call = http.calls[0]
+        assert call.url == f"{BASE_URL}/v1/vcs/register"
+        assert call.json == {"vc": {"id": "vc-grant", "proof": {}}}
+        assert call.headers["authorization"] == "Bearer hak_test"
+
+    def test_renew_vc_carries_the_bearer_token(self, http) -> None:
+        http.respond(201, {"vcId": "vc-2", "previousVcId": "vc-1"})
+        HelixClient(BASE_URL, api_key="hak_test").renew_vc("vc-1")
+        assert http.calls[0].headers["authorization"] == "Bearer hak_test"
 
     def test_delegate_authority_uses_the_custodial_route(self, http) -> None:
         http.respond(200, {"delegatedVC": {"id": "vc-child"}})

@@ -7,17 +7,13 @@
 LangChain integration, ported from helix-sdk-js's langchain/src/middleware.ts.
 
 helix-sdk-js's version targets LangChain.js's `_call(input)` tool
-interface and a lightweight `RunnableConfigLike` callback shape. This
-port targets LangChain Python's actual `langchain_core.tools.BaseTool`
+interface. This port targets LangChain Python's actual `langchain_core.tools.BaseTool`
 (`_run(*args, **kwargs)`) instead -- verified directly against the
 installed `langchain-core` package (see tests/test_langchain_crewai.py)
 rather than assumed from the JS source, since the two SDKs' tool
 interfaces genuinely differ. `helix_id_tool_wrapper()` is the practical
-equivalent of the JS `HelixIDToolWrapper`; `HelixIDCallbackHandler` is
-offered as a LangChain-native alternative to the JS `HelixIDMiddleware`
-(a bespoke `RunnableConfigLike` object, which has no direct Python
-equivalent since LangChain Python's callback system is class-based, not
-an ad-hoc `{ callbacks: [...] }` literal).
+equivalent of the JS `HelixIDToolWrapper`, and `current_helix_vp_headers()`
+of the JS `currentHelixVPHeaders()`.
 
 Agent self-custody has been retired: signing is a server-side call
 (client.sign_vp()) now, not a local wallet load + VPBuilder.sign().
@@ -29,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Optional, TypeVar
 
 from pydantic import PrivateAttr
 
-from helix_sdk.tool_vp import build_signed_vp, encode_base64url_json
+from helix_sdk.tool_vp import build_signed_vp, helix_vp_context, encode_base64url_json
 
 if TYPE_CHECKING:
     from helix_sdk import HelixClient
@@ -53,9 +49,10 @@ def helix_id_tool_wrapper(
     target_service: str,
     user_did: Optional[str] = None,
 ) -> BaseTool:
-    """Wraps `tool` so every invocation has a freshly signed VP injected
-    into its kwargs as `_helixVP`, before delegating to the original
-    tool's `_run`. Equivalent to helix-sdk-js's HelixIDToolWrapper()."""
+    """Wraps `tool` so every invocation signs a fresh VP, then delegates to
+    the original tool's `_run` with its arguments unchanged. The tool reads
+    the VP with `current_helix_vp_headers()` and sends it as the X-Helix-VP
+    header. Equivalent to helix-sdk-js's HelixIDToolWrapper()."""
 
     class _HelixIDWrappedTool(BaseTool):
         _wrapped: Any = PrivateAttr()
@@ -66,8 +63,8 @@ def helix_id_tool_wrapper(
 
         def _run(self, *args: Any, **kwargs: Any) -> Any:
             vp = build_signed_vp(self._client, self._agent_did, self._target_service, self._user_did)
-            kwargs["_helixVP"] = vp
-            return self._wrapped._run(*args, **kwargs)
+            with helix_vp_context(vp):
+                return self._wrapped._run(*args, **kwargs)
 
     wrapped = _HelixIDWrappedTool(name=tool.name, description=tool.description, args_schema=tool.args_schema)
     object.__setattr__(wrapped, "_wrapped", tool)
@@ -79,12 +76,9 @@ def helix_id_tool_wrapper(
 
 
 class HelixIDCallbackHandler(BaseCallbackHandler):
-    """A LangChain-native callback handler, offered for parity with the JS
-    HelixIDMiddleware() shape. Kept for observability/logging use cases --
-    LangChain Python's on_tool_start receives the raw input string/dict,
-    not a mutable object the callback can rewrite before the tool runs
-    (unlike the JS RunnableConfigLike.handleToolStart contract), so real
-    VP injection happens in helix_id_tool_wrapper() above, not here."""
+    """A LangChain-native callback handler, kept for observability/logging
+    use cases only. It attaches no VP: a callback cannot hand one to the
+    tool, so that happens in helix_id_tool_wrapper() above."""
 
     def __init__(
         self,

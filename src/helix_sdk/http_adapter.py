@@ -24,13 +24,23 @@ from .errors import map_api_error
 
 
 class HttpAdapter:
-    def __init__(self, base_url: str, admin_api_key: Optional[str] = None, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        admin_api_key: Optional[str] = None,
+        timeout: float = 30.0,
+        api_key: Optional[str] = None,
+    ) -> None:
         self._base_url = base_url[:-1] if base_url.endswith("/") else base_url
         self._admin_api_key = admin_api_key
+        self._api_key = api_key
         self._timeout = timeout
 
     def has_admin_api_key(self) -> bool:
         return bool(self._admin_api_key)
+
+    def has_api_key(self) -> bool:
+        return bool(self._api_key)
 
     def get(self, path: str) -> Any:
         return self._request("GET", path)
@@ -46,7 +56,12 @@ class HttpAdapter:
         headers = {}
         if body is not None:
             headers["content-type"] = "application/json"
-        if self._admin_api_key:
+        # One credential per client: an enterprise account API key is sent as
+        # the bearer token on every call (enterprise has no admin key at
+        # all), otherwise core's shared admin key goes in its own header.
+        if self._api_key:
+            headers["authorization"] = f"Bearer {self._api_key}"
+        elif self._admin_api_key:
             headers["x-admin-api-key"] = self._admin_api_key
 
         response = requests.request(

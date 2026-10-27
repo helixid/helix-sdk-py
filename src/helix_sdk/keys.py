@@ -6,7 +6,7 @@
 """
 Local Ed25519 signing primitives, ported from helix-sdk-js's
 src/core/keys.ts. This is one of the explicit local-signing carveouts from
-docs/proposal-sdk-api-only.md -- private keys never leave this process, so
+the SDK-API-only design -- private keys never leave this process, so
 keygen/sign/derive have no API equivalent to call instead.
 
 Verified byte-for-byte against fixtures/golden-vectors/signing.json (see

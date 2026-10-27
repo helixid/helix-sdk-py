@@ -296,7 +296,7 @@ class InsufficientScopeError(HelixError):
 
 
 class VPMissingError(HelixError):
-    def __init__(self, message: str = "No _helixVP in tool call input") -> None:
+    def __init__(self, message: str = 'No Verifiable Presentation in the X-Helix-VP header or MCP _meta["x-helix-vp"]') -> None:
         super().__init__(codes.VP_MISSING, message, 401)
 
 

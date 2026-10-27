@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Optional, TypeVar
 
 from pydantic import PrivateAttr
 
-from helix_sdk.tool_vp import build_signed_vp
+from helix_sdk.tool_vp import build_signed_vp, helix_vp_context
 
 if TYPE_CHECKING:
     from helix_sdk import HelixClient
@@ -45,9 +45,10 @@ def helix_id_crewai_tool(
     target_service: str,
     user_did: Optional[str] = None,
 ) -> BaseTool:
-    """Wraps `tool` so every invocation has a freshly signed VP injected
-    into its kwargs as `_helixVP`, before delegating to the original
-    tool's `_run`."""
+    """Wraps `tool` so every invocation signs a fresh VP, then delegates to
+    the original tool's `_run` with its arguments unchanged. The tool reads
+    the VP with `current_helix_vp_headers()` and sends it as the X-Helix-VP
+    header."""
 
     class _HelixIDWrappedCrewAITool(BaseTool):
         _wrapped: Any = PrivateAttr()
@@ -58,8 +59,8 @@ def helix_id_crewai_tool(
 
         def _run(self, *args: Any, **kwargs: Any) -> Any:
             vp = build_signed_vp(self._client, self._agent_did, self._target_service, self._user_did)
-            kwargs["_helixVP"] = vp
-            return self._wrapped._run(*args, **kwargs)
+            with helix_vp_context(vp):
+                return self._wrapped._run(*args, **kwargs)
 
     wrapped = _HelixIDWrappedCrewAITool(
         name=tool.name, description=tool.description, args_schema=tool.args_schema

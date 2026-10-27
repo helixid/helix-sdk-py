@@ -9,8 +9,8 @@ HelixID, mirroring helix-sdk-js's mcp-middleware package.
 
 - helixid_mcp_middleware(): server-side, requires and verifies a signed VP
   on every incoming tool call.
-- attach_helix_vp(): client-side, attaches a signed VP to an outgoing tool
-  call from an agent's wallet.
+- attach_helix_vp(): client-side, attaches a VP signed server-side (via
+  HelixClient.sign_vp()) to an outgoing tool call.
 """
 
 from __future__ import annotations

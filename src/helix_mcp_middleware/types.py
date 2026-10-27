@@ -15,17 +15,22 @@ from helix_sdk import HelixClient
 MCPToolCall = Dict[str, Any]
 """A dict with at least 'name' and 'input' keys, matching the JS
 MCPToolCall interface's structural typing (input is an untyped
-Record<string, unknown> on both sides)."""
+Record<string, unknown> on both sides). The VP is carried in '_meta' (the
+MCP request's params._meta, key "x-helix-vp") or, over HTTP, in 'headers'
+(X-Helix-VP) -- never in 'input'."""
 
 
 @dataclass
 class MCPMiddlewareOptions:
     """Required now that verification calls the API (see
-    docs/proposal-sdk-api-only.md) rather than verifying locally."""
+    the SDK-API-only design) rather than verifying locally."""
 
     client: HelixClient
     required_scopes: List[str] = field(default_factory=list)
     allow_self_signed: bool = False
+    # This server's own DID. When set, a VP signed for any other service is
+    # rejected, so a VP meant for one service can't be replayed against another.
+    expected_target_service: Optional[str] = None
 
 
 @dataclass

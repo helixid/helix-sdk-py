@@ -6,8 +6,7 @@ and Verifiable Presentation verification.
 
 This is the Python counterpart to
 [`helix-sdk-js`](https://github.com/helixid/helix-sdk-js), following the same
-**SDK-API-only** architecture (see `docs/proposal-sdk-api-only.md` and
-`docs/proposal-retire-core-package.md` in the `helixid/helixid` repo): every
+**SDK-API-only** architecture: every
 SDK, in every language, depends only on the HelixID API -- never on a shared
 "core" package -- except for private-key operations that must stay local:
 keygen, sign, canonical-hash and `VPBuilder.sign()`, which issuers and Service
@@ -69,11 +68,15 @@ re-copy the three JSON files here too, the same way `helix-sdk-js` does.
 
 - **`helix_sdk`** -- core SDK (see Quick example below).
 - **`helix_mcp_middleware`** -- Model Context Protocol integration:
-  server-side VP verification middleware and client-side VP attachment.
+  server-side VP verification middleware and client-side VP attachment
+  (the VP rides in the request's `params._meta["x-helix-vp"]`, or the
+  `X-Helix-VP` header over HTTP, never in tool arguments).
   Install with the `mcp-middleware` extra:
   `pip install helixid-sdk-py[mcp-middleware]`.
 - **`helix_langchain`** -- LangChain integration: a tool wrapper that
-  injects a signed VP into every tool call, plus scope-based tool
+  signs a fresh VP for every tool call and exposes it to the tool via
+  `current_helix_vp_headers()` (an `X-Helix-VP` header for the tool's
+  outbound request; tool input is untouched), plus scope-based tool
   filtering. Install with `pip install helixid-sdk-py[langchain]`.
 - **`helix_crewai`** -- CrewAI integration, following the same pattern as
   `helix_langchain`. There is no CrewAI counterpart in `helix-sdk-js` --
@@ -90,12 +93,6 @@ client = HelixClient(
     "https://your-helix-api.example.com",
     admin_api_key="...",  # signing is admin-gated in OSS
 )
-
-# The enrollment token is minted beforehand by the agent's owner
-# (POST /v1/enrollment-tokens) -- not by the agent itself.
-token = "..."  # minted via POST /v1/enrollment-tokens
-onboarding = client.onboard_agent(token, ["https://agent.example.com"])
-agent_did = onboarding["agentDid"]
 
 # Signing is an API call: the caller never has the agent's private key.
 vp = client.sign_vp(agent_did, "https://api.example.com/v1/tools/orders")
@@ -138,8 +135,7 @@ Python equivalent.
 ## CLI
 
 There is no Python CLI. Platform-operator workflows (DID/wallet/status-list/
-VC lifecycle) are covered by `helix-sdk-js`'s `cli` package -- see
-`docs/decision-cli-mcp-scope.md` in the `helixid/helixid` repo for why the
+VC lifecycle) are covered by `helix-sdk-js`'s `cli` package -- the
 CLI has a single canonical implementation rather than one per SDK language.
 
 ## Testing
@@ -190,24 +186,21 @@ example scripts above.
   an oversight; an async variant can be added later without breaking this
   one.
 - **No `did:hedera` package yet.** DID resolution generally is always an
-  API call in this architecture (per `docs/proposal-sdk-api-only.md`), so
+  API call in this architecture, so
   this is really about offline Hedera anchoring specifically, which
   `helix-sdk-js`'s `cli` package supports via a separate `did-hedera`
-  package this repo hasn't ported. Since the CLI itself is JS-only (see
-  `docs/decision-cli-mcp-scope.md`), this gap only matters if this SDK's
+  package this repo hasn't ported. Since the CLI itself is JS-only, this gap only matters if this SDK's
   own local-signing primitives grow a `did:hedera` creation path.
 - **No `widget` package** (helix-sdk-js's browser-embeddable consent
   widget has no obvious Python equivalent and hasn't been attempted).
-- **`HelixIDCallbackHandler` in `helix_langchain` cannot rewrite tool
-  input before execution** -- documented in its own docstring. LangChain
+- **`HelixIDCallbackHandler` in `helix_langchain` is a no-op.** LangChain
   Python's `on_tool_start` callback is a notification hook, not an
-  interceptor (unlike the JS SDK's bespoke `RunnableConfigLike.
-  handleToolStart`, which really can mutate input first). Real VP
-  injection happens through `helix_id_tool_wrapper()` instead; the
-  callback handler is offered for observability/wallet-warming only. This
-  is a genuine LangChain Python API constraint, not an incomplete port.
-- **Version numbering does not yet track `helix-sdk-js`'s version.** Per
-  `docs/decision-sdk-py-scope.md`, this SDK's version should track the JS
+  interceptor, and VPs no longer travel in tool input anyway. VP signing
+  happens in `helix_id_tool_wrapper()`, which hands the VP to the tool
+  through `current_helix_vp_headers()`; the callback handler is kept only
+  for observability use. (The JS SDK has dropped its callback form,
+  `HelixIDMiddleware`, entirely.)
+- **Version numbering does not yet track `helix-sdk-js`'s version.** This SDK's version should track the JS
   SDK's; that mapping strategy hasn't been decided yet, so this starts at
   `0.1.0` independently.
 

@@ -106,13 +106,8 @@ def main() -> int:
 
     print("[Step 4] Sub-agent presents the delegated credential")
     # The sub-agent now holds two active credentials -- its own onboarding VC
-    # and this delegated one -- so the VP pins which to present. The default
-    # subject-only lookup rejects that ambiguity.
-    vp = client.sign_vp(
-        sub_agent["agentDid"],
-        "https://api.example.invalid",
-        vc_id=delegated_vc.get("id"),
-    )
+    # and this delegated one -- and the VP carries both.
+    vp = client.sign_vp(sub_agent["agentDid"], "https://api.example.invalid")
     result = client.verify_vp(vp)
     print(f"  valid: {result.get('valid')}")
     print(f"  effective scopes: {', '.join(result.get('effectiveScopes') or [])}")
