@@ -111,7 +111,7 @@ from .vp_transport import (
     read_helix_vp_meta,
 )
 
-__version__ = "1.0.0"  # x-release-please-version
+__version__ = "2.0.0"  # x-release-please-version
 
 __all__ = [
     "HELIX_VP_HEADER",

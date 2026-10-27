@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.0.0](https://github.com/helixid/helix-sdk-py/compare/helixid-sdk-py-v1.0.0...helixid-sdk-py-v2.0.0) (2026-10-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* issue_grant, revoke_grant, prepare_grant, finalize_grant and IssuerKeyMaterial are removed. Grants are now issued server-side via issue_service_delegation_grant and VPs are sent in the X-Helix-VP header or MCP _meta["x-helix-vp"].
+
+### Features
+
+* SDK revamp — VP transport, client updates, audit fixes ([#11](https://github.com/helixid/helix-sdk-py/issues/11)) ([0ca7d35](https://github.com/helixid/helix-sdk-py/commit/0ca7d3516aedbcfa54042e188dceca4c025994e2))
+
 ## [1.0.0](https://github.com/helixid/helix-sdk-py/compare/helixid-sdk-py-v0.1.1...helixid-sdk-py-v1.0.0) (2026-09-09)
 
 
