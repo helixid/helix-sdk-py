@@ -205,8 +205,48 @@ def test_unreachable_authorization_server_is_503_not_401() -> None:
     assert len(instance.errors) == 1
 
 
-def test_a_server_side_fault_is_500(app: App) -> None:
+def test_a_server_side_fault_is_500() -> None:
     instance = App(client=None)
     with instance.http:
         res = instance.call("lookup_order", {"orderId": "ORD-1001"}, {"authorization": f"HelixVP {VP_OK}"})
     assert res.status_code == 500 and "www-authenticate" not in res.headers
+    assert len(instance.errors) == 1
+
+
+def test_batches_are_refused_before_the_gate_so_nothing_is_audited(app: App) -> None:
+    call = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "lookup_order", "arguments": {"orderId": "ORD-1001"}}}
+    res = app.http.post("/mcp", json=[call, {**call, "id": 2}], headers={**JSON_HEADERS, **bearer("reader")})
+    assert res.status_code == 400 and res.json()["error"]["code"] == -32600
+    assert app.audit == []
+
+
+def test_absurdly_nested_body_is_400(app: App) -> None:
+    assert app.http.post("/mcp", content=b"[" * 200_000, headers=JSON_HEADERS).status_code == 400
+
+
+def test_body_arriving_in_chunks_is_limited_and_replayed(app: App) -> None:
+    def chunks(data: bytes, size: int = 7) -> Any:
+        for i in range(0, len(data), size):
+            yield data[i : i + size]
+
+    body = json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "lookup_order", "arguments": {"orderId": "ORD-1001"}}}).encode()
+    ok = app.http.post("/mcp", content=chunks(body), headers={**JSON_HEADERS, **bearer("reader")})
+    assert ok.status_code == 200 and json.loads(text(ok))["id"] == "ORD-1001"
+    assert app.http.post("/mcp", content=chunks(b"x" * 1_000_001, 65536), headers=JSON_HEADERS).status_code == 413
+
+
+def test_host_and_origin_are_limited_to_this_server_and_loopback() -> None:
+    options = MCPMiddlewareOptions(validate_oauth_token=validate)
+    public = TestClient(create_order_app("https://Orders.Example.com:443/mcp", options), base_url="https://orders.example.com")
+    call = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "lookup_order", "arguments": {"orderId": "ORD-1001"}}}
+    with public:
+        headers = {**JSON_HEADERS, **bearer("reader")}
+        assert public.post("/mcp", json=call, headers=headers).status_code == 200  # Host without the port, any case in the URL
+        assert public.post("/mcp", json=call, headers={**headers, "host": "orders.example.com:443"}).status_code == 200
+        assert public.post("/mcp", json=call, headers={**headers, "origin": "https://orders.example.com"}).status_code == 200
+        assert public.post("/mcp", json=call, headers={**headers, "host": "localhost"}).status_code == 200
+        assert public.post("/mcp", json=call, headers={**headers, "host": "evil.example.com"}).status_code == 421
+        assert public.post("/mcp", json=call, headers={**headers, "origin": "https://evil.example.com"}).status_code == 403
+    for bad in ("localhost:3700/mcp", "ftp://x/mcp", "/mcp"):
+        with pytest.raises(ValueError, match="http"):
+            create_order_app(bad, options)

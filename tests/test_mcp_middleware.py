@@ -558,7 +558,7 @@ class TestDiscovery:
             v = create_oauth_validator(OAuthIssuerOptions(ISS_B, AUD, http=FakeHttp(self.routes(metadata))))
             assert isinstance(denied(lambda v=v: v(token)), AuthorizationServerUnavailableError), metadata
 
-    def test_outage_is_retried_on_the_next_token(self) -> None:
+    def test_outage_is_retried_after_the_backoff(self, monkeypatch: pytest.MonkeyPatch) -> None:
         up = {"now": False}
         good = self.routes(metadata_for(ISS_B))
         http = FakeHttp({self.oidc: lambda kw: good[self.oidc] if up["now"] else ConnectionError("refused"), f"{ISS_B}/keys": good[f"{ISS_B}/keys"]})
@@ -566,6 +566,13 @@ class TestDiscovery:
         token = self.k.token(claims(iss=ISS_B))
         assert isinstance(denied(lambda: v(token)), AuthorizationServerUnavailableError)
         up["now"] = True
+        lookups = len(http.calls)
+        # Within the backoff the failure is shared, with no new request ...
+        assert isinstance(denied(lambda: v(token)), AuthorizationServerUnavailableError)
+        assert len(http.calls) == lookups
+        # ... after it, the lookup is retried.
+        real = time.time
+        monkeypatch.setattr(oauth_module, "_now", lambda: real() + 3)
         assert v(token).sub == "user-1"
 
     def test_discovery_needs_https_issuer(self) -> None:
@@ -722,3 +729,306 @@ def test_async_wrapper_runs_the_same_gate() -> None:
     with pytest.raises(HelixError) as excinfo:
         asyncio.run(mw({"name": "nope", "_meta": {"x-helix-vp": VP}}))
     assert excinfo.value.code == "TOOL_NOT_PERMITTED"
+
+
+# ── every supported signature algorithm, with real keys ──────────────────────
+
+
+def _int_b64(value: int) -> str:
+    return b64(value.to_bytes((value.bit_length() + 7) // 8, "big"))
+
+
+def _signer(alg: str) -> Any:
+    """(jwk, sign(data) -> JWS signature bytes) for a fresh key of the algorithm's type."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
+
+    digests = {"256": hashes.SHA256, "384": hashes.SHA384, "512": hashes.SHA512}
+    if alg == "EdDSA":
+        key = ed25519.Ed25519PrivateKey.generate()
+        raw = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        return {"kty": "OKP", "crv": "Ed25519", "x": b64(raw)}, key.sign
+    digest = digests[alg[2:]]()
+    if alg[:2] in ("RS", "PS"):
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        numbers = key.public_key().public_numbers()
+        pad = padding.PKCS1v15() if alg.startswith("RS") else padding.PSS(mgf=padding.MGF1(digest), salt_length=digest.digest_size)
+        return {"kty": "RSA", "n": _int_b64(numbers.n), "e": _int_b64(numbers.e)}, lambda data: key.sign(data, pad, digest)
+    curve, crv, size = {"ES256": (ec.SECP256R1, "P-256", 32), "ES384": (ec.SECP384R1, "P-384", 48), "ES512": (ec.SECP521R1, "P-521", 66)}[alg]
+    key = ec.generate_private_key(curve())
+    numbers = key.public_key().public_numbers()
+
+    def sign(data: bytes) -> bytes:
+        r, s = decode_dss_signature(key.sign(data, ec.ECDSA(digest)))
+        return r.to_bytes(size, "big") + s.to_bytes(size, "big")
+
+    return {"kty": "EC", "crv": crv, "x": b64(numbers.x.to_bytes(size, "big")), "y": b64(numbers.y.to_bytes(size, "big"))}, sign
+
+
+def _jwt(alg: str, sign: Any, body: Dict[str, Any], kid: str = "k") -> str:
+    signing_input = f"{b64({'alg': alg, 'kid': kid})}.{b64(body)}"
+    return f"{signing_input}.{b64(sign(signing_input.encode()))}"
+
+
+ALL_ALGS = ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "EdDSA"]
+
+
+@pytest.mark.parametrize("alg", ALL_ALGS)
+def test_verifies_each_algorithm_and_rejects_a_tampered_or_foreign_signature(alg: str) -> None:
+    jwk, sign = _signer(alg)
+    v = create_jwt_validator(OAuthIssuerOptions(ISS_A, AUD, jwks_uri=f"{ISS_A}/jwks", http=FakeHttp({f"{ISS_A}/jwks": {"keys": [{**jwk, "kid": "k"}]}})))
+    token = _jwt(alg, sign, claims())
+    assert v(token).sub == "user-1"
+
+    head, body, sig = token.split(".")
+    forged_body = b64({**claims(), "sub": "attacker"})
+    raises_invalid(lambda: v(f"{head}.{forged_body}.{sig}"), "Invalid token signature")
+    _, other_sign = _signer(alg)
+    raises_invalid(lambda: v(_jwt(alg, other_sign, claims())), "Invalid token signature")
+    raises_invalid(lambda: v(f"{head}.{body}.{sig[:-4]}"))  # truncated signature
+    raises_invalid(lambda: v(f"{head}.{body}."))  # no signature at all
+
+
+def test_algorithm_and_key_type_cannot_be_mixed() -> None:
+    rsa_jwk, rsa_sign = _signer("RS256")
+    ec_jwk, ec_sign = _signer("ES256")
+    keys = [{**rsa_jwk, "kid": "r"}, {**ec_jwk, "kid": "e"}]
+    v = create_jwt_validator(OAuthIssuerOptions(ISS_A, AUD, jwks_uri=f"{ISS_A}/jwks", http=FakeHttp({f"{ISS_A}/jwks": {"keys": keys}})))
+    assert v(_jwt("RS256", rsa_sign, claims(), kid="r")).sub == "user-1"
+    # The header names a key of the other type: no key is selected, whatever the signature.
+    raises_invalid(lambda: v(_jwt("ES256", ec_sign, claims(), kid="r")), "No matching signing key")
+    raises_invalid(lambda: v(_jwt("RS256", rsa_sign, claims(), kid="e")), "No matching signing key")
+    # A key that declares its own alg or use is only used for that.
+    pinned = create_jwt_validator(OAuthIssuerOptions(ISS_A, AUD, jwks_uri=f"{ISS_A}/jwks", http=FakeHttp({f"{ISS_A}/jwks": {"keys": [{**rsa_jwk, "kid": "r", "alg": "PS256"}, {**ec_jwk, "kid": "e", "use": "enc"}]}})))
+    raises_invalid(lambda: pinned(_jwt("RS256", rsa_sign, claims(), kid="r")), "No matching signing key")
+    raises_invalid(lambda: pinned(_jwt("ES256", ec_sign, claims(), kid="e")), "No matching signing key")
+
+
+def test_token_without_kid_needs_an_unambiguous_key() -> None:
+    jwk1, sign1 = _signer("ES256")
+    jwk2, _ = _signer("ES256")
+
+    def no_kid(sign: Any) -> str:
+        signing_input = f"{b64({'alg': 'ES256'})}.{b64(claims())}"
+        return f"{signing_input}.{b64(sign(signing_input.encode()))}"
+
+    one = create_jwt_validator(OAuthIssuerOptions(ISS_A, AUD, jwks_uri=f"{ISS_A}/jwks", http=FakeHttp({f"{ISS_A}/jwks": {"keys": [jwk1]}})))
+    assert one(no_kid(sign1)).sub == "user-1"
+    two = create_jwt_validator(OAuthIssuerOptions(ISS_A, AUD, jwks_uri=f"{ISS_A}/jwks", http=FakeHttp({f"{ISS_A}/jwks": {"keys": [jwk1, jwk2]}})))
+    raises_invalid(lambda: two(no_kid(sign1)), "No matching signing key")
+
+
+def test_malformed_tokens_and_keys_are_invalid_tokens_never_crashes() -> None:
+    jwk, sign = _signer("ES256")
+    good = _jwt("ES256", sign, claims())
+    head, body, sig = good.split(".")
+    broken_key = {"kty": "EC", "crv": "P-256", "kid": "k", "x": "!!", "y": "!!"}
+    v = create_jwt_validator(OAuthIssuerOptions(ISS_A, AUD, jwks_uri=f"{ISS_A}/jwks", http=FakeHttp({f"{ISS_A}/jwks": {"keys": [{**jwk, "kid": "k"}]}})))
+    for token in ("..", "a.b.c", f"{head}.{body}.éé", f"é.{body}.{sig}", f"{b64([1])}.{body}.{sig}",                   # JWS segments are unpadded base64url: padding or stray characters are not ignored.
+                  f"{head}.{body}.{sig}==", f"{head}.{body}.{sig}!!", f"{head}.{body}.{sig[:10]} {sig[10:]}"):
+        raises_invalid(lambda token=token: v(token))
+    bad = create_jwt_validator(OAuthIssuerOptions(ISS_A, AUD, jwks_uri=f"{ISS_A}/jwks", http=FakeHttp({f"{ISS_A}/jwks": {"keys": [broken_key]}})))
+    raises_invalid(lambda: bad(good), "Token signature could not be verified")
+
+
+# ── review fixes ─────────────────────────────────────────────────────────────
+
+
+class TestOutageDoesNotPileUp:
+    def test_callers_queued_behind_a_failed_jwks_fetch_share_the_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import threading
+
+        k = Key("k1")
+
+        def slow_failure(kwargs: Dict[str, Any]) -> Any:
+            time.sleep(0.2)
+            return ConnectionError("down")
+
+        http = FakeHttp({f"{ISS_A}/jwks": slow_failure})
+        v = create_jwt_validator(OAuthIssuerOptions(ISS_A, AUD, jwks_uri=f"{ISS_A}/jwks", http=http))
+        token = k.token(claims())
+        errors: List[Any] = []
+        threads = [threading.Thread(target=lambda: errors.append(denied(lambda: v(token)))) for _ in range(8)]
+        started = time.time()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert all(isinstance(e, AuthorizationServerUnavailableError) for e in errors) and len(errors) == 8
+        assert len(http.calls) == 1  # one fetch, not eight in a row
+        assert time.time() - started < 1.0
+        # After the backoff the next caller tries again.
+        real = time.time
+        monkeypatch.setattr(oauth_module, "_now", lambda: real() + 3)
+        denied(lambda: v(token))
+        assert len(http.calls) == 2
+
+    def test_recovery_clears_the_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        k = Key("k1")
+        up = {"now": False}
+        http = FakeHttp({f"{ISS_A}/jwks": lambda kw: {"keys": [k.jwk]} if up["now"] else Response({}, 503)})
+        v = create_jwt_validator(OAuthIssuerOptions(ISS_A, AUD, jwks_uri=f"{ISS_A}/jwks", http=http))
+        denied(lambda: v(k.token(claims())))
+        up["now"] = True
+        real = time.time
+        monkeypatch.setattr(oauth_module, "_now", lambda: real() + 3)
+        assert v(k.token(claims())).sub == "user-1"
+        assert v(k.token(claims())).sub == "user-1"
+        assert len(http.calls) == 2
+
+
+class TestAsyncCallbacks:
+    def test_the_sync_gate_refuses_async_callbacks_instead_of_dropping_them(self) -> None:
+        async def sink(event: Dict[str, Any]) -> None: ...
+        async def validate(token: str) -> Dict[str, Any]:
+            return {"sub": "u"}
+
+        with pytest.raises(ValueError, match="async_helixid_mcp_middleware"):
+            gate(client=verifying_client([]), audit_sink=sink)
+        with pytest.raises(ValueError, match="async_helixid_mcp_middleware"):
+            gate(validate_oauth_token=validate)
+
+        # A sync callable that returns an awaitable is caught at call time: a sink
+        # failure is reported, a validator is a configuration error (never a 401).
+        errors: List[BaseException] = []
+        mw = gate(client=verifying_client([]), audit_sink=lambda e: sink(e), on_audit_error=errors.append)
+        assert mw({"name": "t", "_meta": {"x-helix-vp": VP}})
+        assert len(errors) == 1 and "awaitable" in str(errors[0])
+        err = denied(lambda: gate(validate_oauth_token=lambda t: validate(t))({"name": "t", "headers": {"authorization": "Bearer x"}}))
+        assert isinstance(err, TypeError) and to_http_error_response(err, META_URL) is None
+
+    def test_the_async_gate_awaits_async_callbacks_off_the_event_loop_thread(self) -> None:
+        import threading
+
+        events: List[Dict[str, Any]] = []
+        seen: Dict[str, Any] = {}
+
+        async def validate(token: str) -> Dict[str, Any]:
+            await asyncio.sleep(0)
+            seen["validate_thread"] = threading.get_ident()
+            return {"sub": "u-1", "scopes": ["read"]}
+
+        async def sink(event: Dict[str, Any]) -> None:
+            await asyncio.sleep(0)
+            events.append(event)
+
+        client = verifying_client(["read"])
+        client.verify_vp.side_effect = lambda vp, **kw: seen.update(verify_thread=threading.get_ident()) or {
+            "valid": True, "agentDid": "did:agent", "effectiveScopes": ["read"], "vpId": "v"}
+
+        async def run() -> None:
+            seen["loop_thread"] = threading.get_ident()
+            mw = async_helixid_mcp_middleware(MCPMiddlewareOptions(client=client, validate_oauth_token=validate, audit_sink=sink, tool_scopes={"q": ["read"]}))
+            await mw({"name": "q", "headers": {"authorization": "Bearer tok"}})
+            await mw({"name": "q", "_meta": {"x-helix-vp": VP}})
+
+        asyncio.run(run())
+        assert [(e["event"], e.get("oauthSubject"), e.get("agentDid")) for e in events] == [("AUTHZ_GRANTED", "u-1", None), ("AUTHZ_GRANTED", None, "did:agent")]
+        assert seen["validate_thread"] == seen["loop_thread"]  # the async callback ran on the loop
+        assert seen["verify_thread"] != seen["loop_thread"]  # the blocking API call did not
+
+
+class TestHostileInput:
+    def test_absurdly_nested_json_is_a_bad_credential_not_a_crash(self) -> None:
+        deep = base64.urlsafe_b64encode(b"[" * 100_000).rstrip(b"=").decode()
+        mw = gate(client=verifying_client([]), oauth=OAuthIssuerOptions(ISS_A, AUD, jwks_uri=f"{ISS_A}/jwks", http=FakeHttp()))
+        assert denied(lambda: mw({"name": "t", "headers": {"x-helix-vp": deep}})).code == "VP_INVALID_STRUCTURE"
+        assert denied(lambda: mw({"name": "t", "_meta": {"x-helix-vp": deep}})).code == "VP_INVALID_STRUCTURE"
+        assert denied(lambda: mw({"name": "t", "headers": {"authorization": f"Bearer {deep}.{deep}.x"}})).code == "OAUTH_TOKEN_INVALID"
+
+    def test_meta_that_is_not_a_mapping_is_treated_as_absent(self) -> None:
+        mw = gate(client=verifying_client([]))
+        for meta in ("x", [1], 5, object()):
+            assert denied(lambda meta=meta: mw({"name": "t", "_meta": meta})).code == "VP_MISSING"
+
+        class Meta:  # the shape of the MCP Python SDK's RequestParams.Meta
+            def model_dump(self, by_alias: bool = False) -> Dict[str, Any]:
+                return {"progressToken": None, "x-helix-vp": VP}
+
+        assert mw({"name": "t", "_meta": Meta()})["name"] == "t"
+
+    def test_signatures_must_be_canonical_base64url_but_published_keys_may_be_padded(self) -> None:
+        k = Key("k1")
+        padded = {**k.jwk, "x": k.jwk["x"] + "=", "y": k.jwk["y"] + "="}
+        v = create_jwt_validator(OAuthIssuerOptions(ISS_A, AUD, jwks_uri=f"{ISS_A}/jwks", http=FakeHttp({f"{ISS_A}/jwks": {"keys": [padded]}})))
+        token = k.token(claims())
+        assert v(token).sub == "user-1"
+        head, body, sig = token.split(".")
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        # 64 signature bytes leave unused bits in the last character: exactly one spelling is accepted.
+        accepted = [c for c in alphabet if _accepts(v, f"{head}.{body}.{sig[:-1]}{c}")]
+        assert accepted == [sig[-1]]
+        raises_invalid(lambda: v(f"{head}.{body}.{sig}\n"))
+
+
+def _accepts(validator: Any, token: str) -> bool:
+    try:
+        validator(token)
+        return True
+    except HelixError:
+        return False
+
+
+class TestOptionAndClaimEdges:
+    def setup_method(self) -> None:
+        self.k = Key("k1")
+        self.http = FakeHttp({f"{ISS_A}/jwks": {"keys": [self.k.jwk]}})
+
+    def jwt(self, **options: Any) -> Any:
+        return create_jwt_validator(OAuthIssuerOptions(ISS_A, AUD, jwks_uri=f"{ISS_A}/jwks", http=self.http, **options))
+
+    def test_empty_lists_mean_none_not_the_default(self) -> None:
+        raises_invalid(lambda: self.jwt(algorithms=[])(self.k.token(claims())), "Unsupported token algorithm")
+        assert list(self.jwt(scope_claims=[])(self.k.token(claims())).scopes) == []
+        for bad in ({"scope_claims": "roles"}, {"algorithms": "ES256"}):
+            with pytest.raises(ValueError, match="list of strings"):
+                self.jwt(**bad)
+
+    def test_timestamps_must_be_real_finite_numbers(self) -> None:
+        v = self.jwt()
+        for exp in (float("nan"), float("inf"), 10**400, True, "9999999999"):
+            head, body = b64({"alg": "ES256", "kid": "k1"}), base64.urlsafe_b64encode(json.dumps({**claims(), "exp": exp}).encode()).rstrip(b"=").decode()
+            r, s = decode_dss_signature(self.k.private.sign(f"{head}.{body}".encode(), ec.ECDSA(hashes.SHA256())))
+            token = f"{head}.{body}.{b64(r.to_bytes(32, 'big') + s.to_bytes(32, 'big'))}"
+            raises_invalid(lambda token=token: v(token), "Token expired")
+
+    def test_present_but_null_claims_are_malformed_on_introspection(self) -> None:
+        def answer(**body: Any) -> Any:
+            return create_introspection_validator(introspecting(FakeHttp({INTROSPECT_B: {"active": True, **active(), **body}}), allow_missing_audience=True))
+
+        for body, message in (({"exp": None}, "Token expired"), ({"nbf": None}, "Token not yet valid"), ({"iss": None}, "Unexpected token issuer"), ({"aud": None}, "Token audience does not match this server")):
+            raises_invalid(lambda body=body: answer(**body)("t"), message)
+        assert answer(client_id="", azp="fallback").__call__("t").client_id is None  # an empty client_id is not replaced by azp
+
+    def test_introspection_cache_is_swept_when_large(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        soon = int(time.time()) + 1
+        known = {f"t{i}": active(exp=soon) for i in range(1000)}
+        known["fresh"] = active()
+        http = FakeHttp({INTROSPECT_B: introspection_route(known)})
+        v = create_introspection_validator(introspecting(http, clock_tolerance_seconds=0))
+        for i in range(1000):
+            v(f"t{i}")
+        real = time.time
+        monkeypatch.setattr(oauth_module, "_now", lambda: real() + 2.5)
+        assert v("fresh").sub == "opaque-user"  # the 1001st insert sweeps the 1000 expired entries
+        raises_invalid(lambda: v("t0"), "Token expired")  # asked again: its entry is gone
+        v("fresh")  # served from cache
+        assert len(http.calls) == 1002
+
+
+class TestApiErrorClassification:
+    def test_any_error_carrying_a_credential_code_is_a_bad_credential(self) -> None:
+        class Odd(Exception):
+            code = "VC_REVOKED"
+
+        client = MagicMock()
+        client.verify_vp.side_effect = Odd("revoked upstream")
+        err = denied(lambda: gate(client=client)({"name": "t", "_meta": {"x-helix-vp": VP}}))
+        assert (err.code, str(err)) == ("VP_VERIFICATION_FAILED", "revoked upstream")
+
+    def test_an_api_refusal_of_this_servers_own_request_is_never_the_callers_403(self) -> None:
+        for code in ("INSUFFICIENT_SCOPE",):
+            client = MagicMock()
+            client.verify_vp.side_effect = HelixError(code, "your API key lacks vp:verify", 403)
+            err = denied(lambda client=client: gate(client=client)({"name": "t", "_meta": {"x-helix-vp": VP}}))
+            assert isinstance(err, RuntimeError) and to_http_error_response(err, META_URL) is None, code

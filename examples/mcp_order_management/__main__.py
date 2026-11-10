@@ -76,15 +76,15 @@ def _introspection(raw: Any, where: str, endpoint_allowed: bool) -> Optional[OAu
         return None
     if not isinstance(raw, dict):
         fail(f"{where}.introspection: expected an object")
-    _only_keys(raw, ["clientId", "clientSecret", "cacheTtlSeconds", "allowMissingAudience"] + (["endpoint"] if endpoint_allowed else []), f"{where}.introspection")
+    _only_keys(raw, ["clientId", "clientSecret", "cacheTtlMs", "allowMissingAudience"] + (["endpoint"] if endpoint_allowed else []), f"{where}.introspection")
     client_id, client_secret = _text(raw.get("clientId")), _text(raw.get("clientSecret"))
     if not client_id or not client_secret:
         fail(f"{where}: introspection needs clientId and clientSecret")
     options = OAuthIntrospectionOptions(client_id, client_secret, endpoint=_text(raw.get("endpoint")))
-    if "cacheTtlSeconds" in raw:
-        if not isinstance(raw["cacheTtlSeconds"], (int, float)) or raw["cacheTtlSeconds"] < 0:
-            fail(f"{where}: cacheTtlSeconds must be a non-negative number")
-        options.cache_ttl_seconds = float(raw["cacheTtlSeconds"])
+    if "cacheTtlMs" in raw:  # milliseconds, so one OAUTH_ISSUERS value works for the JS and Python samples
+        if isinstance(raw["cacheTtlMs"], bool) or not isinstance(raw["cacheTtlMs"], (int, float)) or raw["cacheTtlMs"] < 0:
+            fail(f"{where}: cacheTtlMs must be a non-negative number")
+        options.cache_ttl_seconds = raw["cacheTtlMs"] / 1000
     if "allowMissingAudience" in raw:
         if not isinstance(raw["allowMissingAudience"], bool):
             fail(f"{where}: allowMissingAudience must be a boolean")
@@ -182,7 +182,10 @@ def oauth_issuers_from_env(env: Dict[str, str], resource: str) -> List[OAuthIssu
 
 def main() -> None:
     env = dict(os.environ)
-    port = int(env.get("PORT", "3700"))
+    try:
+        port = int(env.get("PORT", "3700"))
+    except ValueError:
+        fail(f"PORT must be a number, got {env.get('PORT')!r}")
     host = env.get("HOST", "127.0.0.1")
     resource = env.get("MCP_RESOURCE") or f"http://localhost:{port}/mcp"
     api_url, api_key, service_did = env.get("HELIX_API_URL"), env.get("HELIX_API_KEY"), env.get("SERVICE_DID")

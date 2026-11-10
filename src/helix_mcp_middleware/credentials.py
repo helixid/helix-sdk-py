@@ -46,7 +46,20 @@ def _header_values(headers: Any, name: str) -> List[str]:
     return [v.strip() for v in out if isinstance(v, str) and v.strip()]
 
 
-def extract_credential(headers: Any = None, meta: Optional[Mapping[str, Any]] = None) -> Optional[ExtractedCredential]:
+def _meta_mapping(meta: Any) -> Mapping[str, Any]:
+    """`_meta` as a mapping. Accepts a dict or the MCP Python SDK's own
+    RequestParams.Meta object (what a tool handler holds); anything else,
+    including a string or list a client might send, is treated as absent."""
+    if isinstance(meta, Mapping):
+        return meta
+    dump = getattr(meta, "model_dump", None)
+    if callable(dump):
+        dumped = dump(by_alias=True)
+        return dumped if isinstance(dumped, Mapping) else {}
+    return {}
+
+
+def extract_credential(headers: Any = None, meta: Any = None) -> Optional[ExtractedCredential]:
     """`Authorization: HelixVP <vp>`, the legacy `X-Helix-VP` header, or MCP
     `_meta["x-helix-vp"]` (stdio) for a HelixID VP, or
     `Authorization: Bearer <token>` for OAuth. Tool arguments are never read.
@@ -78,7 +91,7 @@ def extract_credential(headers: Any = None, meta: Optional[Mapping[str, Any]] = 
     for value in _header_values(headers, _VP_HEADER):
         add(value)
 
-    raw = (meta or {}).get(HELIX_VP_META_KEY)
+    raw = _meta_mapping(meta).get(HELIX_VP_META_KEY)
     if raw is not None and raw != "":
         if not isinstance(raw, str):
             raise VPInvalidStructureError(f'_meta["{HELIX_VP_META_KEY}"] must be a base64url-encoded string')

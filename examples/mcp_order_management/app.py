@@ -51,6 +51,9 @@ def create_order_app(
     served at its path); `auth` is everything except the scopes, which this
     sample fixes in TOOL_SCOPES."""
     url = urlsplit(resource)
+    if url.scheme not in ("http", "https") or not url.hostname:
+        raise ValueError(f"resource must be an http(s) URL, got {resource!r}")
+    host = f"[{url.hostname}]" if ":" in url.hostname else url.hostname  # lower-cased, no port or userinfo
     mcp_path = url.path or "/"
     metadata_url = protected_resource_metadata_url(resource)
     metadata_path = urlsplit(metadata_url).path
@@ -67,10 +70,16 @@ def create_order_app(
         stateless_http=True,
         json_response=True,
         streamable_http_path=mcp_path,
-        # DNS-rebinding protection stays on: only this server's own host and loopback are accepted.
+        # DNS-rebinding protection stays on: only this server's own host and loopback
+        # are accepted, as Host and as Origin, with or without a port.
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
-            allowed_hosts=[url.netloc, "127.0.0.1:*", "localhost:*", "[::1]:*"],
+            allowed_hosts=[h for name in (host, "127.0.0.1", "localhost", "[::1]") for h in (name, f"{name}:*")],
+            allowed_origins=[
+                o
+                for origin in (f"{url.scheme}://{host}", "http://127.0.0.1", "http://localhost", "http://[::1]")
+                for o in (origin, f"{origin}:*")
+            ],
         ),
     )
     register_order_tools(server, store if store is not None else create_order_store())
@@ -111,12 +120,17 @@ def create_order_app(
         raw = b"".join(chunks)
         try:
             body = json.loads(raw.decode("utf-8"))
-        except ValueError:
+        except (ValueError, RecursionError):  # RecursionError: absurdly nested JSON
             await respond(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Request body is not valid JSON"}})
+            return
+        if isinstance(body, list):
+            # The MCP Python transport refuses batches. Answer before the gate, or
+            # every entry would be verified and audited as granted for calls that never run.
+            await respond(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Batch requests are not supported"}})
             return
 
         headers = Headers(scope=scope)
-        for message in body if isinstance(body, list) else [body]:
+        for message in [body]:
             if not isinstance(message, dict) or message.get("method") != "tools/call":
                 continue
             params = message.get("params") if isinstance(message.get("params"), dict) else {}

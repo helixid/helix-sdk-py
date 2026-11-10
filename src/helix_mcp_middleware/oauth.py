@@ -14,6 +14,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
+import re
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -101,7 +103,11 @@ _ALGS: Dict[str, Tuple[str, Optional[str]]] = {
 }
 _DEFAULT_SCOPE_CLAIMS = ("scope", "scp")
 _CACHE_SWEEP_AT = 1000
-_TIMEOUT = 5
+# (connect, read) seconds for every call to an authorization server.
+_TIMEOUT = (3.05, 5)
+# After a failed JWKS or metadata fetch, callers within this window get the same
+# failure without another request.
+_FAILURE_BACKOFF = 2.0
 
 
 def _now() -> float:
@@ -117,14 +123,35 @@ class _ActiveTokenRejectedError(MCPAuthError):
     not fit this server."""
 
 
+_B64URL = re.compile(r"^[A-Za-z0-9_-]*$")
+
+
 def _b64url(segment: str) -> bytes:
-    return base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
+    """A JWS segment: unpadded, canonical base64url and nothing else.
+    base64.urlsafe_b64decode silently drops characters outside the alphabet,
+    tolerates padding and ignores unused trailing bits, so many strings would
+    decode to the same bytes; here exactly one does."""
+    if not isinstance(segment, str) or not _B64URL.fullmatch(segment) or len(segment) % 4 == 1:
+        raise ValueError("not base64url")
+    decoded = base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
+    if base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii") != segment:
+        raise ValueError("not canonical base64url")
+    return decoded
+
+
+def _b64url_jwk(member: Any) -> bytes:
+    """A JWK member. Published key sets are not always canonical (some pad), and
+    nothing here is attacker-chosen per request, so padding is tolerated."""
+    if not isinstance(member, str) or not _B64URL.fullmatch(member.rstrip("=")):
+        raise ValueError("not base64url")
+    stripped = member.rstrip("=")
+    return base64.urlsafe_b64decode(stripped + "=" * (-len(stripped) % 4))
 
 
 def _decode_segment(segment: str) -> Dict[str, Any]:
     try:
         parsed = json.loads(_b64url(segment).decode("utf-8"))
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):  # RecursionError: absurdly nested JSON
         parsed = None
     if not isinstance(parsed, dict):
         raise _invalid("Malformed token")
@@ -150,9 +177,16 @@ def _audiences(options: OAuthIssuerOptions) -> List[str]:
     return [options.audience] if isinstance(options.audience, str) else list(options.audience)
 
 
+def _check_list_options(options: "OAuthIssuerOptions") -> None:
+    # A bare string would be iterated character by character and silently match nothing.
+    for name in ("scope_claims", "algorithms"):
+        if isinstance(getattr(options, name), str):
+            raise ValueError(f"{name} must be a list of strings, not a string")
+
+
 def _parse_scopes(claims: Dict[str, Any], scope_claims: Optional[Sequence[str]]) -> List[str]:
     scopes: List[str] = []
-    for name in scope_claims or _DEFAULT_SCOPE_CLAIMS:
+    for name in _DEFAULT_SCOPE_CLAIMS if scope_claims is None else scope_claims:
         value = claims.get(name)
         items = value.split(" ") if isinstance(value, str) else value if isinstance(value, list) else []
         for item in items:
@@ -162,7 +196,14 @@ def _parse_scopes(claims: Dict[str, Any], scope_claims: Optional[Sequence[str]])
 
 
 def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    """A usable timestamp: a real, finite number. Python's json accepts NaN and
+    Infinity (which would never expire) and arbitrarily large ints (which
+    overflow in arithmetic); none of those is a time."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
+    return abs(value) < 1e13
 
 
 def _check_standard_claims(
@@ -176,18 +217,18 @@ def _check_standard_claims(
     (signature verified, or introspected as active)."""
     now = _now()
     tolerance = options.clock_tolerance_seconds
+    # Presence, not truthiness: a claim that is present but null is malformed, not absent.
     exp = claims.get("exp")
-    if exp is not None or require_exp:
+    if "exp" in claims or require_exp:
         if not _is_number(exp) or exp + tolerance < now:
             raise _invalid("Token expired")
     nbf = claims.get("nbf")
-    if nbf is not None and (not _is_number(nbf) or nbf - tolerance > now):
+    if "nbf" in claims and (not _is_number(nbf) or nbf - tolerance > now):
         raise _invalid("Token not yet valid")
-    iss = claims.get("iss")
-    if iss is not None and iss != options.issuer:
+    if "iss" in claims and claims["iss"] != options.issuer:
         raise _invalid("Unexpected token issuer")
     aud = claims.get("aud")
-    if aud is None:
+    if "aud" not in claims:
         if require_aud:
             raise _invalid("Token has no audience")
     else:
@@ -195,7 +236,7 @@ def _check_standard_claims(
         allowed = _audiences(options)
         if not any(isinstance(a, str) and a in allowed for a in token_aud):
             raise _invalid("Token audience does not match this server")
-    client_id = claims.get("client_id") or claims.get("azp")
+    client_id = claims["client_id"] if claims.get("client_id") is not None else claims.get("azp")
     client_id = client_id if isinstance(client_id, str) and client_id else None
     sub = claims.get("sub")
     if not (isinstance(sub, str) and sub):
@@ -208,14 +249,14 @@ def _check_standard_claims(
 
 def _public_key(jwk: Dict[str, Any]) -> Any:
     kty = jwk.get("kty")
-    as_int = lambda name: int.from_bytes(_b64url(jwk[name]), "big")  # noqa: E731
+    as_int = lambda name: int.from_bytes(_b64url_jwk(jwk[name]), "big")  # noqa: E731
     if kty == "RSA":
         return rsa.RSAPublicNumbers(e=as_int("e"), n=as_int("n")).public_key()
     if kty == "EC":
         curve = _CURVES[jwk["crv"]][0]()
         return ec.EllipticCurvePublicNumbers(as_int("x"), as_int("y"), curve).public_key()
     if kty == "OKP" and jwk.get("crv") == "Ed25519":
-        return ed25519.Ed25519PublicKey.from_public_bytes(_b64url(jwk["x"]))
+        return ed25519.Ed25519PublicKey.from_public_bytes(_b64url_jwk(jwk["x"]))
     raise ValueError("unsupported key")
 
 
@@ -246,12 +287,13 @@ def create_jwt_validator(options: OAuthIssuerOptions) -> Validator:
     if not jwks_uri:
         raise ValueError("jwks_uri is required here; create_oauth_validator can discover it from the issuer")
     _assert_https_or_loopback(jwks_uri, "jwks_uri")
-    allowed = set(options.algorithms or _ALGS)
+    _check_list_options(options)
+    allowed = set(_ALGS if options.algorithms is None else options.algorithms)
     for alg in allowed:
         if alg not in _ALGS:
             raise ValueError(f"Unsupported algorithm: {alg}")
 
-    state: Dict[str, Any] = {"keys": [], "fetched_at": 0.0}
+    state: Dict[str, Any] = {"keys": [], "fetched_at": 0.0, "failed_at": None, "failure": None}
     lock = threading.Lock()
 
     def refresh() -> None:
@@ -278,6 +320,11 @@ def create_jwt_validator(options: OAuthIssuerOptions) -> Validator:
 
     def find_key(kid: Optional[str], alg: str) -> Dict[str, Any]:
         with lock:
+            # Callers queue on this lock while one of them fetches. If that fetch
+            # just failed, the ones behind it share the failure instead of each
+            # repeating a slow, doomed request while still holding the lock.
+            if state["failed_at"] is not None and _now() - state["failed_at"] < _FAILURE_BACKOFF:
+                raise state["failure"]
             try:
                 if _now() - state["fetched_at"] > options.jwks_cache_ttl_seconds:
                     refresh()
@@ -285,10 +332,12 @@ def create_jwt_validator(options: OAuthIssuerOptions) -> Validator:
                 if not candidates and _now() - state["fetched_at"] >= options.jwks_refetch_cooldown_seconds:
                     refresh()  # unknown kid: the issuer may have rotated keys
                     candidates = select(kid, alg)
+                state["failed_at"] = None
             except Exception as exc:  # noqa: BLE001 - the authorization server, not the caller, is the problem
-                raise AuthorizationServerUnavailableError(
-                    f"Signing keys could not be retrieved from {jwks_uri}: {exc}"
-                ) from exc
+                failure = AuthorizationServerUnavailableError(f"Signing keys could not be retrieved from {jwks_uri}: {exc}")
+                failure.__cause__ = exc
+                state["failed_at"], state["failure"] = _now(), failure
+                raise failure from exc
         # Without a kid, only accept an unambiguous key.
         if len(candidates) != 1:
             raise _invalid("No matching signing key")
@@ -339,6 +388,7 @@ def create_introspection_validator(options: OAuthIssuerOptions) -> Validator:
         raise ValueError("introspection.endpoint is required here; create_oauth_validator can discover it from the issuer")
     endpoint = introspection.endpoint
     _assert_https_or_loopback(endpoint, "introspection endpoint")
+    _check_list_options(options)
     # RFC 6749 section 2.3.1: form-encode the id and secret before Basic-encoding them.
     pair = f"{quote_plus(introspection.client_id, safe='')}:{quote_plus(introspection.client_secret, safe='')}"
     basic = base64.b64encode(pair.encode("utf-8")).decode("ascii")
@@ -371,7 +421,7 @@ def create_introspection_validator(options: OAuthIssuerOptions) -> Validator:
             raise unavailable(f"HTTP {res.status_code}")
         try:
             claims = res.json()
-        except ValueError:
+        except (ValueError, RecursionError):
             raise unavailable("response is not JSON") from None
         if not isinstance(claims, dict) or not isinstance(claims.get("active"), bool):
             raise unavailable('response has no boolean "active"')
@@ -495,11 +545,19 @@ def _issuer_validators(entry: OAuthIssuerOptions) -> Tuple[Optional[Validator], 
 
     built: List[Tuple[Optional[Validator], Optional[Validator]]] = [] if needs_discovery else [build({})]
     lock = threading.Lock()
+    failed: Dict[str, Any] = {"at": None, "error": None}
 
     def ready() -> Tuple[Optional[Validator], Optional[Validator]]:
         with lock:
             if not built:
-                built.append(build(_discover_metadata(entry)))
+                # As in find_key: callers queued behind a failed lookup share its failure.
+                if failed["at"] is not None and _now() - failed["at"] < _FAILURE_BACKOFF:
+                    raise failed["error"]
+                try:
+                    built.append(build(_discover_metadata(entry)))
+                except AuthorizationServerUnavailableError as exc:
+                    failed["at"], failed["error"] = _now(), exc
+                    raise
             return built[0]
 
     jwt_validator: Optional[Validator] = (lambda token: ready()[0](token)) if wants_jwt else None  # type: ignore[misc]

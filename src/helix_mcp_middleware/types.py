@@ -44,7 +44,8 @@ class MCPMiddlewareOptions:
     and the provider presets). Mutually exclusive with `validate_oauth_token`."""
     validate_oauth_token: Optional[Callable[[str], Any]] = None
     """Custom bearer-token validation (your own API keys as bearers). Return
-    an AuthResult, or a dict with 'sub' and 'scopes'; raise to reject."""
+    an AuthResult, or a dict with 'sub' and 'scopes'; raise to reject. May be
+    async with async_helixid_mcp_middleware (as may `audit_sink`)."""
     audit_sink: Optional[Callable[[Dict[str, Any]], None]] = None
     """Receives an event for every decision about an identified caller. See
     create_helix_audit_sink."""
