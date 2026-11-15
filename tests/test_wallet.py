@@ -77,8 +77,11 @@ def _build_grant_vc(agent_did: str, issuer_did: str, user_did: str, scopes: List
 def _decode_proof_value(proof_value: str) -> str:
     from helix_sdk.vp_crypto import base58btc_decode
 
-    value = proof_value[1:] if proof_value.startswith("z") else proof_value
-    return base58btc_decode(value).hex()
+    # VPBuilder writes the signature as plain base58btc, with no multibase "z"
+    # prefix. Do not strip a leading "z": about 1 signature in 280 happens to
+    # start with one, and dropping it corrupts the value (this test used to
+    # fail at that rate).
+    return base58btc_decode(proof_value).hex()
 
 
 @pytest.fixture()
