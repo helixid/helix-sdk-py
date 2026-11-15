@@ -67,10 +67,22 @@ re-copy the three JSON files here too, the same way `helix-sdk-js` does.
 ## Packages in this repo
 
 - **`helix_sdk`** -- core SDK (see Quick example below).
-- **`helix_mcp_middleware`** -- Model Context Protocol integration:
-  server-side VP verification middleware and client-side VP attachment
-  (the VP rides in the request's `params._meta["x-helix-vp"]`, or the
-  `X-Helix-VP` header over HTTP, never in tool arguments).
+- **`helix_mcp_middleware`** -- Model Context Protocol integration, the same
+  Phase 1 surface as `@helixid/mcp-middleware`:
+  `helixid_mcp_middleware()` / `async_helixid_mcp_middleware()` gate every
+  incoming tool call. A caller presents a HelixID VP
+  (`Authorization: HelixVP`, `X-Helix-VP`, or MCP `_meta["x-helix-vp"]`) or
+  an OAuth 2.1 bearer token; `tool_scopes` maps each tool to the scopes it
+  needs and denies unlisted tools; every decision goes to `audit_sink`
+  (`create_helix_audit_sink()` writes to the HelixID audit log).
+  `oauth=` takes one trusted issuer or a list: `OAuthIssuerOptions(issuer,
+  audience)` is enough (keys come from the issuer's metadata), or use the
+  presets `entra()`, `auth0()`, `okta()`, `keycloak()`; opaque tokens are
+  checked by RFC 7662 introspection at the one issuer you run.
+  `to_http_error_response()` and `build_protected_resource_metadata()` give
+  the 401 / 403 challenges and the RFC 9728 document. `attach_helix_vp()`
+  attaches a VP to an outgoing call. A runnable server is in
+  [`examples/mcp_order_management`](examples/mcp_order_management).
   Install with the `mcp-middleware` extra:
   `pip install helixid-sdk-py[mcp-middleware]`.
 - **`helix_langchain`** -- LangChain integration: a tool wrapper that
@@ -157,6 +169,10 @@ real follow-up work, not something this tooling change did on its own.
   storage/queries, and `VPBuilder` local-signing round trip. (`delegate()`
   and its mocked-HTTP tests were removed along with the rest of agent
   self-custody.)
+- `tests/test_mcp_middleware.py` -- the middleware's Phase 1 cases (credentials,
+  scopes, JWT / introspection / several issuers / discovery / presets, HTTP
+  challenges, audit); `tests/test_mcp_order_management_example.py` runs the
+  sample behind the MCP SDK's HTTP transport (Python 3.10+).
 - `tests/test_framework_adapters.py` -- exercises `helix_mcp_middleware`,
   `helix_langchain`, and `helix_crewai` against the real installed
   `langchain-core` and `crewai` packages (not mocks of them), so a real

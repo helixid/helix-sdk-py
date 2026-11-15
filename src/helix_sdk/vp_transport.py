@@ -34,7 +34,7 @@ def decode_helix_vp(value: str) -> Dict[str, Any]:
     raw = value.strip()
     try:
         decoded = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, RecursionError) as exc:  # RecursionError: absurdly nested JSON
         raise VPInvalidStructureError(f"{HELIX_VP_HEADER} is not base64url-encoded JSON") from exc
     if not isinstance(decoded, dict):
         raise VPInvalidStructureError(f"{HELIX_VP_HEADER} is not a JSON object")
