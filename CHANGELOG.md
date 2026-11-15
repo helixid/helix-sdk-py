@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.1.0](https://github.com/helixid/helix-sdk-py/compare/helixid-sdk-py-v2.0.0...helixid-sdk-py-v2.1.0) (2026-11-15)
+
+
+### Features
+
+* **mcp-middleware:** Phase 1 auth gate, OAuth, per-tool scopes, audit and order-management sample ([06c5797](https://github.com/helixid/helix-sdk-py/commit/06c579779497a8df17b7894c5849b55f07b75669))
+* **mcp-middleware:** Phase 1 auth gate, OAuth, per-tool scopes, audit and order-management sample ([6066c03](https://github.com/helixid/helix-sdk-py/commit/6066c03a6fd74347bdd72af71af7cb5cb60c9255))
+
+
+### Bug Fixes
+
+* **mcp-middleware:** review fixes for the Phase 1 port ([e97b103](https://github.com/helixid/helix-sdk-py/commit/e97b103e8e361734e89c113212f6ee8a21828879))
+
 ## [2.0.0](https://github.com/helixid/helix-sdk-py/compare/helixid-sdk-py-v1.0.0...helixid-sdk-py-v2.0.0) (2026-10-27)
 
 
