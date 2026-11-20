@@ -45,6 +45,25 @@ from .keys import (
     multibase_to_public_key_hex,
 )
 
+# KYA-OS story L1-A: the agent's own Ed25519 key, generated client side; only
+# its public half (JWK, did:key) ever leaves the process. Resolution of did:web
+# and did:key to that key never touches a Helix database.
+from .agent_key import (
+    DEFAULT_AGENT_KEY_ID,
+    AgentKey,
+    agent_key_registration,
+    agent_public_key,
+    assert_no_private_material,
+    decode_base58btc,
+    encode_base58btc,
+    generate_agent_key,
+    public_key_from_did_key,
+    public_key_jwk_bytes,
+    to_did_key,
+    to_public_key_jwk,
+)
+from .did_resolver import ResolvedKey, did_key_document, resolve_did, resolve_did_key, resolve_did_web
+
 # Errors
 from .errors import (  # noqa: F401
     HelixError,
