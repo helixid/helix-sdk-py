@@ -363,6 +363,15 @@ class InvalidJWTError(HelixError):
         super().__init__(codes.JWT_INVALID, message, 400)
 
 
+class InvalidJWSError(HelixError):
+    """A compact JWS that does not verify (KYA-OS L1.3 to L1.5). ``reason`` is
+    one of helix_sdk.crypto.jws.JwsReasons, the same strings helix-core uses."""
+
+    def __init__(self, reason: str, message: str = "JWS is invalid") -> None:
+        super().__init__(codes.JWS_INVALID, message, 400, {"reason": reason})
+        self.reason = reason
+
+
 class JWTExpiredError(HelixError):
     def __init__(self, message: str = "JWT has expired") -> None:
         super().__init__(codes.JWT_EXPIRED, message, 401)
