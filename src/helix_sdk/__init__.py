@@ -48,6 +48,7 @@ from .keys import (
 # Errors
 from .errors import (  # noqa: F401
     HelixError,
+    InvalidJWSError,
     map_api_error,
     ValidationError,
     InternalError,
