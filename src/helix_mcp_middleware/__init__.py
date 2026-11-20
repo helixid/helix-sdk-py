@@ -17,7 +17,10 @@ HelixID, mirroring helix-sdk-js's mcp-middleware package.
   metadata; presets entra(), auth0(), okta(), keycloak().
 - to_http_error_response(), build_protected_resource_metadata(): 401 / 403
   challenges and the RFC 9728 document.
-- create_helix_audit_sink(): writes decisions to the HelixID audit log.
+- Audit (KYA-OS AAP-1): McpAuditTrail records typed events through a
+  helix_sdk.audit.AuditTrail; create_mcp_audit_trail() /
+  create_helix_audit_reporter() build one over `POST /v1/audit-log/events`,
+  create_helix_audit_sink() is the one-call legacy `audit_sink` over them.
 - attach_helix_vp(): client-side, attaches a VP signed server-side (via
   HelixClient.sign_vp()) to an outgoing tool call.
 """
@@ -25,7 +28,18 @@ HelixID, mirroring helix-sdk-js's mcp-middleware package.
 from __future__ import annotations
 
 from .attach import attach_helix_vp
-from .audit import AuditSink, ToolAuditEvent, create_helix_audit_sink
+from .audit import (
+    OAUTH_SUBJECT_KEY_ID,
+    AuditContext,
+    AuditSink,
+    McpAuditTrail,
+    ToolAuditEvent,
+    ToolCallAudit,
+    create_helix_audit_reporter,
+    create_helix_audit_sink,
+    create_mcp_audit_trail,
+    current_tool_call,
+)
 from .credentials import ExtractedCredential, extract_credential
 from .errors import AuthorizationServerUnavailableError, MCPAuthError, ToolScopeError
 from .metadata import (
@@ -73,6 +87,13 @@ __all__ = [
     "protected_resource_metadata_url",
     "HttpErrorResponse",
     "create_helix_audit_sink",
+    "create_helix_audit_reporter",
+    "create_mcp_audit_trail",
+    "current_tool_call",
     "AuditSink",
+    "AuditContext",
+    "McpAuditTrail",
     "ToolAuditEvent",
+    "ToolCallAudit",
+    "OAUTH_SUBJECT_KEY_ID",
 ]

@@ -12,11 +12,18 @@ at the RFC 9728 metadata (which is how OAuth clients discover the
 authorization server), and a scope failure gets a 403. Only `tools/call` is
 gated: `initialize` and `tools/list` stay open, so HelixID clients that send
 their VP in `params._meta` (not a header) keep working, and a VP is verified
-once per tool call, not once per request."""
+once per tool call, not once per request.
+
+With an `audit` trail (McpAuditTrail), every gated tools/call is bracketed
+by typed KYA-OS audit events: `session.established` before the gate, the
+gate's own decision events, then `tool.call.started` and
+`tool.call.completed` / `tool.call.failed`, or `tool.call.denied` when the
+gate refused, all under one correlationId."""
 
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any, Callable, Optional, Sequence
 from urllib.parse import urlsplit
@@ -28,6 +35,7 @@ from starlette.responses import JSONResponse
 
 from helix_mcp_middleware import (
     AuthorizationServerUnavailableError,
+    McpAuditTrail,
     MCPMiddlewareOptions,
     async_helixid_mcp_middleware,
     build_protected_resource_metadata,
@@ -46,10 +54,12 @@ def create_order_app(
     authorization_servers: Optional[Sequence[str]] = None,
     store: Optional[OrderStore] = None,
     on_server_error: Optional[Callable[[BaseException], None]] = None,
+    audit: Optional[McpAuditTrail] = None,
 ) -> Any:
     """An ASGI app. `resource` is this server's MCP endpoint URL (MCP is
     served at its path); `auth` is everything except the scopes, which this
-    sample fixes in TOOL_SCOPES."""
+    sample fixes in TOOL_SCOPES; `audit` records each tool call as typed
+    events (pair it with `auth.audit_sink = audit.tool_audit_sink()`)."""
     url = urlsplit(resource)
     if url.scheme not in ("http", "https") or not url.hostname:
         raise ValueError(f"resource must be an http(s) URL, got {resource!r}")
@@ -129,21 +139,25 @@ def create_order_app(
             await respond(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Batch requests are not supported"}})
             return
 
-        headers = Headers(scope=scope)
-        for message in [body]:
-            if not isinstance(message, dict) or message.get("method") != "tools/call":
-                continue
-            params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        if not (isinstance(body, dict) and body.get("method") == "tools/call"):
+            await handle(scope, raw, receive, send, None)
+            return
+        params = body.get("params") if isinstance(body.get("params"), dict) else {}
+        name = params.get("name")
+        audit_scope = audit.begin_tool_call(name if isinstance(name, str) else None) if audit is not None else nullcontext()
+        with audit_scope as call_audit:
             try:
                 await gate({
-                    "name": params.get("name"),
+                    "name": name,
                     "input": params.get("arguments") if isinstance(params.get("arguments"), dict) else {},
                     "_meta": params.get("_meta") if isinstance(params.get("_meta"), dict) else None,
-                    "headers": headers,
+                    "headers": Headers(scope=scope),
                 })
             except Exception as error:  # noqa: BLE001
                 denial = to_http_error_response(error, metadata_url)
                 if denial is not None:
+                    if call_audit is not None:
+                        call_audit.denied(_reason_code(error))
                     await respond(denial.status, denial.body, {"www-authenticate": denial.headers["WWW-Authenticate"]})
                     return
                 if on_server_error is not None:
@@ -151,17 +165,26 @@ def create_order_app(
                 if isinstance(error, AuthorizationServerUnavailableError):
                     # The caller's token was not shown to be bad; its authorization
                     # server could not be asked. Say so, and invite a retry.
+                    if call_audit is not None:
+                        call_audit.failed("authorization_server_unavailable")
                     await respond(
                         503,
                         {"error": "temporarily_unavailable", "error_description": "The authorization server could not be reached"},
                         {"retry-after": "5"},
                     )
                 else:
+                    if call_audit is not None:
+                        call_audit.failed("server_error")
                     await respond(500, {"error": "server_error"})
                 return
+            await handle(scope, raw, receive, send, call_audit)
 
-        # Hand the request, body intact, to the MCP transport.
+    async def handle(scope: Any, raw: bytes, receive: Any, send: Any, call_audit: Any) -> None:
+        """Hands the request, body intact, to the MCP transport; with a tool
+        call's audit, `tool.call.started` first and `completed` on a 2xx
+        answer, else `failed`."""
         replayed = False
+        status: Optional[int] = None
 
         async def replay() -> Any:
             nonlocal replayed
@@ -170,6 +193,30 @@ def create_order_app(
                 return {"type": "http.request", "body": raw, "more_body": False}
             return await receive()
 
-        await mcp_app(scope, replay, send)
+        async def observe(message: Any) -> None:
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            await send(message)
+
+        if call_audit is None:
+            await mcp_app(scope, replay, send)
+            return
+        call_audit.started()
+        try:
+            await mcp_app(scope, replay, observe)
+        except Exception:
+            call_audit.failed("handler_error")
+            raise
+        if status is not None and 200 <= status < 300:
+            call_audit.completed()
+        else:
+            call_audit.failed("handler_error")
 
     return app
+
+
+def _reason_code(error: BaseException) -> str:
+    """The gate's verdict as a reason code (never its message): the error's wire code, lower-cased."""
+    code = getattr(error, "code", None)
+    return code.lower() if isinstance(code, str) and code else "request_denied"

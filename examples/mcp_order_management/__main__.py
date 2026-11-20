@@ -10,7 +10,11 @@ Configuration (environment), the same as the JS sample:
   MCP_RESOURCE          public URL of the MCP endpoint (default http://localhost:$PORT/mcp); the OAuth audience
   HELIX_API_URL         HelixID API to verify VPs and write audit events. Required whenever
   HELIX_API_KEY         HELIX_API_KEY is set: there is deliberately no default URL.
-  SERVICE_DID           this server's DID: VPs for other services are rejected
+  SERVICE_DID           this server's DID: VPs for other services are rejected; the producer of
+                        its audit events (required with HELIX_API_KEY)
+  AUDIT_INCLUDE_TOOL_NAMES=1
+                        record tool names (`action.name`) in audit events; off by default, a tool
+                        name being a caller-presented reference
   OAUTH_ISSUER          OAuth door, one authorization server. The issuer alone is enough: its keys are
                         read from its metadata (aud must be MCP_RESOURCE). Optional:
   OAUTH_JWKS_URI          its jwks_uri, to skip discovery
@@ -42,7 +46,8 @@ from helix_mcp_middleware import (
     OAuthIntrospectionOptions,
     OAuthIssuerOptions,
     auth0,
-    create_helix_audit_sink,
+    create_helix_audit_reporter,
+    create_mcp_audit_trail,
     entra,
     keycloak,
     okta,
@@ -205,10 +210,19 @@ def main() -> None:
         service_did=service_did or None,
         on_audit_error=lambda error: print("audit write failed:", error, file=sys.stderr),
     )
+    audit = None
     if api_url:
         auth.client = HelixClient(api_url, api_key=api_key) if api_key else HelixClient(api_url)
         if api_key:
-            auth.audit_sink = create_helix_audit_sink(api_url, api_key, service_did=service_did or None)
+            if not service_did:
+                fail("HELIX_API_KEY writes audit events, whose producer is this server: set SERVICE_DID")
+            audit = create_mcp_audit_trail(
+                create_helix_audit_reporter(api_url, api_key),
+                service_did,
+                include_tool_names=env.get("AUDIT_INCLUDE_TOOL_NAMES") == "1",
+                on_error=auth.on_audit_error,
+            )
+            auth.audit_sink = audit.tool_audit_sink()
     if demo:
         def demo_token(token: str) -> AuthResult:
             if token not in DEMO_TOKENS:
@@ -227,6 +241,7 @@ def main() -> None:
             auth,
             authorization_servers=[i.issuer for i in issuers] or None,
             on_server_error=lambda error: print("server error:", repr(error), file=sys.stderr),
+            audit=audit,
         )
     except ValueError as error:
         fail(str(error))
@@ -234,7 +249,7 @@ def main() -> None:
     print(f"order-management MCP server on {resource}")
     print(f"  HelixID VPs: {'verified via ' + api_url if auth.client else 'off (set HELIX_API_URL)'}")
     print(f"  OAuth:       {'DEMO tokens demo-reader, demo-admin' if demo else ', '.join(i.issuer for i in issuers) or 'off'}")
-    print(f"  Audit:       {api_url + '/v1/audit-log/events' if auth.audit_sink else 'off (set HELIX_API_URL + HELIX_API_KEY)'}")
+    print(f"  Audit:       {api_url + '/v1/audit-log/events' if audit else 'off (set HELIX_API_URL + HELIX_API_KEY + SERVICE_DID)'}")
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
