@@ -24,6 +24,8 @@ from __future__ import annotations
 
 # Agent
 from .wallet import AgentWallet, WalletCredential
+# KYA-OS story F-1: the credential split (identity, capability attestations, delegation hops).
+from .credential_store import CredentialStore
 from .vp_builder import VPBuilder, VPBuilderSignOverrides
 
 # Verifier
@@ -124,6 +126,7 @@ __all__ = [
     "read_helix_vp_meta",
     "AgentWallet",
     "WalletCredential",
+    "CredentialStore",
     "VPBuilder",
     "VPBuilderSignOverrides",
     "verify_vp",
