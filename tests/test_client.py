@@ -356,3 +356,30 @@ class TestEnterpriseMode:
         http.respond(500)
         with pytest.raises(InternalError):
             method(HelixClient(BASE_URL, api_key="hak_test"))
+
+
+class TestAuditLog:
+    def test_get_audit_log_passes_filters(self, http) -> None:
+        rows = [{"id": "1", "recordedAt": "t", "eventDigest": "sha256:" + "0" * 64, "event": {"eventType": "consent.approved"}}]
+        http.respond(200, rows)
+        client = HelixClient(BASE_URL, api_key="hak")
+        assert client.get_audit_log(event_type="consent.approved", since="2026-01-01", limit=5, family="consent") == rows
+        assert http.calls[0].url == BASE_URL + "/v1/audit-log?eventType=consent.approved&family=consent&since=2026-01-01&limit=5"
+        http.respond(200, [])
+        assert client.get_audit_log() == [] and http.calls[1].url == BASE_URL + "/v1/audit-log"
+
+    def test_record_audit_event_posts_the_event_best_effort(self, http) -> None:
+        event = {"eventType": "consent.approved", "schema": "x"}
+        http.respond(201, {"recorded": True})
+        HelixClient(BASE_URL, api_key="hak").record_audit_event(event)
+        assert (http.calls[0].method, http.calls[0].url, http.calls[0].json) == ("POST", BASE_URL + "/v1/audit-log/events", event)
+        assert http.calls[0].headers["authorization"] == "Bearer hak"
+        # A refusal never surfaces.
+        http.respond(400, {"error": {"code": "AUDIT_EVENT_INVALID", "message": "bad"}})
+        HelixClient(BASE_URL, admin_api_key="admin").record_audit_event(event)
+        assert len(http.calls) == 2
+        # Without a key (or without an API) it is a no-op.
+        HelixClient(BASE_URL).record_audit_event(event)
+        HelixClient().record_audit_event(event)
+        assert len(http.calls) == 2
+

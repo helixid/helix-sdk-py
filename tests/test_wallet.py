@@ -194,3 +194,50 @@ class TestWalletCredentialQueries:
         assert latest_grant.vc_id == grant_vc["id"]
 
         assert wallet.get_latest_credential("NoSuchType") is None
+
+
+class TestConsentGrantAudit:
+    def test_storing_a_grant_records_a_typed_consent_approved_event(self, wallet_dir: str) -> None:
+        recorded: List[Dict[str, Any]] = []
+
+        class FakeClient:
+            def record_audit_event(self, event: Dict[str, Any]) -> None:
+                recorded.append(event)
+
+        key_pair = generate_key_pair()
+        agent_did = f"did:key:{public_key_to_multibase(key_pair.public_key)}"
+        wallet = AgentWallet(private_key_hex=key_pair.private_key, did_value=agent_did, client=FakeClient())  # type: ignore[arg-type]
+        grant = _build_grant_vc(agent_did, "did:web:sp.example.com", "did:key:zUser", ["read:orders"])
+        wallet.add_credential(grant)
+        wallet.add_credential(_build_agent_vc(agent_did, ["read:orders"]))  # not a grant: nothing recorded
+        assert len(recorded) == 1
+        event = recorded[0]
+        from helix_sdk.audit import AUDIT_BINDING_MCP, validate_audit_event
+
+        assert validate_audit_event(event) == (True, event)
+        assert event["eventType"] == "consent.approved" and event["binding"] == AUDIT_BINDING_MCP
+        assert event["actor"] == {"kind": "pairwise_did", "did": agent_did}
+        assert event["responsibleParty"] == {"kind": "public_did", "did": "did:key:zUser"}
+        assert event["resource"] == {"kind": "public_did", "did": "did:web:sp.example.com"}
+        assert event["action"] == {"category": "consent"} and event["outcome"] == "succeeded"
+        assert event["details"] == {"family": "consent", "phase": "approved", "consentRef": grant["id"]}
+        assert event["source"] == {"producer": {"kind": "pairwise_did", "did": agent_did}, "sourceId": f"helix-sdk-py:{agent_did}", "sourceSequence": "1"}
+        assert event["tenantRef"] == {"kind": "pairwise_did", "did": agent_did}
+
+    def test_audit_failures_and_odd_shapes_never_surface(self, wallet_dir: str) -> None:
+        class BrokenClient:
+            def record_audit_event(self, event: Dict[str, Any]) -> None:
+                raise RuntimeError("API down")
+
+        key_pair = generate_key_pair()
+        agent_did = f"did:key:{public_key_to_multibase(key_pair.public_key)}"
+        wallet = AgentWallet(private_key_hex=key_pair.private_key, did_value=agent_did, client=BrokenClient())  # type: ignore[arg-type]
+        grant = _build_grant_vc(agent_did, "did:web:sp.example.com", "did:key:zUser", ["read:orders"])
+        wallet.add_credential(grant)
+        # An issuer object and no userDid are fine too; the credential is stored either way.
+        odd = _build_grant_vc(agent_did, "did:web:sp.example.com", "did:key:zUser", ["read:orders"])
+        odd["issuer"] = {"id": "did:web:sp.example.com"}
+        del odd["credentialSubject"]["userDid"]
+        wallet.add_credential(odd)
+        assert [c.vc_id for c in wallet.wallet_credentials] == [grant["id"], odd["id"]]
+

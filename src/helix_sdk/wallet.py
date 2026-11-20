@@ -252,23 +252,40 @@ class AgentWallet:
         self._record_consent_grant(vc)
 
     def _record_consent_grant(self, vc: Dict[str, Any]) -> None:
-        """Emits CONSENT_GRANTED when the credential just stored is an
-        SP-issued delegation grant. Swallows everything: a wallet with no
-        client, a down API, or an unexpected shape must all leave the
-        stored credential untouched."""
+        """Records a typed ``consent.approved`` event (helix_sdk.audit) when
+        the credential just stored is an SP-issued delegation grant. Swallows
+        everything: a wallet with no client, a down API, or an unexpected
+        shape must all leave the stored credential untouched."""
         if self.client is None or not _is_delegation_grant_vc(vc):
             return
         try:
+            from .audit import AUDIT_BINDING_MCP, AuditTrail, CallbackAuditSink, pairwise_did, public_did
+
             subject = vc["credentialSubject"]
-            self.client.record_consent_granted_audit(
-                vcId=vc["id"],
-                agentDid=subject["id"],
-                issuer=vc.get("issuer"),
-                userDid=subject.get("userDid"),
-                scopes=subject.get("scopes"),
-                durability=subject.get("durability"),
-                grantedAt=_now_iso(),
-                source="sdk",
+            agent_did = subject["id"]
+            producer = pairwise_did(agent_did)
+            client = self.client
+            trail = AuditTrail(
+                sink=CallbackAuditSink(lambda entry: client.record_audit_event(entry.event)),
+                source_id=f"helix-sdk-py:{agent_did}",
+                producer=producer,
+                tenant_ref=producer,
+                binding=AUDIT_BINDING_MCP,
+            )
+            issuer = vc.get("issuer")
+            if isinstance(issuer, dict):
+                issuer = issuer.get("id")
+            user_did = subject.get("userDid")
+            trail.record(
+                {
+                    "eventType": "consent.approved",
+                    "actor": pairwise_did(agent_did),
+                    "responsibleParty": public_did(user_did) if isinstance(user_did, str) else None,
+                    "resource": public_did(issuer) if isinstance(issuer, str) else None,
+                    "action": {"category": "consent"},
+                    "outcome": "succeeded",
+                    "details": {"family": "consent", "phase": "approved", "consentRef": vc["id"]},
+                }
             )
         except Exception:  # noqa: BLE001
             pass
