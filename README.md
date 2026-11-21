@@ -64,6 +64,19 @@ signature, same base58btc-encoded proof value, in every language. See
 If you regenerate the vectors in `helix-server` (`pnpm generate:golden-vectors`),
 re-copy the three JSON files here too, the same way `helix-sdk-js` does.
 
+## Local verifier (KYA-OS story F-2)
+
+`helix_sdk.verifier.verify(proof, seams, options, chain=..., request=..., card=...)` verifies a KYA-OS request proof
+(`org.kya-os/proof.v1`) and the delegation chain the request carries, in-process, from the presented artifacts and
+what its seams answer (`resolve_did`, `resolve_did_keys`, `fetch_status_list`, `resolve_card`, `nonce_store`, `clock`,
+`trusted_issuers`). It never reads a Helix database, and a missing seam fails closed with its reason code
+(`helix_sdk.verifier.ReasonCodes`). It is the port of helix-sdk-js's `kyaos.verifier.verify`: same seams, same codes,
+same results, which `tests/test_verifier.py` proves over the fixture set helix-core generates
+(`fixtures/verifier/*.json`, read from the sibling checkout or `HELIX_CORE_FIXTURES_DIR`).
+
+`python -m helix_sdk.conformance [vectors_dir]` runs the KYA-OS vector categories `signed-proof`, `delegation-chain`,
+`status-list`, `did-key`, `did-web`, `card-proof` and `entity-card` through `helix_sdk.conformance.HelixConformanceAdapter`.
+
 ## Packages in this repo
 
 - **`helix_sdk`** -- core SDK (see Quick example below).
