@@ -35,6 +35,8 @@ from starlette.responses import JSONResponse
 
 from helix_mcp_middleware import (
     AuthorizationServerUnavailableError,
+    audit_unavailable_response,
+    mark_audit_degraded,
     McpAuditTrail,
     MCPMiddlewareOptions,
     async_helixid_mcp_middleware,
@@ -42,6 +44,8 @@ from helix_mcp_middleware import (
     protected_resource_metadata_url,
     to_http_error_response,
 )
+
+from helix_mcp_middleware.audit_delivery import TERMINAL_FAILED
 
 from .orders import TOOL_SCOPES, OrderStore, create_order_store, register_order_tools
 
@@ -182,9 +186,12 @@ def create_order_app(
     async def handle(scope: Any, raw: bytes, receive: Any, send: Any, call_audit: Any) -> None:
         """Hands the request, body intact, to the MCP transport; with a tool
         call's audit, `tool.call.started` first and `completed` on a 2xx
-        answer, else `failed`."""
+        answer, else `failed`. Under required delivery (A-2) the tool does not
+        run when its intent cannot be recorded (`audit_delivery_failed`), and an
+        answer whose completion cannot be recorded is marked degraded
+        (`_meta["org.kya-os/audit"]`), so the answer is held until then."""
         replayed = False
-        status: Optional[int] = None
+        messages: list = []
 
         async def replay() -> Any:
             nonlocal replayed
@@ -193,27 +200,70 @@ def create_order_app(
                 return {"type": "http.request", "body": raw, "more_body": False}
             return await receive()
 
-        async def observe(message: Any) -> None:
-            nonlocal status
-            if message["type"] == "http.response.start":
-                status = message["status"]
-            await send(message)
+        async def capture(message: Any) -> None:
+            messages.append(message)
 
         if call_audit is None:
             await mcp_app(scope, replay, send)
             return
-        call_audit.started()
+        if not _recorded(call_audit.started):
+            await _send_json(send, 200, {"jsonrpc": "2.0", "id": _rpc_id(raw), "result": audit_unavailable_response()})
+            return
         try:
-            await mcp_app(scope, replay, observe)
+            await mcp_app(scope, replay, capture)
         except Exception:
-            call_audit.failed("handler_error")
+            _recorded(lambda: call_audit.failed("handler_error"))
             raise
+        status = next((m["status"] for m in messages if m["type"] == "http.response.start"), None)
         if status is not None and 200 <= status < 300:
-            call_audit.completed()
+            if not _recorded(call_audit.completed):
+                messages = _degraded(messages)
         else:
-            call_audit.failed("handler_error")
+            _recorded(lambda: call_audit.failed("handler_error"))
+        for message in messages:
+            await send(message)
 
     return app
+
+
+def _recorded(step: Callable[[], Any]) -> bool:
+    """One audit append: False when it raised or the trail swallowed a failure."""
+    try:
+        return step() is not None
+    except Exception:  # noqa: BLE001 - the caller answers for a failed append
+        return False
+
+
+def _rpc_id(raw: bytes) -> Any:
+    try:
+        message = json.loads(raw)
+    except ValueError:
+        return None
+    first = message[0] if isinstance(message, list) and message else message
+    return first.get("id") if isinstance(first, dict) else None
+
+
+async def _send_json(send: Any, status: int, body: Any) -> None:
+    payload = json.dumps(body).encode("utf-8")
+    await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(payload)).encode())]})
+    await send({"type": "http.response.body", "body": payload, "more_body": False})
+
+
+def _degraded(messages: list) -> list:
+    """The held answer with every tool result marked degraded: the completion was not recorded."""
+    start = next(m for m in messages if m["type"] == "http.response.start")
+    body = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+    try:
+        answer = json.loads(body)
+    except ValueError:
+        return messages
+    replies = answer if isinstance(answer, list) else [answer]
+    for reply in replies:
+        if isinstance(reply, dict) and isinstance(reply.get("result"), dict):
+            reply["result"] = mark_audit_degraded(reply["result"], TERMINAL_FAILED)
+    payload = json.dumps(answer).encode("utf-8")
+    headers = [(k, v) for k, v in start.get("headers", []) if k.lower() != b"content-length"] + [(b"content-length", str(len(payload)).encode())]
+    return [{**start, "headers": headers}, {"type": "http.response.body", "body": payload, "more_body": False}]
 
 
 def _reason_code(error: BaseException) -> str:

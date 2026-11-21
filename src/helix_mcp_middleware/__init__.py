@@ -40,6 +40,14 @@ from .audit import (
     create_mcp_audit_trail,
     current_tool_call,
 )
+from .audit_delivery import (
+    AUDIT_META_KEY,
+    async_run_audited_tool,
+    audit_unavailable_response,
+    create_helix_audit_delivery,
+    mark_audit_degraded,
+    run_audited_tool,
+)
 from .credentials import ExtractedCredential, extract_credential
 from .errors import AuthorizationServerUnavailableError, MCPAuthError, ToolScopeError
 from .metadata import (
@@ -61,6 +69,12 @@ from .providers import auth0, entra, keycloak, okta
 from .types import AttachHelixVPOptions, MCPMiddlewareOptions, MCPToolCall
 
 __all__ = [
+    "AUDIT_META_KEY",
+    "async_run_audited_tool",
+    "audit_unavailable_response",
+    "create_helix_audit_delivery",
+    "mark_audit_degraded",
+    "run_audited_tool",
     "helixid_mcp_middleware",
     "async_helixid_mcp_middleware",
     "attach_helix_vp",

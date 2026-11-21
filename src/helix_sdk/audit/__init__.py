@@ -25,6 +25,7 @@ and the vendored ``audit-integrity`` vectors (tests/test_audit.py).
 from __future__ import annotations
 
 from ..errors import AuditEventInvalidError, AuditEvidenceError
+from .delivery import AUDIT_DELIVERY_MODES, AuditDeliveryConfigError, AuditDeliverySink, AuditFlushResult, create_audit_delivery
 from .digest import (
     audit_digest,
     audit_event_digest,
@@ -33,6 +34,24 @@ from .digest import (
     keyed_commitment_value,
     utf16_length,
     wtf8_bytes,
+)
+from .outbox import (
+    AuditOutboxConflictError,
+    AuditOutboxContractReport,
+    AuditOutboxItem,
+    DurableOutbox,
+    MemoryAuditOutbox,
+    assert_audit_outbox_contract,
+    audit_outbox_item_key,
+    evaluate_audit_outbox_provider_contract,
+    same_audit_submission,
+)
+from .recorder import (
+    AuditDeliveryError,
+    AuditRecorderSubmission,
+    HttpAuditRecorderClient,
+    assert_entry_binds_submission,
+    audit_submission_wire,
 )
 from .evidence import (
     EncryptedEvidence,
@@ -89,6 +108,25 @@ from .types import (
 )
 
 __all__ = [
+    "AUDIT_DELIVERY_MODES",
+    "AuditDeliveryConfigError",
+    "AuditDeliveryError",
+    "AuditDeliverySink",
+    "AuditFlushResult",
+    "AuditOutboxConflictError",
+    "AuditOutboxContractReport",
+    "AuditOutboxItem",
+    "AuditRecorderSubmission",
+    "DurableOutbox",
+    "HttpAuditRecorderClient",
+    "MemoryAuditOutbox",
+    "assert_audit_outbox_contract",
+    "assert_entry_binds_submission",
+    "audit_outbox_item_key",
+    "audit_submission_wire",
+    "create_audit_delivery",
+    "evaluate_audit_outbox_provider_contract",
+    "same_audit_submission",
     "AUDIT_BINDING_HELIX",
     "AUDIT_BINDING_MCP",
     "AUDIT_DIGEST_DOMAINS",
