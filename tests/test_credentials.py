@@ -172,10 +172,16 @@ class TestJsonSchema:
         assert v(ref, {"id": "x"}) == ["$.id: does not match pattern ^did:"]
 
     def test_refuses_unsupported_keywords_and_bad_refs(self) -> None:
-        with pytest.raises(JsonSchemaError, match="maximum"):
-            assert_supported_schema({"maximum": 1})
+        with pytest.raises(JsonSchemaError, match="uniqueItems"):
+            assert_supported_schema({"uniqueItems": True})
         with pytest.raises(JsonSchemaError, match="#/properties/a"):
-            assert_supported_schema({"properties": {"a": {"maximum": 1}}})
+            assert_supported_schema({"properties": {"a": {"uniqueItems": True}}})
+        # maxLength, minimum and maximum are evaluated (story F-2: the Entity Card schema uses them).
+        assert validate_json_schema({"type": "string", "maxLength": 2}, "abc")
+        assert validate_json_schema({"type": "number", "minimum": 1, "maximum": 3}, 0)
+        assert validate_json_schema({"type": "number", "minimum": 1, "maximum": 3}, 4)
+        assert validate_json_schema({"type": "integer", "minimum": 1, "maximum": 3}, 2) == []
+        assert validate_json_schema({"type": "number", "maximum": 3}, True) != []
         with pytest.raises(JsonSchemaError, match="#/allOf/1"):
             assert_supported_schema({"allOf": [{}, {"if": {}}]})
         with pytest.raises(JsonSchemaError, match="#/items"):
