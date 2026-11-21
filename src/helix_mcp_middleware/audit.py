@@ -78,17 +78,19 @@ class ToolCallAudit:
             context["actor"] = self.actor
         return context
 
-    def started(self) -> None:
-        self._audit.tool("started", "unknown", tool_name=self.tool_name, attempt=self.attempt, context=self.context())
+    # Each returns the recorded entry (with the recorder's receipt under required
+    # delivery, A-2), or None when the trail's on_error swallowed a failure.
+    def started(self) -> Optional[AuditTrailEntry]:
+        return self._audit.tool("started", "unknown", tool_name=self.tool_name, attempt=self.attempt, context=self.context())
 
-    def completed(self) -> None:
-        self._audit.tool("completed", "succeeded", tool_name=self.tool_name, attempt=self.attempt, context=self.context())
+    def completed(self) -> Optional[AuditTrailEntry]:
+        return self._audit.tool("completed", "succeeded", tool_name=self.tool_name, attempt=self.attempt, context=self.context())
 
-    def failed(self, reason_code: str) -> None:
-        self._audit.tool("failed", "failed", tool_name=self.tool_name, attempt=self.attempt, reason_code=reason_code, context=self.context())
+    def failed(self, reason_code: str) -> Optional[AuditTrailEntry]:
+        return self._audit.tool("failed", "failed", tool_name=self.tool_name, attempt=self.attempt, reason_code=reason_code, context=self.context())
 
-    def denied(self, reason_code: str) -> None:
-        self._audit.tool("denied", "denied", tool_name=self.tool_name, attempt=self.attempt, reason_code=reason_code, context=self.context())
+    def denied(self, reason_code: str) -> Optional[AuditTrailEntry]:
+        return self._audit.tool("denied", "denied", tool_name=self.tool_name, attempt=self.attempt, reason_code=reason_code, context=self.context())
 
 
 _CURRENT_CALL: "ContextVar[Optional[ToolCallAudit]]" = ContextVar("helix_mcp_audit_current_call", default=None)

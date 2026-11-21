@@ -15,6 +15,11 @@ Configuration (environment), the same as the JS sample:
   AUDIT_INCLUDE_TOOL_NAMES=1
                         record tool names (`action.name`) in audit events; off by default, a tool
                         name being a caller-presented reference
+  AUDIT_DELIVERY        required (default): each event's recorder receipt before the call goes on;
+                        buffered: a durable outbox (AUDIT_OUTBOX_DIR) delivered in the background;
+                        best-effort: only with AUDIT_ACCEPT_AAP1=1
+  AUDIT_OUTBOX_DIR      buffered delivery's durable outbox directory (AUDIT_OUTBOX=memory asks for the
+                        ephemeral one, which buffered delivery refuses at startup)
   OAUTH_ISSUER          OAuth door, one authorization server. The issuer alone is enough: its keys are
                         read from its metadata (aud must be MCP_RESOURCE). Optional:
   OAUTH_JWKS_URI          its jwks_uri, to skip discovery
@@ -46,7 +51,7 @@ from helix_mcp_middleware import (
     OAuthIntrospectionOptions,
     OAuthIssuerOptions,
     auth0,
-    create_helix_audit_reporter,
+    create_helix_audit_delivery,
     create_mcp_audit_trail,
     entra,
     keycloak,
@@ -216,8 +221,21 @@ def main() -> None:
         if api_key:
             if not service_did:
                 fail("HELIX_API_KEY writes audit events, whose producer is this server: set SERVICE_DID")
+            delivery = env.get("AUDIT_DELIVERY") or "required"
+            try:
+                reporter = create_helix_audit_delivery(
+                    api_url,
+                    api_key,
+                    delivery=delivery,
+                    outbox_dir=env.get("AUDIT_OUTBOX_DIR") or None,
+                    outbox="memory" if env.get("AUDIT_OUTBOX") == "memory" else None,
+                    accept_aap1=env.get("AUDIT_ACCEPT_AAP1") == "1",
+                    on_delivery_failure=lambda error, _event: print("audit delivery failed:", error, file=sys.stderr),
+                )
+            except ValueError as error:
+                fail(f"audit delivery refused: {error}")
             audit = create_mcp_audit_trail(
-                create_helix_audit_reporter(api_url, api_key),
+                reporter,
                 service_did,
                 include_tool_names=env.get("AUDIT_INCLUDE_TOOL_NAMES") == "1",
                 on_error=auth.on_audit_error,
