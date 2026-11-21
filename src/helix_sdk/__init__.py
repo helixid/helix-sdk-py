@@ -64,6 +64,20 @@ from .agent_key import (
 )
 from .did_resolver import ResolvedKey, did_key_document, resolve_did, resolve_did_key, resolve_did_web
 
+# KYA-OS story F-3: custody preference. helix_init (self-custody onboarding),
+# HelixCustodialSigner (custodial agents sign through the API), the custody
+# API client; the agent runtime takes any Signer (VPBuilder.sign_with).
+from .custody import (
+    CustodyApiError,
+    HelixCustodialSigner,
+    HelixCustodyClient,
+    HelixInitResult,
+    activate_agent,
+    change_to_self_custody,
+    check_own_hosting,
+    helix_init,
+)
+
 # Errors
 from .errors import (  # noqa: F401
     HelixError,
@@ -162,4 +176,12 @@ __all__ = [
     "HelixError",
     "map_api_error",
     "codes",
+    "CustodyApiError",
+    "HelixCustodialSigner",
+    "HelixCustodyClient",
+    "HelixInitResult",
+    "activate_agent",
+    "change_to_self_custody",
+    "check_own_hosting",
+    "helix_init",
 ]

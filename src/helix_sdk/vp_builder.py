@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from . import proof
+from . import proof, vp_crypto
 from .errors import VPInvalidStructureError
 
 
@@ -78,6 +78,37 @@ class VPBuilder:
         overrides: Optional[VPBuilderSignOverrides] = None,
     ) -> Dict[str, Any]:
         overrides = overrides or VPBuilderSignOverrides()
+        payload = self._payload(overrides)
+        signed = dict(payload)
+        signed["proof"] = proof.create_ed25519_proof(
+            payload, private_key_hex, verification_method_id, overrides.proof_created_at
+        )
+        return signed
+
+    def sign_with(self, signer: Any, overrides: Optional[VPBuilderSignOverrides] = None) -> Dict[str, Any]:
+        """KYA-OS story F-3: the same proof made through any Signer (an
+        ``EnvSigner`` for a self-custody agent, a ``HelixCustodialSigner`` for a
+        custodial one), so the code presenting a VP is identical in both
+        custody modes. The signer must be the holder's."""
+        if signer.did != self.holder_did:
+            raise VPInvalidStructureError(f"signer {signer.did} is not the VP holder {self.holder_did}")
+        payload = self._payload(overrides or VPBuilderSignOverrides())
+        signature = signer.sign(vp_crypto.hash_canonical_payload(payload))
+        if not isinstance(signature, (bytes, bytearray)) or len(signature) != 64:
+            raise VPInvalidStructureError("signer did not return a 64-byte Ed25519 signature")
+        overrides = overrides or VPBuilderSignOverrides()
+        created = overrides.proof_created_at if overrides.proof_created_at is not None else datetime.now(timezone.utc)
+        signed = dict(payload)
+        signed["proof"] = {
+            "type": "Ed25519Signature2020",
+            "created": proof._to_iso_z(created),
+            "verificationMethod": f"{signer.did}#{str(signer.kid).lstrip('#')}",
+            "proofPurpose": "assertionMethod",
+            "proofValue": vp_crypto.base58btc_encode(bytes(signature)),
+        }
+        return signed
+
+    def _payload(self, overrides: VPBuilderSignOverrides) -> Dict[str, Any]:
         expires_at = overrides.expires_at or (datetime.now(timezone.utc) + timedelta(minutes=5))
         payload: Dict[str, Any] = {
             "@context": ["https://www.w3.org/ns/credentials/v2"],
@@ -88,14 +119,9 @@ class VPBuilder:
             "nonce": overrides.nonce or os.urandom(32).hex(),
             "expirationDate": proof._to_iso_z(expires_at),
         }
-        # "No user" is one semantic state with one wire shape: the key is
-        # absent, never serialized as null.
         if self.user_did is not None:
+            # "No user" is one semantic state with one wire shape: the key is
+            # absent, never serialized as null.
             payload["delegatedBy"] = self.user_did
         payload["targetService"] = self.target_service
-
-        signed = dict(payload)
-        signed["proof"] = proof.create_ed25519_proof(
-            payload, private_key_hex, verification_method_id, overrides.proof_created_at
-        )
-        return signed
+        return payload
