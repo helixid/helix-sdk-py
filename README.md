@@ -146,9 +146,21 @@ Python equivalent.
 
 ## CLI
 
-There is no Python CLI. Platform-operator workflows (DID/wallet/status-list/
-VC lifecycle) are covered by `helix-sdk-js`'s `cli` package -- the
-CLI has a single canonical implementation rather than one per SDK language.
+Platform-operator workflows (DID/wallet/status-list/VC lifecycle) are covered
+by `helix-sdk-js`'s `cli` package -- the CLI has a single canonical
+implementation rather than one per SDK language.
+
+The one exception is custody (KYA-OS story F-3): `helix-custody init`,
+`helix-custody activate` and `helix-custody take` (or
+`python -m helix_sdk.custody`) do what `helix init`, `helix activate` and
+`helix custody take` do, for Python-only hosts. The same steps are functions:
+`helix_init`, `activate_agent`, `change_to_self_custody`.
+
+A self-custody agent's key is generated on its host and never sent. A
+custodial agent signs through `HelixCustodialSigner`, which calls the Helix
+API. Both are Signers, so `VPBuilder.sign_with(signer)` and `sign_jws` work
+the same with either. Custodial agents are labelled `custody: helix` and are
+not counted in KYA-OS conformance claims; their proofs still verify.
 
 ## Testing
 
