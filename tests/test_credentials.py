@@ -29,7 +29,18 @@ from typing import Any, Dict, List
 
 import pytest
 
-from helix_sdk import CredentialStore
+import helix_sdk
+from helix_sdk import (
+    CAPABILITY_ATTESTATION_TYPE,
+    DELEGATION_CREDENTIAL_TYPE,
+    IDENTITY_CREDENTIAL_TYPE,
+    CapabilityAttestation,
+    CredentialStore,
+    PresentedChain,
+    SignAttestationsOptions,
+    StoredCredential,
+    sign_attestation_document,
+)
 from helix_sdk.credentials import (
     CAPABILITY_ATTESTATION_SCHEMA,
     DELEGATION_HOP_SCHEMA,
@@ -613,6 +624,9 @@ class TestHelixCoreFixture:
         assert signed == owner_signed["credential"]
         rebuilt = build_capability_attestation(signer, inp["subjectDid"], inp["capability"], inp["validUntil"], owner_signed["credential"]["credentialStatus"], id=inp["id"], valid_from=inp["validFrom"], proof_created=inp["proofCreated"])
         assert rebuilt == owner_signed["credential"]
+        # The standalone signer (JS signAttestationDocument) yields the same bytes from the unsigned document.
+        unsigned = {k: v for k, v in owner_signed["credential"].items() if k != "proof"}
+        assert sign_attestation_document(unsigned, signer, inp["proofCreated"]) == owner_signed["credential"]
 
     def test_every_chain_comes_to_the_recorded_verdict(self, fixture: Dict[str, Any]) -> None:
         resolver = fixture["did_documents"].get
@@ -667,3 +681,98 @@ class TestHelixCoreFixture:
         for name, schema in (("identity-credential", IDENTITY_CREDENTIAL_SCHEMA), ("capability-attestation", CAPABILITY_ATTESTATION_SCHEMA), ("delegation-hop", DELEGATION_HOP_SCHEMA)):
             with open(schema_dir / f"{name}.schema.json", encoding="utf-8") as f:
                 assert json.load(f) == schema, name
+
+
+class TestPublicSurface:
+    """The names helix-sdk-js exports for F-1 exist on helix_sdk, in Python style."""
+
+    def test_every_js_export_has_a_python_counterpart(self) -> None:
+        for name in [
+            "CredentialStore",
+            "sign_attestation_document",
+            "CredentialSigner",
+            "BitstringStatusEntry",
+            "DataIntegrityProof",
+            "StoredCredential",
+            "CapabilityAttestation",
+            "DelegationHop",
+            "CredentialStoreData",
+            "PresentedChain",
+            "SignAttestationsOptions",
+            "IDENTITY_CREDENTIAL_TYPE",
+            "CAPABILITY_ATTESTATION_TYPE",
+            "DELEGATION_CREDENTIAL_TYPE",
+        ]:
+            assert name in helix_sdk.__all__, name
+            assert hasattr(helix_sdk, name), name
+        assert (IDENTITY_CREDENTIAL_TYPE, CAPABILITY_ATTESTATION_TYPE, DELEGATION_CREDENTIAL_TYPE) == (
+            "AgentIdentityCredential",
+            "CapabilityAttestationCredential",
+            "DelegationCredential",
+        )
+
+    def test_typed_shapes_mark_the_members_the_store_relies_on(self) -> None:
+        assert {"id", "type", "issuer", "credentialSubject"} <= StoredCredential.__required_keys__
+        assert {"@context", "validUntil", "proof"} <= StoredCredential.__optional_keys__
+        assert {"validFrom", "credentialStatus"} <= CapabilityAttestation.__required_keys__
+        assert PresentedChain.__required_keys__ == {"identity", "hops"}
+        assert SignAttestationsOptions.__required_keys__ == {"valid_until", "status_entries"}
+        assert SignAttestationsOptions.__optional_keys__ == {"subject_did", "valid_from", "ids", "created"}
+
+    def test_sign_attestations_accepts_a_built_options_mapping(self) -> None:
+        options: SignAttestationsOptions = {
+            "subject_did": AGENT.did,
+            "valid_until": "2026-12-31T00:00:00Z",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "status_entries": [entry(1)],
+            "ids": ["urn:uuid:opt"],
+            "created": "2026-01-01T00:00:00Z",
+        }
+        [signed] = CredentialStore().sign_attestations(["read:orders"], OWNER.signer, **options)
+        assert signed["id"] == "urn:uuid:opt" and signed["proof"]["created"] == "2026-01-01T00:00:00Z"
+
+
+class TestSignAttestationDocument:
+    def _document(self, issuer: str) -> Dict[str, Any]:
+        return {
+            "@context": ["https://www.w3.org/ns/credentials/v2", "https://helixid.io/contexts/v1"],
+            "id": "urn:uuid:doc",
+            "type": ["VerifiableCredential", CAPABILITY_ATTESTATION_TYPE],
+            "issuer": issuer,
+            "validFrom": "2026-01-01T00:00:00Z",
+            "validUntil": "2026-12-31T00:00:00Z",
+            "credentialSubject": {"id": AGENT.did, "capability": "read:orders"},
+            "credentialStatus": entry(7),
+        }
+
+    def test_signs_like_sign_data_integrity_and_verifies(self) -> None:
+        document = self._document(OWNER.did)
+        signed = sign_attestation_document(document, OWNER.signer, "2026-01-01T00:00:00Z")
+        assert signed == sign_data_integrity(document, OWNER.signer, "2026-01-01T00:00:00Z")
+        assert signed["proof"]["verificationMethod"] == f"{OWNER.did}#key-1"
+        assert "proof" not in document
+        assert verify_capability_attestation(signed, resolve, subject_did=AGENT.did, now_ms=parse_date_time("2026-06-01T00:00:00Z")).ok
+
+    def test_refuses_a_signer_that_is_not_the_issuer(self) -> None:
+        with pytest.raises(ValueError, match="not the issuer"):
+            sign_attestation_document(self._document(HELIX.did), OWNER.signer, "2026-01-01T00:00:00Z")
+
+    def test_refuses_a_signer_that_returns_a_short_signature(self) -> None:
+        class Short:
+            did = OWNER.did
+            kid = "key-1"
+
+            def sign(self, data: bytes) -> bytes:
+                return b"\x00" * 63
+
+        with pytest.raises(ValueError, match="64-byte"):
+            sign_attestation_document(self._document(OWNER.did), Short(), "2026-01-01T00:00:00Z")
+
+    def test_refuses_a_document_that_already_carries_a_proof(self) -> None:
+        signed = sign_attestation_document(self._document(OWNER.did), OWNER.signer, "2026-01-01T00:00:00Z")
+        with pytest.raises(ValueError, match="already carries a proof"):
+            sign_attestation_document(signed, OWNER.signer, "2026-01-01T00:00:00Z")
+
+    def test_add_refuses_a_credential_whose_type_is_not_a_list(self) -> None:
+        with pytest.raises(ValueError, match="not an identity"):
+            CredentialStore().add({"id": "urn:uuid:x", "type": "AgentIdentityCredential", "issuer": HELIX.did, "credentialSubject": {}})
