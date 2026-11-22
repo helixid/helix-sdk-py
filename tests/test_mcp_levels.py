@@ -16,6 +16,7 @@ the audit trail and the HTTP refusal.
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
@@ -242,22 +243,32 @@ class TestGate:
 
 
 class TestAuditSink:
-    def test_posts_the_c_c_fields(self) -> None:
+    def test_carries_the_c_c_fields_in_the_typed_events(self) -> None:
+        """A-1's strict events hold no C-C member: L3-minus and the cnf diagnostic enter the
+        verification code, and a level refusal is authorization.denied with its own reason."""
         posted: List[Dict[str, Any]] = []
 
         class Http:
-            def post(self, url: str, json: Dict[str, Any], headers: Dict[str, str], timeout: float) -> Any:
-                posted.append(json)
+            def post(self, url: str, data: bytes, headers: Dict[str, str], timeout: float) -> Any:
+                posted.append(json.loads(data))
                 return SimpleNamespace(status_code=201)
 
-        sink = create_helix_audit_sink("http://api.test", "hak", http=Http())
+        sink = create_helix_audit_sink("http://api.test", "hak", service_did="did:web:svc", http=Http())
         sink({
-            "event": "AUTHZ_DENIED", "result": "denied", "timestamp": "t", "agentDid": "did:key:z6Mk", "effectiveScopes": [],
-            "level": "L3", "proofAssurance": "L3-minus", "l3Minus": True, "cnfDiagnostics": ["cnf_present_but_token_unfused"],
+            "event": "AUTHZ_DENIED", "result": "denied", "timestamp": "t", "authMethod": "kyaos", "agentDid": "did:key:z6Mk", "effectiveScopes": [],
+            "level": "L3", "fresh": True, "proofAssurance": "L3-minus", "l3Minus": True, "cnfDiagnostics": ["cnf_present_but_token_unfused"],
             "requiredLevel": "L3", "reason": "level_insufficient: L3-minus < L3",
         })
-        sink({"event": "AUTHZ_GRANTED", "result": "allowed", "timestamp": "t", "agentDid": "did:key:z6Mk", "effectiveScopes": [], "cnfDiagnostics": []})
-        assert {k: posted[0][k] for k in ("proofAssurance", "l3Minus", "cnfDiagnostics", "requiredLevel")} == {
-            "proofAssurance": "L3-minus", "l3Minus": True, "cnfDiagnostics": ["cnf_present_but_token_unfused"], "requiredLevel": "L3",
-        }
-        assert not {"proofAssurance", "l3Minus", "cnfDiagnostics", "requiredLevel"} & set(posted[1])
+        sink({"event": "AUTHZ_GRANTED", "result": "allowed", "timestamp": "t", "authMethod": "kyaos", "agentDid": "did:key:z6Mk", "effectiveScopes": [], "level": "L3", "proofAssurance": "L3", "cnfDiagnostics": []})
+        sink({"event": "AUTHZ_GRANTED", "result": "allowed", "timestamp": "t", "authMethod": "kyaos", "agentDid": "did:key:z6Mk", "effectiveScopes": [], "level": "L3", "proofAssurance": "L3-minus", "fresh": False})
+        assert [b["eventType"] for b in posted] == [
+            "proof.verified", "authorization.denied", "proof.verified", "authorization.approved", "proof.verified", "authorization.approved",
+        ]
+        assert posted[0]["details"]["verificationCode"] == "KYAOS_PROOF_L3_MINUS_CNF_UNFUSED"
+        assert posted[1]["reason"] == {"code": "proof_level_insufficient"}
+        assert posted[1]["authorization"] == {"source": "delegation", "decision": "denied"}
+        assert posted[2]["details"]["verificationCode"] == "KYAOS_PROOF_L3"
+        assert posted[4]["details"]["verificationCode"] == "KYAOS_PROOF_L3_MINUS_CACHED"
+        for body in posted:
+            text = json.dumps(body)
+            assert not any(key in text for key in ("proofAssurance", "l3Minus", "cnfDiagnostics", "requiredLevel"))

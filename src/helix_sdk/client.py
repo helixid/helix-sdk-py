@@ -254,22 +254,35 @@ class HelixClient:
         event_type: Optional[str] = None,
         since: Optional[str] = None,
         limit: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
-        qs = _query_string({"eventType": event_type, "since": since, "limit": limit})
+        family: Optional[str] = None,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """``GET /v1/audit-log``: one page, ``{"items": [...], "nextCursor": str | None}``,
+        newest first. Pass ``nextCursor`` back as ``cursor`` for the next page
+        (``None`` on the last). On helix-core each item is a row ``{id,
+        recordedAt, eventDigest, event, ledgerId, ledgerEpochId, sequence,
+        entryDigest, receipt}``, ``event`` the typed KYA-OS producer event
+        (helix_sdk.audit); a hosted deployment's account view answers the same
+        page shape with the event at the account's tier."""
+        qs = _query_string({"eventType": event_type, "family": family, "since": since, "cursor": cursor, "limit": limit})
         return self._http_required().get(f"/v1/audit-log{qs}")
 
-    def record_consent_granted_audit(self, **entry: Any) -> None:
-        """Best-effort consent-grant audit. A failure here must never
-        surface to the caller -- see AgentWallet.add_credential()."""
+    def record_audit_event(self, event: Dict[str, Any]) -> None:
+        """Records one typed producer event (``POST /v1/audit-log/events``):
+        the body is the event exactly as an ``AuditTrail`` built it, validated
+        strictly by the API. A no-op without an API key (audit writes need
+        one). Errors propagate: a producer that must not fail on an audit
+        write (the wallet) catches them."""
         if not self._api_audit_enabled:
             return
-        try:
-            self._http_required().post(
-                "/v1/audit-log/consent-granted",
-                {**entry, "subjectDid": entry.get("agentDid"), "eventType": "CONSENT_GRANTED"},
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        self._http_required().post("/v1/audit-log/events", event)
+
+    def audit_sink(self) -> Any:
+        """An ``AuditSink`` (helix_sdk.audit) for an ``AuditTrail`` whose
+        events this client should report to the API."""
+        from .audit import CallbackAuditSink
+
+        return CallbackAuditSink(lambda entry: self.record_audit_event(entry.event))
 
     # -- Sessions ------------------------------------------------------------
 

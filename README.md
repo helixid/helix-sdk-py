@@ -104,7 +104,24 @@ the detached JWS, the `cnf` fusion (`L3` with a token `cnf`, `L3-minus` without)
   and `l3_minus_satisfies_l3` set the Card level each tool demands (story
   C-C; a call below it raises `LevelError`, 401 `insufficient_user_authentication`
   with `derivedLevel` / `requiredLevel`); every decision goes to `audit_sink`
-  (`create_helix_audit_sink()` writes to the HelixID audit log).
+  (`create_helix_audit_sink()` writes to the HelixID audit log). Since KYA-OS
+  story A-1 the log holds typed producer events (AAP-1 Recorded): each
+  decision of a KYA-OS caller becomes `proof.verified` (verification code
+  `KYAOS_PROOF_<level>`, `_CACHED` when a status was not read live; story C-C
+  writes an L3 on an unfused proof as `L3_MINUS` and adds `_CNF_UNFUSED` for
+  the `cnf` diagnostic) then `authorization.approved` / `authorization.denied`
+  (reason `proof_level_insufficient` for a level refusal), a refused request
+  proof `proof.rejected` by its first reason code, strictly validated,
+  sequenced per source with `previousSourceEventDigest`, digested and posted
+  to `POST /v1/audit-log/events`. For a tool call's whole lifecycle build an
+  `McpAuditTrail` with `create_mcp_audit_trail(create_helix_audit_reporter(url,
+  key), service_did)`, pass `audit.tool_audit_sink()` as `audit_sink`, and
+  wrap each call in `with audit.begin_tool_call(tool_name)`,
+  as `examples/mcp_order_management` does. No event holds tool arguments, a
+  response, a token or a credential; an OAuth subject is a keyed commitment; tool
+  names only with `include_tool_names=True`. The typed events themselves
+  (`AuditTrail`, the strict validator, digests, SPEC 7.8 references, the
+  evidence vault) are `helix_sdk.audit`.
   `oauth=` takes one trusted issuer or a list: `OAuthIssuerOptions(issuer,
   audience)` is enough (keys come from the issuer's metadata), or use the
   presets `entra()`, `auth0()`, `okta()`, `keycloak()`; opaque tokens are
@@ -125,6 +142,37 @@ the detached JWS, the `cnf` fusion (`L3` with a token `cnf`, `L3-minus` without)
   this is Python-only. Install with `pip install helixid-sdk-py[crewai]`.
 
 Install everything at once with `pip install helixid-sdk-py[all]`.
+
+### Audit delivery to the recorder (KYA-OS A-2, AAP-2 Chained)
+
+Audit events go to the HelixID recorder (`POST /v1/audit/submissions`), which
+assigns sequence, epoch, predecessor and time and signs a receipt. The server
+never chooses any of those. The same surface as `@helixid/mcp-middleware`:
+
+```python
+audit = create_mcp_audit_trail(
+    create_helix_audit_delivery(base_url, api_key, delivery="required"),
+    service_did,
+)
+audit_tool_handlers(server)  # a FastMCP server, before its tools are registered
+with audit.begin_tool_call(tool_name, credential=vp):
+    ...  # each tool runs audited under this call
+```
+
+| `delivery` | What it means |
+|---|---|
+| `required` (default) | The intent's signed receipt is obtained before the handler runs; if it cannot be, the call answers `audit_delivery_failed` and the handler does not run. If the terminal append fails after the handler ran, the result is marked `_meta["org.kya-os/audit"] = {"status": "degraded", "reason": ...}` with `isError`. |
+| `buffered` | Events go to a durable outbox (`outbox_dir`) keyed by `(sourceId, eventId)` and are delivered in the background, in order per source; the outbox survives a restart. An ephemeral outbox is refused at startup. |
+| `best-effort` | Refused unless `accept_aap1=True`: delivery is attempted and failures are only reported (AAP-1, capture only). |
+
+The tenant is the producer (the service DID) unless `tenant_ref` says
+otherwise; each tenant DID has its own ledger. `audit_tool_handlers` takes the
+call explicitly, as the JS one does, or uses the tool call
+`begin_tool_call` opened in the current context, since a Python server is
+usually built once. `run_audited_tool` / `async_run_audited_tool` wrap a
+single handler. `HelixClient.get_audit_log(cursor=...)` reads the log one
+page at a time (`{"items": [...], "nextCursor": ...}`). The order-management
+sample reads `AUDIT_DELIVERY`, `AUDIT_OUTBOX_DIR` and `AUDIT_ACCEPT_AAP1`.
 
 ## Quick example
 

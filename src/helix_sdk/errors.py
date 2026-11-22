@@ -15,7 +15,7 @@ caller already knows from the JS SDK or from helix-api's error responses.
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 from . import codes
 
@@ -586,6 +586,31 @@ class AccountQuotaExceededError(HelixError):
 class CaptchaFailedError(HelixError):
     def __init__(self, message: str = "CAPTCHA verification failed") -> None:
         super().__init__(codes.CAPTCHA_FAILED, message, 400)
+
+
+class AuditEventInvalidError(HelixError):
+    """A value that is not a KYA-OS producer audit event (helix_sdk.audit).
+    ``issues`` are ``{"path", "message"}`` dicts naming each offending member,
+    the first of which the message repeats; the path is dotted (``''`` is the
+    top level), the same strings helix-core reports."""
+
+    def __init__(self, issues: Sequence[Mapping[str, str]]) -> None:
+        first = issues[0] if issues else None
+        message = (
+            f"Audit event is invalid at {first['path'] or '$'}: {first['message']}"
+            if first is not None
+            else "Audit event is invalid"
+        )
+        super().__init__(codes.AUDIT_EVENT_INVALID, message, 400, {"issues": [dict(issue) for issue in issues]})
+        self.issues = [dict(issue) for issue in issues]
+
+
+class AuditEvidenceError(HelixError):
+    """An evidence object or reference that cannot be used: no vault, another
+    key, bytes that do not match their reference, failed AEAD verification."""
+
+    def __init__(self, message: str, details: Optional[Mapping[str, Any]] = None) -> None:
+        super().__init__(codes.AUDIT_EVIDENCE_INVALID, message, 400, details)
 
 
 # ── API error mapping ───────────────────────────────────────────────────────
