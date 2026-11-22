@@ -10,9 +10,9 @@ The gate runs at the HTTP layer, in front of the MCP transport, so a missing
 or invalid credential gets a real HTTP 401 with `WWW-Authenticate` pointing
 at the RFC 9728 metadata (which is how OAuth clients discover the
 authorization server), and a scope failure gets a 403. Only `tools/call` is
-gated: `initialize` and `tools/list` stay open, so HelixID clients that send
-their VP in `params._meta` (not a header) keep working, and a VP is verified
-once per tool call, not once per request.
+gated: `initialize` and `tools/list` stay open, and a KYA-OS request proof
+(in `params._meta`) is verified once per tool call, in-process, over the
+JSON-RPC request exactly as received (story F-2).
 
 With `kyaos` set, the same layer runs the KYA-OS session and proof flow (story
 L2-A): the `_kyaos_handshake` tool opens a session (credentials, when present,
@@ -157,7 +157,9 @@ def create_order_app(
         scopes_supported=list(dict.fromkeys(s for scopes in TOOL_SCOPES.values() for s in scopes)),
         resource_name="Order Management (HelixID sample)",
     )
-    gate = async_helixid_mcp_middleware(replace(auth, tool_scopes=TOOL_SCOPES, required_scopes=[]))
+    # The handshake needs an identified caller, not a scope: it is listed with none (story F-2).
+    tool_scopes = {**TOOL_SCOPES, kyaos.handshake_tool_name: []} if kyaos is not None else TOOL_SCOPES
+    gate = async_helixid_mcp_middleware(replace(auth, tool_scopes=tool_scopes, required_scopes=[]))
 
     server = FastMCP(
         "order-management",
@@ -258,15 +260,16 @@ def create_order_app(
             name = params.get("name")
             arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
             meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else None
-            tool_call = {"name": name, "input": arguments, "_meta": meta, "headers": headers}
+            # The proof's requestHash covers the request as sent.
+            tool_call = {"name": name, "input": arguments, "_meta": meta, "headers": headers, "request": {"method": message["method"], "params": params}}
 
             if kyaos is not None and kyaos.is_handshake(name):
                 # The handshake is open to anonymous agents; a credential, when
                 # sent, must be good and makes the session an authenticated one.
                 try:
-                    caller = await gate.authorize({**tool_call, "name": "lookup_order"})  # type: ignore[attr-defined]
+                    caller = await gate.authorize(tool_call)  # type: ignore[attr-defined]
                 except Exception as error:  # noqa: BLE001
-                    if getattr(error, "code", None) != "VP_MISSING":
+                    if getattr(error, "code", None) != "PROOF_MISSING":
                         await refuse(error)
                         return
                 else:

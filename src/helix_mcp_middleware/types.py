@@ -10,33 +10,36 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Union
 
-from helix_sdk import HelixClient
-
 from .oauth import OAuthIssuerOptions
+from .verify_locally import LocalVerifier, MiddlewareVerifierOptions
 
 if TYPE_CHECKING:  # pragma: no cover - a type only; the module imports the gate's errors
     from .needs_authorization import NeedsAuthorization
 
 MCPToolCall = Dict[str, Any]
 """A dict with at least 'name' and 'input' keys, matching the JS
-MCPToolCall interface's structural typing (input is an untyped
-Record<string, unknown> on both sides). The VP is carried in '_meta' (the
-MCP request's params._meta, key "x-helix-vp") or, over HTTP, in 'headers'
-(`Authorization: HelixVP <vp>` or X-Helix-VP; `Authorization: Bearer <token>`
-for OAuth) -- never in 'input'."""
+MCPToolCall interface's structural typing. The KYA-OS request proof is
+carried in '_meta' (the MCP request's params._meta) under
+"org.kya-os/request-proof", the delegation chain under
+"org.kya-os/delegation-chain"; over HTTP an OAuth token comes in 'headers'
+(`Authorization: Bearer <token>`); never in 'input'. 'request' is the
+JSON-RPC request as received ({"method", "params"}), when the host has it:
+the proof's requestHash is recomputed over exactly this, else the request is
+rebuilt from 'name', 'input' and '_meta'."""
 
 
 @dataclass
 class MCPMiddlewareOptions:
-    client: Optional[HelixClient] = None
-    """Required to verify HelixID VPs (verification calls the API). Not
-    needed for an OAuth-only server."""
+    verifier: Optional[Union[LocalVerifier, MiddlewareVerifierOptions]] = None
+    """How KYA-OS request proofs are verified: in-process, from the proof and
+    the carried chain alone (story F-2), with the Helix API never asked. A
+    built LocalVerifier (shared with other gates), or its settings
+    (``service_did`` defaults to this middleware's; ``catalog`` to the scopes
+    of ``tool_scopes``). Not needed for an OAuth-only server."""
     required_scopes: List[str] = field(default_factory=list)
     """Fallback applied to every tool when `tool_scopes` is not set."""
-    allow_self_signed: bool = False
     expected_target_service: Optional[str] = None
-    """This server's own DID. When set, a VP signed for any other service is
-    rejected, so a VP meant for one service can't be replayed against another."""
+    """This server's own DID: the proof audience. `service_did` is the same setting under its current name."""
     tool_scopes: Optional[Dict[str, List[str]]] = None
     """Per-tool required scopes. Deny by default: when this map is set, a
     tool that is not a key in it is rejected before it runs (an empty list
@@ -55,21 +58,9 @@ class MCPMiddlewareOptions:
     on_audit_error: Optional[Callable[[BaseException], None]] = None
     """Called when `audit_sink` raises. Audit failures never block a tool call."""
     service_did: Optional[str] = None
-    """Included in audit events; defaults to `expected_target_service`."""
+    """This server's DID: the proof audience, included in audit events; defaults to `expected_target_service`."""
     needs_authorization: Optional["NeedsAuthorization"] = None
     """KYA-OS story L3-E: answers a call whose delegation is missing or does
     not cover the tool's scopes with a signed `needs_authorization` challenge
     (instead of the plain 403), and verifies the retry that carries the resume
     token and the new delegation credential. See create_needs_authorization."""
-
-
-@dataclass
-class AttachHelixVPOptions:
-    """Agent self-custody has been retired -- signing happens server-side
-    via `client`, not a local wallet. `agent_did` is the agent's DID,
-    previously implied by which wallet file was loaded."""
-
-    client: HelixClient
-    agent_did: str
-    target_service: str
-    user_did: Optional[str] = None
