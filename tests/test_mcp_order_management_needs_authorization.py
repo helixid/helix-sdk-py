@@ -15,7 +15,6 @@ Needs the `mcp` extra, so Python 3.10+.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import sys
 import time
@@ -41,7 +40,6 @@ from helix_mcp_middleware import (  # noqa: E402
     MemoryResumeTokenStore,
     NeedsAuthorizationOptions,
     RedisResumeTokenStore,
-    ResumeTokenBinding,
     create_kyaos,
     create_needs_authorization,
 )
@@ -289,38 +287,16 @@ class TestNeedsAuthorizationFromEnv:
             strict.authorize_retry(token, hop_for(AGENT), entry_context())
         assert caught.value.reason == "retry_authorizer_missing"
 
-    def test_the_resume_store_follows_the_redis_replay_store(self) -> None:
+    def test_the_resume_store_follows_the_replay_store_through_the_middleware(self) -> None:
         pytest.importorskip("redis")
-        assert entry.resume_store_from_env({}) is None
-        store = entry.resume_store_from_env({"KYAOS_NONCE_STORE": "redis", "KYAOS_REDIS_URL": "redis://127.0.0.1:6380"})
-        assert isinstance(store, RedisResumeTokenStore)
-
-    def test_the_loop_bound_redis_client_makes_one_client_per_loop(self) -> None:
-        made: List[Any] = []
-
-        class Client:
-            def __init__(self) -> None:
-                self.values: Dict[str, str] = {}
-                made.append(self)
-
-            async def set(self, name: str, value: str, px: int, nx: bool) -> bool:
-                self.values[name] = value
-                return True
-
-            async def getdel(self, name: str) -> Any:
-                return self.values.pop(name, None)
-
-        bound = entry._LoopBoundRedis(Client)
-        store = RedisResumeTokenStore(bound)
-
-        async def scenario() -> Any:
-            token = await store.issue(ResumeTokenBinding(AGENT, "refund_order", ["orders:admin"]), time.time() + 60)  # type: ignore[misc]
-            return await store.consume(token), await store.consume(token)  # type: ignore[misc]
-
-        first, second = asyncio.run(scenario())
-        assert first is not None and first.agent_did == AGENT and second is None
-        asyncio.run(scenario())
-        assert len(made) == 2  # one per event loop
+        memory = entry.needs_authorization_from_env({"KYAOS_AUTHORIZATION_URL": CONSENT}, SERVICE, True, None)
+        assert memory is not None and isinstance(memory.store, MemoryResumeTokenStore)
+        env = {"KYAOS_AUTHORIZATION_URL": CONSENT, "KYAOS_NONCE_STORE": "redis", "KYAOS_REDIS_URL": "redis://127.0.0.1:6380"}
+        shared = entry.needs_authorization_from_env(env, SERVICE, True, None)
+        assert shared is not None and isinstance(shared.store, RedisResumeTokenStore)
+        # A bad replay-store setting stops the sample at startup.
+        with pytest.raises(SystemExit):
+            entry.needs_authorization_from_env({"KYAOS_AUTHORIZATION_URL": CONSENT, "KYAOS_NONCE_STORE": "postgres"}, SERVICE, True, None)
 
     def test_the_audit_log_file_gets_every_event_as_a_json_line(self, tmp_path: Path) -> None:
         path = tmp_path / "audit.jsonl"

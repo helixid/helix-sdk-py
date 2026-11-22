@@ -33,7 +33,9 @@ Every challenge issued is audited through the audit sink as an
 signed proof on the challenge is the tamper-evident record of it.
 
 The layer is synchronous, like helixid_mcp_middleware(): its store,
-authorizer and audit sink answer values. async_helixid_mcp_middleware()
+authorizer and audit sink answer values. With no store given it takes the
+one the environment names (resume_token_store_from_env, following L2-A's
+KYAOS_NONCE_STORE); a Redis one is async (redis.asyncio). async_helixid_mcp_middleware()
 runs it in a worker thread and bridges each of them onto the request's event
 loop (``bridged()``), so there they may be async (redis.asyncio, say).
 
@@ -45,6 +47,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -54,12 +57,12 @@ from urllib.parse import urlsplit, urlunsplit
 from helix_sdk.errors import HelixError
 
 from .resume_token_store import (
-    MemoryResumeTokenStore,
     ResumeTokenBinding,
     ResumeTokenRecord,
     ResumeTokenStore,
     is_resume_token,
 )
+from .resume_token_store_env import resume_token_store_from_env
 
 NEEDS_AUTHORIZATION = "needs_authorization"
 #: Control argument carrying the resume token on a retry.
@@ -157,8 +160,13 @@ class ResumeRetry:
 class NeedsAuthorizationOptions:
     #: The consent page: a URL, or a function of the challenge's ChallengeContext. Always covered by the proof.
     authorization_url: Union[str, Callable[[ChallengeContext], str]]
-    #: Default MemoryResumeTokenStore (one instance); share a RedisResumeTokenStore across instances.
+    #: Default: the store KYAOS_NONCE_STORE leads to (resume_token_store_from_env: Redis on KYAOS_REDIS_URL
+    #: when the replay store is Redis, memory otherwise). An explicit store wins.
     store: Optional[ResumeTokenStore] = None
+    #: Where the default store reads its settings; default ``os.environ``.
+    env: Optional[Mapping[str, str]] = None
+    #: Where the default store logs its startup line and warnings; default the ``helix_mcp_middleware.kyaos`` logger.
+    logger: Optional[logging.Logger] = None
     #: Resume-token lifetime; default 600.
     ttl_seconds: Optional[float] = None
     #: Verifies the credential a retry carries (F-2, L3-H). Default: refuses.
@@ -230,12 +238,19 @@ class NeedsAuthorization:
     def __init__(self, options: NeedsAuthorizationOptions) -> None:
         self._options = options
         self._now: Callable[[], float] = options.now if options.now is not None else time.time
-        self.store: ResumeTokenStore = options.store if options.store is not None else MemoryResumeTokenStore(now=self._now)
+        self.store: ResumeTokenStore = (
+            options.store if options.store is not None else resume_token_store_from_env(options.env, now=self._now, logger=options.logger)
+        )
         ttl = options.ttl_seconds if options.ttl_seconds is not None else DEFAULT_RESUME_TTL_SECONDS
         if isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or not ttl > 0 or ttl == float("inf"):
             raise ValueError("create_needs_authorization: ttl_seconds must be a positive number")
         self.ttl_seconds: float = ttl
         self._authorizer: RetryAuthorizer = options.authorizer if options.authorizer is not None else _refusing_authorizer
+
+    async def ready(self) -> None:
+        """Resolves at once: in Python the store's settings and package are
+        checked when the layer is built, and a problem raises there. Kept so
+        hosts can await it as they do helix-sdk-js's ``needsAuthorization.ready()``."""
 
     def bridged(self, bridge: Callable[[Callable[..., Any]], Callable[..., Any]]) -> "NeedsAuthorization":
         """The same layer with its store, authorizer, audit sink and error

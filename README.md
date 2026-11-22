@@ -169,7 +169,7 @@ from helix_mcp_middleware import MCPMiddlewareOptions, NeedsAuthorizationOptions
 needs_authorization = create_needs_authorization(NeedsAuthorizationOptions(
     authorization_url=lambda c: f"https://consent.example/authorize?tool={c.tool}",
     ttl_seconds=600,              # resume-token lifetime
-    store=None,                   # MemoryResumeTokenStore; RedisResumeTokenStore(redis_client) across instances
+    # store: default follows KYAOS_NONCE_STORE (resume_token_store_from_env: Redis on KYAOS_REDIS_URL, else memory)
     authorizer=verify_delegation, # the seam stories F-2 and L3-H implement; default refuses every retry
     audit_sink=audit_sink,        # every challenge: AUTHZ_DENIED, reason "needs_authorization"
 ))

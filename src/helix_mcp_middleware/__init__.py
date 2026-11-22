@@ -91,8 +91,10 @@ from .needs_authorization import *  # noqa: E402,F401,F403
 from .needs_authorization import __all__ as _needs_authorization_all  # noqa: E402
 from .resume_token_store import *  # noqa: E402,F401,F403
 from .resume_token_store import __all__ as _resume_token_store_all  # noqa: E402
+from .resume_token_store_env import *  # noqa: E402,F401,F403
+from .resume_token_store_env import __all__ as _resume_token_store_env_all  # noqa: E402
 
-__all__ += _needs_authorization_all + _resume_token_store_all
+__all__ += _needs_authorization_all + _resume_token_store_all + _resume_token_store_env_all
 
 # KYA-OS session, replay store and server response proof (story L2-A).
 from .kyaos import *  # noqa: E402,F401,F403

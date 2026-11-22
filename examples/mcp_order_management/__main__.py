@@ -41,8 +41,10 @@ Configuration (environment), the same as the JS sample:
                           See .env.example.
   KYAOS_AUTHORIZATION_URL KYA-OS (story L3-E): the consent page a caller without the authority for a
                         tool is sent to. Turns on the signed needs_authorization challenge and the
-                        resume flow; the resume-token store is Redis when KYAOS_NONCE_STORE=redis (the
-                        same KYAOS_REDIS_URL, records shared with JS instances), else in memory. In
+                        resume flow; the resume-token store follows KYAOS_NONCE_STORE, read by
+                        helix_mcp_middleware itself (resume_token_store_from_env): Redis on
+                        KYAOS_REDIS_URL, key prefix KYAOS_RESUME_KEY_PREFIX, when the replay store is
+                        Redis (records shared with JS instances), memory otherwise. In
                         DEMO_MODE the retry's DelegationCredential is checked structurally only (see
                         demo_authorizer.py); outside it every retry is refused until a verifier
                         (stories F-2, L3-H) is wired in. Optional:
@@ -53,11 +55,9 @@ Configuration (environment), the same as the JS sample:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import sys
-import weakref
 from typing import Any, Callable, Dict, List, NoReturn, Optional
 
 import uvicorn
@@ -76,8 +76,6 @@ from helix_mcp_middleware import (
     NeedsAuthorizationOptions,
     OAuthIntrospectionOptions,
     OAuthIssuerOptions,
-    RedisResumeTokenStore,
-    ResumeTokenStore,
     auth0,
     create_helix_audit_sink,
     create_kyaos,
@@ -270,38 +268,6 @@ def kyaos_from_env(env: Dict[str, str], resource: str, service_did: Optional[str
         fail(f"KYA-OS: {error}")
 
 
-class _LoopBoundRedis:
-    """A redis.asyncio client made on first use, inside the running event loop,
-    one per loop, with the two commands RedisResumeTokenStore needs."""
-
-    def __init__(self, make: Callable[[], Any]) -> None:
-        self._make = make
-        self._clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any]" = weakref.WeakKeyDictionary()
-
-    def _client(self) -> Any:
-        loop = asyncio.get_running_loop()
-        if loop not in self._clients:
-            self._clients[loop] = self._make()
-        return self._clients[loop]
-
-    async def set(self, *args: Any, **kwargs: Any) -> Any:
-        return await self._client().set(*args, **kwargs)
-
-    async def getdel(self, name: str) -> Any:
-        return await self._client().getdel(name)
-
-
-def resume_store_from_env(env: Dict[str, str]) -> Optional[ResumeTokenStore]:
-    """Redis when the replay store is Redis (the same URL), else None (the layer's in-memory default)."""
-    config = read_nonce_store_config(env)
-    if config.kind != "redis":
-        return None
-    import redis.asyncio as redis_asyncio  # the redis extra, already required by KYAOS_NONCE_STORE=redis
-
-    url = config.url
-    return RedisResumeTokenStore(_LoopBoundRedis(lambda: redis_asyncio.Redis.from_url(url)))
-
-
 def needs_authorization_from_env(
     env: Dict[str, str], service_did: Optional[str], demo: bool, audit_sink: Optional[Callable[[Dict[str, Any]], Any]]
 ) -> Optional[NeedsAuthorization]:
@@ -329,7 +295,8 @@ def needs_authorization_from_env(
             NeedsAuthorizationOptions(
                 authorization_url=url_for,
                 ttl_seconds=ttl_seconds,
-                store=resume_store_from_env(env),
+                # The resume-token store follows KYAOS_NONCE_STORE, chosen by helix_mcp_middleware itself from the same environment.
+                env=env,
                 authorizer=demo_retry_authorizer(service_did) if demo else None,
                 audit_sink=audit_sink,
                 on_audit_error=lambda error: print("audit write failed:", error, file=sys.stderr),
@@ -413,7 +380,7 @@ def main() -> None:
     audits = [f"{api_url}/v1/audit-log/events" if api_url and api_key else "", f"file {env['AUDIT_LOG_FILE']}" if env.get("AUDIT_LOG_FILE") else ""]
     print(f"  Audit:       {' + '.join(a for a in audits if a) or 'off (set HELIX_API_URL + HELIX_API_KEY, or AUDIT_LOG_FILE)'}")
     if auth.needs_authorization is not None:
-        store = "in redis" if read_nonce_store_config(env).kind == "redis" else "in memory"
+        store = "in redis (KYAOS_REDIS_URL)" if read_nonce_store_config(env).kind == "redis" else "in memory"
         retries = "checked structurally (DEMO_MODE, no signature verification)" if demo else "refused until a verifier is wired in"
         print(f"  Consent:     needs_authorization challenges to {env['KYAOS_AUTHORIZATION_URL']}, resume tokens {store}, retries {retries}")
     else:
