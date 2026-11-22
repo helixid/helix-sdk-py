@@ -24,12 +24,14 @@ and the vendored ``audit-integrity`` vectors (tests/test_audit.py).
 
 from __future__ import annotations
 
+from ..crypto.jcs import CanonicalJsonError, canonicalize, hash_json
 from ..errors import AuditEventInvalidError, AuditEvidenceError
 from .digest import (
     audit_digest,
     audit_event_digest,
     digest_bytes,
     digest_text,
+    json_digest,
     keyed_commitment_value,
     utf16_length,
     wtf8_bytes,
@@ -80,15 +82,43 @@ from .types import (
     AUDIT_EVENT_TYPES,
     AUDIT_EVENT_VERSION,
     AUDIT_INTEGRITY_SUITE,
+    AdministrationPhase,
+    AuditEventFamily,
     AuditEventInput,
+    AuditOutcome,
     AuditProducerEvent,
     AuditTrailEntry,
+    AuthorizationPhase,
+    ConsentPhase,
+    DelegationPhase,
     EvidenceRef,
+    KeyPhase,
+    LedgerPhase,
     PartyRef,
+    PartyRefKind,
+    ProofPhase,
+    SessionPhase,
+    ToolPhase,
     audit_event_family,
 )
 
 __all__ = [
+    "PartyRefKind",
+    "AuditOutcome",
+    "AuditEventFamily",
+    "SessionPhase",
+    "ToolPhase",
+    "ProofPhase",
+    "DelegationPhase",
+    "AuthorizationPhase",
+    "ConsentPhase",
+    "KeyPhase",
+    "LedgerPhase",
+    "AdministrationPhase",
+    "CanonicalJsonError",
+    "canonicalize",
+    "hash_json",
+    "json_digest",
     "AUDIT_BINDING_HELIX",
     "AUDIT_BINDING_MCP",
     "AUDIT_DIGEST_DOMAINS",

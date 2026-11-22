@@ -1081,3 +1081,31 @@ class TestErrorsDoNotLeak:
         with pytest.raises(AuditEventInvalidError) as refused:
             make_trail().record(session_input(correlationId=3, actor={"kind": "email", "value": "secret@example.com"}))
         assert "secret@example.com" not in str(refused.value) and "secret@example.com" not in json.dumps(refused.value.details)
+
+
+class TestJsonDigestAndReExports:
+    """``json_digest`` (JS ``jsonDigest``) and the names helix_sdk.audit shares with the JS module."""
+
+    def test_json_digest_hashes_the_wire_form(self) -> None:
+        import hashlib
+
+        from helix_sdk.audit import CanonicalJsonError, canonicalize, hash_json, json_digest
+
+        expected = "sha256:" + hashlib.sha256(b'{"id":"did:x","n":null,"t":[1,2]}').hexdigest()
+        assert json_digest({"id": "did:x", "n": float("inf"), "t": (1, 2)}) == expected
+        assert json_digest({"id": "did:x", "n": float("nan"), "t": [1, 2]}) == expected
+        assert json_digest({1: "a"}) == hash_json({"1": "a"})
+        assert canonicalize({"b": 1, "a": 2}) == '{"a":2,"b":1}'
+        with pytest.raises(CanonicalJsonError):
+            json_digest({"s": "\ud800"})
+
+    def test_value_set_aliases_are_exported(self) -> None:
+        import typing
+
+        import helix_sdk.audit as audit
+
+        assert typing.get_args(audit.AuditOutcome) == ("succeeded", "failed", "denied", "challenged", "unknown")
+        assert set(typing.get_args(audit.AuditEventFamily)) == set(audit.AUDIT_EVENT_FAMILIES)
+        assert typing.get_args(audit.PartyRefKind) == ("public_did", "pairwise_did", "keyed_commitment", "evidence_ref")
+        phases = [audit.SessionPhase, audit.ToolPhase, audit.ProofPhase, audit.DelegationPhase, audit.AuthorizationPhase, audit.ConsentPhase, audit.KeyPhase, audit.LedgerPhase, audit.AdministrationPhase]
+        assert sum(len(typing.get_args(p)) for p in phases) == len(audit.AUDIT_EVENT_TYPES)

@@ -117,6 +117,9 @@ class AgentWallet:
     wallet_credentials: List[WalletCredential] = field(default_factory=list)
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+    # The wallet's audit source (helix_sdk.audit.AuditTrail), built on first
+    # use: one source sequence per wallet instance.
+    _audit_trail: Optional[Any] = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.private_key_hex:
@@ -259,19 +262,23 @@ class AgentWallet:
         if self.client is None or not _is_delegation_grant_vc(vc):
             return
         try:
-            from .audit import AUDIT_BINDING_MCP, AuditTrail, CallbackAuditSink, pairwise_did, public_did
+            from .audit import AUDIT_BINDING_MCP, AuditTrail, pairwise_did, public_did
 
             subject = vc["credentialSubject"]
             agent_did = subject["id"]
             producer = pairwise_did(agent_did)
-            client = self.client
-            trail = AuditTrail(
-                sink=CallbackAuditSink(lambda entry: client.record_audit_event(entry.event)),
-                source_id=f"helix-sdk-py:{agent_did}",
-                producer=producer,
-                tenant_ref=producer,
-                binding=AUDIT_BINDING_MCP,
-            )
+            # One audit source per wallet instance, built on first use, so
+            # its consent events share one sequence and chain (as in the JS wallet).
+            trail = self._audit_trail
+            if trail is None:
+                trail = AuditTrail(
+                    sink=self.client.audit_sink(),
+                    source_id=f"helix-sdk-py:{agent_did}",
+                    producer=producer,
+                    tenant_ref=producer,
+                    binding=AUDIT_BINDING_MCP,
+                )
+                self._audit_trail = trail
             issuer = vc.get("issuer")
             if isinstance(issuer, dict):
                 issuer = issuer.get("id")

@@ -74,7 +74,20 @@ re-copy the three JSON files here too, the same way `helix-sdk-js` does.
   (`Authorization: HelixVP`, `X-Helix-VP`, or MCP `_meta["x-helix-vp"]`) or
   an OAuth 2.1 bearer token; `tool_scopes` maps each tool to the scopes it
   needs and denies unlisted tools; every decision goes to `audit_sink`
-  (`create_helix_audit_sink()` writes to the HelixID audit log).
+  (`create_helix_audit_sink()` writes to the HelixID audit log). Since KYA-OS
+  story A-1 the log holds typed producer events (AAP-1 Recorded): each
+  decision becomes `proof.verified`, `delegation.verified` and
+  `authorization.approved` / `authorization.denied`, strictly validated,
+  sequenced per source with `previousSourceEventDigest`, digested and posted
+  to `POST /v1/audit-log/events`. For a tool call's whole lifecycle build an
+  `McpAuditTrail` with `create_mcp_audit_trail(create_helix_audit_reporter(url,
+  key), service_did)`, pass `audit.tool_audit_sink()` as `audit_sink`, and
+  wrap each call in `with audit.begin_tool_call(tool_name, credential=vp)`,
+  as `examples/mcp_order_management` does. No event holds tool arguments, a
+  response, a token or a VP; an OAuth subject is a keyed commitment; tool
+  names only with `include_tool_names=True`. The typed events themselves
+  (`AuditTrail`, the strict validator, digests, SPEC 7.8 references, the
+  evidence vault) are `helix_sdk.audit`.
   `oauth=` takes one trusted issuer or a list: `OAuthIssuerOptions(issuer,
   audience)` is enough (keys come from the issuer's metadata), or use the
   presets `entra()`, `auth0()`, `okta()`, `keycloak()`; opaque tokens are

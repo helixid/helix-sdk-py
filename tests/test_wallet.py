@@ -204,6 +204,11 @@ class TestConsentGrantAudit:
             def record_audit_event(self, event: Dict[str, Any]) -> None:
                 recorded.append(event)
 
+            def audit_sink(self) -> Any:
+                from helix_sdk.audit import CallbackAuditSink
+
+                return CallbackAuditSink(lambda entry: self.record_audit_event(entry.event))
+
         key_pair = generate_key_pair()
         agent_did = f"did:key:{public_key_to_multibase(key_pair.public_key)}"
         wallet = AgentWallet(private_key_hex=key_pair.private_key, did_value=agent_did, client=FakeClient())  # type: ignore[arg-type]
@@ -223,11 +228,23 @@ class TestConsentGrantAudit:
         assert event["details"] == {"family": "consent", "phase": "approved", "consentRef": grant["id"]}
         assert event["source"] == {"producer": {"kind": "pairwise_did", "did": agent_did}, "sourceId": f"helix-sdk-py:{agent_did}", "sourceSequence": "1"}
         assert event["tenantRef"] == {"kind": "pairwise_did", "did": agent_did}
+        # One source per wallet: the next grant is sequence 2 and names the first as its predecessor.
+        from helix_sdk.audit import audit_event_digest
+
+        wallet.add_credential(_build_grant_vc(agent_did, "did:web:sp.example.com", "did:key:zUser", ["write:orders"]))
+        assert len(recorded) == 2
+        assert recorded[1]["source"]["sourceSequence"] == "2"
+        assert recorded[1]["source"]["previousSourceEventDigest"] == audit_event_digest(event)
 
     def test_audit_failures_and_odd_shapes_never_surface(self, wallet_dir: str) -> None:
         class BrokenClient:
             def record_audit_event(self, event: Dict[str, Any]) -> None:
                 raise RuntimeError("API down")
+
+            def audit_sink(self) -> Any:
+                from helix_sdk.audit import CallbackAuditSink
+
+                return CallbackAuditSink(lambda entry: self.record_audit_event(entry.event))
 
         key_pair = generate_key_pair()
         agent_did = f"did:key:{public_key_to_multibase(key_pair.public_key)}"
