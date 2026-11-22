@@ -700,7 +700,7 @@ class TestStartFinishCall:
 
     def test_without_a_session_the_call_is_authorised_from_its_credentials(self) -> None:
         kya, _ = runtime()
-        started = run(kya.start(tool_call(), authorize=lambda: AuthorizedCaller(auth_method="helixvp", agent_did=AGENT)))
+        started = run(kya.start(tool_call(), authorize=lambda: AuthorizedCaller(auth_method="kyaos", agent_did=AGENT)))
         assert isinstance(started, KyaOsAllowed)
         assert started.session is None and started.client_did == AGENT
         result = run(started.finish(RESULT))
@@ -913,16 +913,16 @@ class TestGateAuthorize:
         assert run(gate.authorize(call)).oauth_subject == "agent-1"  # type: ignore[attr-defined]
         assert run(gate(call)) is call
 
-    def test_vp_caller_carries_agent_did_and_vp_id(self) -> None:
-        from unittest.mock import MagicMock
+    def test_a_kyaos_caller_carries_agent_did_level_assurance_and_freshness(self) -> None:
+        from types import SimpleNamespace
 
-        from helix_sdk.vp_transport import encode_helix_vp
+        class Verifier:
+            def verify_call(self, call: Dict[str, Any]) -> Any:
+                return SimpleNamespace(ok=True, effective_scopes=["orders:read"], proof_did=AGENT, level="L2", proof_assurance="L3-minus", fresh=True, reasons=[])
 
-        client = MagicMock()
-        client.verify_vp.return_value = {"valid": True, "agentDid": AGENT, "effectiveScopes": ["orders:read"], "vpId": "vp:1"}
-        gate = helixid_mcp_middleware(MCPMiddlewareOptions(client=client, tool_scopes={"lookup_order": ["orders:read"]}))
-        caller = gate.authorize({"name": "lookup_order", "_meta": {"x-helix-vp": encode_helix_vp({"id": "vp:1"})}})  # type: ignore[attr-defined]
-        assert (caller.auth_method, caller.agent_did, caller.vp_id) == ("helixvp", AGENT, "vp:1")
+        gate = helixid_mcp_middleware(MCPMiddlewareOptions(verifier=Verifier(), tool_scopes={"lookup_order": ["orders:read"]}))
+        caller = gate.authorize({"name": "lookup_order", "_meta": {"org.kya-os/request-proof": {"prf": "org.kya-os/proof.v1"}}})  # type: ignore[attr-defined]
+        assert caller == AuthorizedCaller(auth_method="kyaos", scopes=["orders:read"], agent_did=AGENT, level="L2", proof_assurance="L3-minus", fresh=True)
 
 
 class TestHttpRefusalWithProof:

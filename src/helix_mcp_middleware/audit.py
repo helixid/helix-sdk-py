@@ -50,10 +50,12 @@ from helix_sdk.audit import (
 ToolAuditEvent = Dict[str, Any]
 """One authorization decision for one tool call, as middleware.py reports it:
 event ('AUTHZ_GRANTED' | 'AUTHZ_DENIED'), result ('allowed' | 'denied'),
-timestamp, authMethod ('helixvp' | 'oauth'), effectiveScopes, and when known
-agentDid, oauthSubject (never recorded as such), vpId, toolName,
-requiredScope, reason, serviceDid; ``correlationId`` and ``delegation``
-(a ``DelegationEvidence``) default to the current ``begin_tool_call()``."""
+timestamp, authMethod ('kyaos' | 'oauth'), effectiveScopes, and when known
+agentDid (the DID the request proof verified as), level and fresh (KYA-OS
+callers: the level the local verifier derived, story F-2, and whether every
+status was read live), oauthSubject (never recorded as such), toolName,
+requiredScope, reason, serviceDid; ``correlationId`` and ``delegation`` (a
+``DelegationEvidence``) default to the current ``begin_tool_call()``."""
 
 AuditSink = Callable[[ToolAuditEvent], None]
 """Receives every decision for an identified caller, before the tool runs."""
@@ -111,6 +113,16 @@ def delegation_evidence_of(credential: Any) -> Optional[DelegationEvidence]:
     if chain_digests is not None:
         evidence["delegationChainDigests"] = chain_digests
     return evidence
+
+
+_GUARD_REASONS = frozenset({"tool is not in toolScopes", "insufficient scope", "needs_authorization"})
+"""The guard's own denials of an identified caller; any other reason a KYA-OS caller is denied with is the local verifier's."""
+
+
+def _kyaos_verification_code(event: ToolAuditEvent) -> str:
+    """``KYAOS_PROOF_<level>``, with ``_CACHED`` when the verifier did not read every status live (story F-2)."""
+    level = event.get("level")
+    return "KYAOS_PROOF" + (f"_{level}" if isinstance(level, str) else "") + ("_CACHED" if event.get("fresh") is False else "")
 
 
 def _delegation_authorization(delegation: DelegationEvidence, decision: str, scope_id: Optional[str] = None) -> Dict[str, Any]:
@@ -336,11 +348,15 @@ class McpAuditTrail:
 
     def tool_audit_sink(self) -> AuditSink:
         """The middleware's ``audit_sink``: translates each authorization
-        decision into the typed events. A HelixID caller: ``proof.verified``,
+        decision into the typed events. A KYA-OS caller (story F-2):
+        ``proof.verified``, its verification code naming the level the local
+        verifier derived (and ``_CACHED`` when a status was not read live),
         then ``delegation.verified`` when the presented credential is known,
         then ``authorization.approved`` or ``authorization.denied`` (reason
-        ``needs_authorization`` for an L3-E challenge). An OAuth caller: only
-        the authorization event, with the subject as a keyed commitment."""
+        ``needs_authorization`` for an L3-E challenge); a request proof the
+        verifier refused is ``proof.rejected`` by its first reason code, and
+        nothing else. An OAuth caller: only the authorization event, with the
+        subject as a keyed commitment."""
 
         def sink(event: ToolAuditEvent) -> None:
             call = _CURRENT_CALL.get()
@@ -359,12 +375,18 @@ class McpAuditTrail:
                 base["correlationId"] = event["correlationId"]
             tool_name = event.get("toolName") if isinstance(event.get("toolName"), str) else None
             scope_id = event.get("requiredScope") if isinstance(event.get("requiredScope"), str) else None
-            helixvp = event.get("authMethod") == "helixvp"
-            if helixvp:
+            allowed = event.get("result") == "allowed"
+            kyaos = event.get("authMethod") == "kyaos"
+            reason = event.get("reason") if isinstance(event.get("reason"), str) else None
+            if kyaos and not allowed and scope_id is None and reason is not None and reason not in _GUARD_REASONS:
+                # The local verifier refused the request proof: its reasons are codes, the first one names the refusal.
+                self.proof("rejected", "denied", reason_code=reason.split(",")[0].strip() or "proof_invalid", context=base)
+                return
+            if kyaos:
                 proof_context = dict(base)
                 if delegation is not None:
                     proof_context["authorization"] = _delegation_authorization(delegation, "allowed")
-                self.proof("verified", "succeeded", verification_code="VP_VERIFIED", context=proof_context)
+                self.proof("verified", "succeeded", verification_code=_kyaos_verification_code(event), context=proof_context)
                 if delegation is not None:
                     ref = delegation.get("delegationRef")
                     self.delegation(
@@ -373,12 +395,11 @@ class McpAuditTrail:
                         "succeeded",
                         context={**base, "authorization": _delegation_authorization(delegation, "allowed")},
                     )
-            allowed = event.get("result") == "allowed"
             decision = "allowed" if allowed else "denied"
-            if helixvp and delegation is not None:
+            if kyaos and delegation is not None:
                 authorization = _delegation_authorization(delegation, decision, scope_id)
             else:
-                authorization = {"source": "delegation" if helixvp else "policy", "decision": decision}
+                authorization = {"source": "delegation" if kyaos else "policy", "decision": decision}
                 if scope_id is not None:
                     authorization["scopeId"] = scope_id
             context = {**base, "authorization": authorization}
