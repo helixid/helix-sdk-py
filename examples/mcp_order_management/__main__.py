@@ -45,6 +45,12 @@ Configuration (environment), the same as the JS sample:
                         or custom {"issuer", "jwksUri"?, "introspection"?: {"clientId", "clientSecret", "endpoint"?}}
   DEMO_MODE=1           local demo only: accept the fixed bearer tokens below instead of an
                         authorization server. Refused unless HOST is loopback.
+  PUBLIC_ORIGIN         KYA-OS story C-A: serve this server's did.json and card.json (its did:web is
+                        derived from the origin and MCP path). Optional with it:
+  SERVICE_NAME            the card's display name (default "Order Management (HelixID sample)")
+  SERVICE_PUBLIC_KEY_JWK  the service key's public JWK, {"kty":"OKP","crv":"Ed25519","x":...}
+  SERVICE_KID             its verification-method fragment (default key-1)
+  SERVICE_RESPONSIBLE_PARTY  the accountable org DID, when there is one
   SERVICE_SIGNING_KEY   KYA-OS (story L2-A): this server's Ed25519 private key (hex), the key
                         SERVICE_DID's document lists as key-1. Turns on the _kyaos_handshake tool,
                         sessions and a server-signed proof on every tool call outcome. Optional:
@@ -87,12 +93,12 @@ import os
 import re
 import sys
 from typing import Any, Callable, Dict, List, NoReturn, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import uvicorn
 
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-
 from helix_sdk.crypto.jws import EnvSigner
+from helix_sdk.errors import HelixError
 from helix_mcp_middleware import (
     AuthResult,
     KyaOsOptions,
@@ -103,6 +109,7 @@ from helix_mcp_middleware import (
     NeedsAuthorization,
     NeedsAuthorizationOptions,
     OAuthIntrospectionOptions,
+    ServeIdentityOptions,
     OAuthIssuerOptions,
     WellKnownMcp,
     WellKnownMcpConfig,
@@ -255,6 +262,26 @@ def oauth_issuers_from_env(env: Dict[str, str], resource: str) -> List[OAuthIssu
     elif jwks_uri or introspection_url or client_id or client_secret:
         fail("OAUTH_JWKS_URI / OAUTH_INTROSPECTION_URL / OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET need OAUTH_ISSUER")
     return issuers
+
+
+def identity_from_env(env: Dict[str, str], resource: str, service_did: Optional[str]) -> Optional[ServeIdentityOptions]:
+    """PUBLIC_ORIGIN and SERVICE_*: what the JS sample reads for the same card."""
+    public_origin = env.get("PUBLIC_ORIGIN")
+    if not public_origin:
+        return None
+    card: Dict[str, Any] = {
+        "name": env.get("SERVICE_NAME") or "Order Management (HelixID sample)",
+        "capabilities": ["tools/list", "tools/call", *TOOL_SCOPES.keys()],
+    }
+    if env.get("SERVICE_PUBLIC_KEY_JWK"):
+        try:
+            card["publicKeyJwk"] = json.loads(env["SERVICE_PUBLIC_KEY_JWK"])
+        except ValueError:
+            fail("SERVICE_PUBLIC_KEY_JWK is not valid JSON")
+        card["kid"] = env.get("SERVICE_KID") or "key-1"
+    if env.get("SERVICE_RESPONSIBLE_PARTY"):
+        card["responsibleParty"] = env["SERVICE_RESPONSIBLE_PARTY"]
+    return ServeIdentityOptions(public_origin=public_origin, path=urlsplit(resource).path, did=service_did or None, card=card)
 
 
 _KYAOS_SETTINGS = ("KYAOS_NONCE_STORE", "KYAOS_PUBLIC_ORIGIN", "KYAOS_CLOCK_SKEW_SECONDS", "KYAOS_SESSIONS", "KYAOS_SESSION_TTL_MINUTES")
@@ -511,6 +538,7 @@ def main() -> None:
     if auth.verifier is None and auth.validate_oauth_token is None and auth.oauth is None:
         fail("no way to authenticate callers: set SERVICE_DID (KYA-OS request proofs), OAUTH_ISSUER / OAUTH_ISSUERS, or DEMO_MODE=1")
 
+    identity = identity_from_env(env, resource, service_did)
     auth.needs_authorization = needs_authorization_from_env(env, service_did, demo, auth.audit_sink)
     well_known, well_known_off = well_known_from_env(env, resource, service_did, kyaos)
     try:
@@ -520,10 +548,13 @@ def main() -> None:
             authorization_servers=[i.issuer for i in issuers] or None,
             on_server_error=lambda error: print("server error:", repr(error), file=sys.stderr),
             audit=audit,
+            identity=identity,
             kyaos=kyaos,
             well_known=well_known,
         )
     except ValueError as error:
+        fail(str(error))
+    except HelixError as error:  # an invalid card (EntityCardError)
         fail(str(error))
 
     print(f"order-management MCP server on {resource}")
@@ -542,6 +573,8 @@ def main() -> None:
         f"file {env['AUDIT_LOG_FILE']}" if env.get("AUDIT_LOG_FILE") else "",
     ]
     print(f"  Audit:       {' + '.join(a for a in audits if a) or 'off (set HELIX_API_URL + HELIX_API_KEY + SERVICE_DID, or AUDIT_LOG_FILE)'}")
+    path = urlsplit(resource).path.rstrip("/")
+    print(f"  Identity:    {identity.public_origin + path + '/{did,card}.json' if identity else 'off (set PUBLIC_ORIGIN)'}")
     if auth.needs_authorization is not None:
         store = "in redis (KYAOS_REDIS_URL)" if read_nonce_store_config(env).kind == "redis" else "in memory"
         retries = "checked structurally (DEMO_MODE, no signature verification)" if demo else "refused until a verifier is wired in"
