@@ -159,6 +159,39 @@ falls back to memory. One startup line on the `helix_mcp_middleware.kyaos` logge
 Redis password is shown as `***`); memory with `ENV` or `NODE_ENV` set to `production` also warns that it covers one
 process only.
 
+## The `/.well-known/mcp` discovery document (`helix_mcp_middleware`, story L1-D)
+
+`create_well_known_mcp()` builds the KYA-OS discovery document from config, validates it against the vendored
+`well-known-mcpi.json` schema at startup (raising `WellKnownMcpError` with the schema's complaints) and serves it over
+ASGI; for the same config it is byte for byte the document `@helixid/mcp-middleware`'s `createWellKnownMcp()` serves.
+
+```python
+from helix_mcp_middleware import create_well_known_mcp
+
+well_known = create_well_known_mcp(
+    public_origin="https://mcp.example.com",   # the origin agents connect to; required, never the bind address
+    server_did="did:web:mcp.example.com",       # did:web or did:key; required
+    tools_endpoint="/mcp",                       # path at public_origin, or an absolute URL there
+    kyaos=kya.describe(),                        # proofs, the handshake and the skew from the L2-A layer
+    status_list_credential="https://mcp.example.com/credentials/status/1",  # optional
+    capabilities={"delegation": False, "statusList": False, "crisp": False},  # each true only while that feature is on
+)
+
+async def app(scope, receive, send):
+    if await well_known.handle(scope, receive, send):  # GET / HEAD /.well-known/mcp; False for anything else
+        return
+    ...
+# any other host: well_known.respond() is (status, headers, body)
+```
+
+`enabled=False` answers 404. Validation needs `jsonschema` (in the `mcp-middleware` and `all` extras); the `uri`,
+`uri-reference` and `email` formats are checked with ajv-formats' own expressions, so both languages refuse the same
+documents with the same messages. Route `/.well-known/mcp` at your origin root to the middleware: helix-sdk-js's
+`mcp-middleware/docs/well-known.md` has the nginx, ALB and API Gateway rules and the `public_origin` rule. The client
+side is `helix_sdk.kyaos.fetch_well_known_mcp(origin)` / `read_well_known_mcp(document)`, which fill
+`clockSkewSeconds` with 120 when absent and resolve relative endpoints, for `create_handshake_request()` timing and
+`verify_response_proof(..., skew_seconds=document["clockSkewSeconds"])`.
+
 ## Examples
 
 See `examples/`:
