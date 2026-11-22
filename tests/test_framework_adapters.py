@@ -234,3 +234,24 @@ class TestCrewAI:
 
         result = filter_crewai_tools_by_scope([allowed_tool, denied_tool], client, did)
         assert [t.name for t in result] == ["get_orders"]
+
+
+class TestAgentScopes:
+    def test_scopes_come_from_the_active_credential_and_none_is_an_error(self) -> None:
+        from helix_sdk.agent_scopes import get_agent_scopes
+
+        client = MagicMock()
+        client.list_vcs.return_value = [{"scopes": ["read:orders"]}]
+        assert get_agent_scopes(client, "did:key:zA") == ["read:orders"]
+        client.list_vcs.assert_called_with(subject_did="did:key:zA", status="active")
+        client.list_vcs.return_value = []
+        with pytest.raises(RuntimeError, match="No active credential"):
+            get_agent_scopes(client, "did:key:zA")
+
+    def test_the_langchain_callback_handler_signs_nothing(self) -> None:
+        pytest.importorskip("langchain_core", reason="langchain-core requires Python >= 3.10")
+        from helix_langchain import HelixIDCallbackHandler
+
+        handler = HelixIDCallbackHandler("did:key:zA", "did:web:orders.example.com")
+        assert (handler.agent_did, handler.audience) == ("did:key:zA", "did:web:orders.example.com")
+        assert handler.on_tool_start({}, "input") is None
