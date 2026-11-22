@@ -8,7 +8,7 @@ the twin of helix-sdk-js's ``mcp-middleware/src/audit.ts``.
 
 The gate in middleware.py hands ``audit_sink`` one ``ToolAuditEvent`` per
 authorization decision; ``McpAuditTrail.tool_audit_sink()`` turns each into
-the typed events of the protocol (``proof.verified``, ``delegation.verified``,
+the typed events of the protocol (``proof.verified`` / ``proof.rejected``,
 ``authorization.approved`` / ``authorization.denied``), and
 ``begin_tool_call()`` records the call's own lifecycle
 (``session.established``, ``tool.call.started`` / ``completed`` / ``failed`` /
@@ -34,14 +34,10 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from helix_sdk.audit import (
     AUDIT_BINDING_MCP,
-    UNKNOWN_DELEGATION_REF,
     AuditSink as TypedAuditSink,
     AuditTrail,
     AuditTrailEntry,
     PartyRef,
-    credential_digest,
-    delegation_chain_digests,
-    delegation_ref,
     keyed_commitment_value,
     pairwise_did,
     public_did,
@@ -54,15 +50,11 @@ timestamp, authMethod ('kyaos' | 'oauth'), effectiveScopes, and when known
 agentDid (the DID the request proof verified as), level and fresh (KYA-OS
 callers: the level the local verifier derived, story F-2, and whether every
 status was read live), oauthSubject (never recorded as such), toolName,
-requiredScope, reason, serviceDid; ``correlationId`` and ``delegation`` (a
-``DelegationEvidence``) default to the current ``begin_tool_call()``."""
+requiredScope, reason, serviceDid; ``correlationId`` defaults to the current
+``begin_tool_call()``."""
 
 AuditSink = Callable[[ToolAuditEvent], None]
 """Receives every decision for an identified caller, before the tool runs."""
-
-DelegationEvidence = Dict[str, Any]
-"""SPEC section 7.8: how the presented delegation credential and its chain are
-referenced, ``{delegationRef?, delegationCredentialDigest?, delegationChainDigests?}``."""
 
 McpAuditContext = Dict[str, Any]
 """What every event of a tool call shares: ``actor``, ``responsibleParty``,
@@ -74,47 +66,6 @@ AuditContext = McpAuditContext
 OAUTH_SUBJECT_KEY_ID = "oauth-subject-v1"
 """The keyId of the keyed commitment an OAuth subject is recorded as."""
 
-_DELEGATION_MEMBERS = ("delegationRef", "delegationCredentialDigest", "delegationChainDigests")
-
-
-def _is_agent_credential(value: Any) -> bool:
-    if not isinstance(value, dict):
-        return False
-    types = value.get("type")
-    if isinstance(types, list) and "HelixAgentCredential" in types:
-        return True
-    subject = value.get("credentialSubject")
-    return isinstance(subject, dict) and subject.get("type") == "HelixAgent"
-
-
-def delegation_evidence_of(credential: Any) -> Optional[DelegationEvidence]:
-    """The delegation evidence of a decoded HelixID VP (SPEC section 7.8): the
-    presented credential is its last agent credential, the chain is that
-    credential's ``delegationChain`` (root first) followed by the credential
-    itself. None when the value is not a VP or shows no agent credential."""
-    if not isinstance(credential, dict):
-        return None
-    presented_list = credential.get("verifiableCredential")
-    if not isinstance(presented_list, list):
-        return None
-    agents = [vc for vc in presented_list if _is_agent_credential(vc)]
-    if not agents:
-        return None
-    presented = agents[-1]
-    chain = presented.get("delegationChain")
-    ref = delegation_ref(presented)
-    digest = credential_digest(presented)
-    chain_digests = delegation_chain_digests([*(chain if isinstance(chain, list) else []), presented])
-    evidence: DelegationEvidence = {}
-    if ref is not None:
-        evidence["delegationRef"] = ref
-    if digest is not None:
-        evidence["delegationCredentialDigest"] = digest
-    if chain_digests is not None:
-        evidence["delegationChainDigests"] = chain_digests
-    return evidence
-
-
 _GUARD_REASONS = frozenset({"tool is not in toolScopes", "insufficient scope", "needs_authorization"})
 """The guard's own denials of an identified caller; any other reason a KYA-OS caller is denied with is the local verifier's."""
 
@@ -123,17 +74,6 @@ def _kyaos_verification_code(event: ToolAuditEvent) -> str:
     """``KYAOS_PROOF_<level>``, with ``_CACHED`` when the verifier did not read every status live (story F-2)."""
     level = event.get("level")
     return "KYAOS_PROOF" + (f"_{level}" if isinstance(level, str) else "") + ("_CACHED" if event.get("fresh") is False else "")
-
-
-def _delegation_authorization(delegation: DelegationEvidence, decision: str, scope_id: Optional[str] = None) -> Dict[str, Any]:
-    """The authorization evidence that carries the delegation members (``decision`` as given)."""
-    authorization: Dict[str, Any] = {"source": "delegation", "decision": decision}
-    if scope_id is not None:
-        authorization["scopeId"] = scope_id
-    for member in _DELEGATION_MEMBERS:
-        if delegation.get(member) is not None:
-            authorization[member] = delegation[member]
-    return authorization
 
 
 class ToolCallAudit:
@@ -145,7 +85,6 @@ class ToolCallAudit:
         correlation_id: str,
         tool_name: Optional[str],
         actor: Optional[PartyRef],
-        delegation: Optional[DelegationEvidence],
     ) -> None:
         self._audit = audit
         self.correlation_id = correlation_id
@@ -153,8 +92,6 @@ class ToolCallAudit:
         self.tool_name = tool_name
         self.actor = actor
         """The caller, once known (given at ``begin_tool_call``, or learned from the authorization decision)."""
-        self.delegation = delegation
-        """The presented delegation credential's evidence, when the credential was a HelixID VP."""
 
     def started(self) -> Optional[AuditTrailEntry]:
         """The tool is about to run."""
@@ -320,22 +257,18 @@ class McpAuditTrail:
         tool_name: Optional[str] = None,
         correlation_id: Optional[str] = None,
         actor: Optional[PartyRef] = None,
-        credential: Any = None,
     ) -> Iterator[ToolCallAudit]:
         """Starts one tool call's audit: records ``session.established``, then
         yields the call with itself as the current context, so a gate sink
         called inside attributes its events to this call (same correlation
         id, same actor). Call ``started()`` / ``completed()`` / ``failed()`` /
-        ``denied()`` as the call goes. When ``credential`` is a decoded HelixID
-        VP its agent credential becomes the delegation evidence the sink
-        attaches to ``proof.verified`` and ``delegation.verified``.
-        ``correlation_id`` defaults to ``audit_<uuid>``."""
+        ``denied()`` as the call goes. ``correlation_id`` defaults to
+        ``audit_<uuid>``."""
         call = ToolCallAudit(
             self,
             correlation_id or f"audit_{uuid.uuid4()}",
             tool_name,
             actor,
-            delegation_evidence_of(credential),
         )
         self.session("established", True, context=call.context())
         token = _CURRENT_CALL.set(call)
@@ -351,7 +284,6 @@ class McpAuditTrail:
         decision into the typed events. A KYA-OS caller (story F-2):
         ``proof.verified``, its verification code naming the level the local
         verifier derived (and ``_CACHED`` when a status was not read live),
-        then ``delegation.verified`` when the presented credential is known,
         then ``authorization.approved`` or ``authorization.denied`` (reason
         ``needs_authorization`` for an L3-E challenge); a request proof the
         verifier refused is ``proof.rejected`` by its first reason code, and
@@ -365,9 +297,6 @@ class McpAuditTrail:
                 actor = call.actor
             if call is not None and call.actor is None and actor is not None:
                 call.actor = actor
-            delegation = event.get("delegation") if isinstance(event.get("delegation"), dict) else None
-            if delegation is None and call is not None:
-                delegation = call.delegation
             base: McpAuditContext = {}
             if actor is not None:
                 base["actor"] = actor
@@ -383,25 +312,11 @@ class McpAuditTrail:
                 self.proof("rejected", "denied", reason_code=reason.split(",")[0].strip() or "proof_invalid", context=base)
                 return
             if kyaos:
-                proof_context = dict(base)
-                if delegation is not None:
-                    proof_context["authorization"] = _delegation_authorization(delegation, "allowed")
-                self.proof("verified", "succeeded", verification_code=_kyaos_verification_code(event), context=proof_context)
-                if delegation is not None:
-                    ref = delegation.get("delegationRef")
-                    self.delegation(
-                        "verified",
-                        ref if isinstance(ref, str) else UNKNOWN_DELEGATION_REF,
-                        "succeeded",
-                        context={**base, "authorization": _delegation_authorization(delegation, "allowed")},
-                    )
+                self.proof("verified", "succeeded", verification_code=_kyaos_verification_code(event), context=dict(base))
             decision = "allowed" if allowed else "denied"
-            if kyaos and delegation is not None:
-                authorization = _delegation_authorization(delegation, decision, scope_id)
-            else:
-                authorization = {"source": "delegation" if kyaos else "policy", "decision": decision}
-                if scope_id is not None:
-                    authorization["scopeId"] = scope_id
+            authorization: Dict[str, Any] = {"source": "delegation" if kyaos else "policy", "decision": decision}
+            if scope_id is not None:
+                authorization["scopeId"] = scope_id
             context = {**base, "authorization": authorization}
             if allowed:
                 self.authorization("approved", "succeeded", context=context, tool_name=tool_name)
@@ -558,7 +473,6 @@ def create_helix_audit_sink(
 __all__: List[str] = [
     "AuditContext",
     "AuditSink",
-    "DelegationEvidence",
     "McpAuditContext",
     "McpAuditTrail",
     "OAUTH_SUBJECT_KEY_ID",
@@ -568,5 +482,4 @@ __all__: List[str] = [
     "create_helix_audit_sink",
     "create_mcp_audit_trail",
     "current_tool_call",
-    "delegation_evidence_of",
 ]

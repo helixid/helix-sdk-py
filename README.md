@@ -93,15 +93,17 @@ same results, which `tests/test_verifier.py` proves over the fixture set helix-c
   needs and denies unlisted tools; every decision goes to `audit_sink`
   (`create_helix_audit_sink()` writes to the HelixID audit log). Since KYA-OS
   story A-1 the log holds typed producer events (AAP-1 Recorded): each
-  decision becomes `proof.verified`, `delegation.verified` and
-  `authorization.approved` / `authorization.denied`, strictly validated,
+  decision of a KYA-OS caller becomes `proof.verified` (verification code
+  `KYAOS_PROOF_<level>`, `_CACHED` when a status was not read live) then
+  `authorization.approved` / `authorization.denied`, a refused request proof
+  `proof.rejected` by its first reason code, strictly validated,
   sequenced per source with `previousSourceEventDigest`, digested and posted
   to `POST /v1/audit-log/events`. For a tool call's whole lifecycle build an
   `McpAuditTrail` with `create_mcp_audit_trail(create_helix_audit_reporter(url,
   key), service_did)`, pass `audit.tool_audit_sink()` as `audit_sink`, and
-  wrap each call in `with audit.begin_tool_call(tool_name, credential=vp)`,
+  wrap each call in `with audit.begin_tool_call(tool_name)`,
   as `examples/mcp_order_management` does. No event holds tool arguments, a
-  response, a token or a VP; an OAuth subject is a keyed commitment; tool
+  response, a token or a credential; an OAuth subject is a keyed commitment; tool
   names only with `include_tool_names=True`. The typed events themselves
   (`AuditTrail`, the strict validator, digests, SPEC 7.8 references, the
   evidence vault) are `helix_sdk.audit`.

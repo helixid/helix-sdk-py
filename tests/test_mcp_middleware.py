@@ -33,8 +33,6 @@ from helix_sdk.audit import (
     AuditTrailEntry,
     MemoryAuditSink,
     audit_event_digest,
-    credential_digest,
-    delegation_chain_digests,
     keyed_commitment_value,
     pairwise_did,
     public_did,
@@ -58,7 +56,6 @@ from helix_mcp_middleware import (
     create_mcp_audit_trail,
     create_needs_authorization,
     current_tool_call,
-    delegation_evidence_of,
     create_introspection_validator,
     create_jwt_validator,
     create_oauth_validator,
@@ -742,17 +739,6 @@ def posted(call: Dict[str, Any]) -> Any:
     return json.loads(call["data"].decode("utf-8"))
 
 
-def _agent_vc(vc_id: str) -> Dict[str, Any]:
-    """An agent credential signed the way SPEC section 7.8 reads it (proofValue is base64)."""
-    return {
-        "id": vc_id,
-        "type": ["VerifiableCredential", "HelixAgentCredential"],
-        "issuer": "did:web:issuer.example",
-        "credentialSubject": {"id": "did:key:a"},
-        "proof": {"type": "Ed25519Signature2020", "proofValue": "AQIDBA=="},
-    }
-
-
 class TestAudit:
     def test_events_for_kyaos_callers(self) -> None:
         events: List[Dict[str, Any]] = []
@@ -1013,34 +999,15 @@ class TestAudit:
         assert "authorization" not in proof and proof["details"] == {"family": "proof", "phase": "verified", "verificationCode": "KYAOS_PROOF"}
         assert approved["authorization"] == {"source": "delegation", "decision": "allowed"} and approved["outcome"] == "succeeded"
 
-    def test_sink_records_delegation_verified_when_the_decision_carries_the_presented_credential(self) -> None:
-        memory = MemoryAuditSink()
-        sink = create_mcp_audit_trail(memory, "did:web:svc").tool_audit_sink()
-        delegation = {"delegationRef": "urn:uuid:d", "delegationCredentialDigest": "sha256:" + "a" * 64, "delegationChainDigests": ["sha256:" + "a" * 64], "ignored": None}
-        sink({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "kyaos", "agentDid": "did:key:a", "effectiveScopes": [], "delegation": delegation})
-        proof, verified, approved = memory.events
-        expected = {"source": "delegation", "decision": "allowed", "delegationRef": "urn:uuid:d", "delegationCredentialDigest": "sha256:" + "a" * 64, "delegationChainDigests": ["sha256:" + "a" * 64]}
-        assert memory.event_types == ["proof.verified", "delegation.verified", "authorization.approved"]
-        assert proof["authorization"] == verified["authorization"] == approved["authorization"] == expected
-        assert verified["details"] == {"family": "delegation", "phase": "verified", "delegationRef": "urn:uuid:d"}
-
-    def test_sink_names_an_id_less_presented_credential_unknown(self) -> None:
-        memory = MemoryAuditSink()
-        create_mcp_audit_trail(memory, "did:web:svc").tool_audit_sink()({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "kyaos", "effectiveScopes": [], "delegation": {}})
-        assert memory.events[1]["details"]["delegationRef"] == "unknown"
-        assert memory.events[1]["authorization"] == {"source": "delegation", "decision": "allowed"}
-
     def test_sink_a_helixid_caller_denied(self) -> None:
         memory = MemoryAuditSink()
         sink = create_mcp_audit_trail(memory, "did:web:svc").tool_audit_sink()
         sink({"event": "AUTHZ_DENIED", "result": "denied", "authMethod": "kyaos", "agentDid": "did:key:a", "effectiveScopes": [], "requiredScope": "write"})
-        sink({"event": "AUTHZ_DENIED", "result": "denied", "authMethod": "kyaos", "agentDid": "did:key:a", "effectiveScopes": [], "delegation": {"delegationRef": "urn:uuid:d"}})
+        sink({"event": "AUTHZ_DENIED", "result": "denied", "authMethod": "kyaos", "agentDid": "did:key:a", "effectiveScopes": [], "reason": "tool is not in toolScopes"})
         events = memory.events
-        assert memory.event_types == ["proof.verified", "authorization.denied", "proof.verified", "delegation.verified", "authorization.denied"]
+        assert memory.event_types == ["proof.verified", "authorization.denied", "proof.verified", "authorization.denied"]
         assert events[1]["reason"] == {"code": "insufficient_scope"} and events[1]["authorization"] == {"source": "delegation", "decision": "denied", "scopeId": "write"}
-        assert events[4]["reason"] == {"code": "tool_not_permitted"} and events[4]["authorization"] == {"source": "delegation", "decision": "denied", "delegationRef": "urn:uuid:d"}
-        sink({"event": "AUTHZ_DENIED", "result": "denied", "authMethod": "kyaos", "agentDid": "did:key:a", "effectiveScopes": [], "requiredScope": "write", "delegation": {"delegationRef": "urn:uuid:d"}})
-        assert memory.events[-1]["authorization"] == {"source": "delegation", "decision": "denied", "scopeId": "write", "delegationRef": "urn:uuid:d"}
+        assert events[3]["reason"] == {"code": "tool_not_permitted"} and events[3]["authorization"] == {"source": "delegation", "decision": "denied"}
 
     def test_sink_an_oauth_caller(self) -> None:
         memory = MemoryAuditSink()
@@ -1083,7 +1050,7 @@ class TestAudit:
         with audit.begin_tool_call("q") as call:
             assert call.correlation_id.startswith("audit_") and len(call.correlation_id) == len("audit_") + 36
         with audit.begin_tool_call("q", correlation_id="call-1") as call:
-            assert call.correlation_id == "call-1" and call.tool_name == "q" and call.delegation is None
+            assert call.correlation_id == "call-1" and call.tool_name == "q"
         assert current_tool_call() is None
 
     def test_begin_tool_call_joins_the_gate_decision_and_the_lifecycle(self) -> None:
@@ -1138,43 +1105,6 @@ class TestAudit:
         assert "correlationId" not in events[0] and "actor" not in events[0]
         assert events[2]["correlationId"] == "inside" and events[2]["actor"] == pairwise_did("did:key:a")
         assert events[3]["correlationId"] == "explicit" and events[3]["actor"] == pairwise_did("did:key:b")
-
-    def test_begin_tool_call_derives_delegation_evidence_from_a_decoded_vp(self) -> None:
-        memory = MemoryAuditSink()
-        audit = create_mcp_audit_trail(memory, "did:web:svc")
-        parent = _agent_vc("urn:uuid:parent")
-        leaf = {**_agent_vc("urn:uuid:leaf"), "delegationChain": [parent]}
-        vp = {"verifiableCredential": [_agent_vc("urn:uuid:other"), {"type": ["VerifiableCredential", "DelegationGrantCredential"]}, leaf]}
-        expected = {
-            "delegationRef": "urn:uuid:leaf",
-            "delegationCredentialDigest": credential_digest(leaf),
-            "delegationChainDigests": delegation_chain_digests([parent, leaf]),
-        }
-        with audit.begin_tool_call("q", credential=vp) as call:
-            assert call.delegation == expected
-            audit.tool_audit_sink()({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "kyaos", "agentDid": "did:key:a", "effectiveScopes": []})
-        assert memory.event_types == ["session.established", "proof.verified", "delegation.verified", "authorization.approved"]
-        authorization = {"source": "delegation", "decision": "allowed", **expected}
-        assert memory.events[1]["authorization"] == memory.events[2]["authorization"] == memory.events[3]["authorization"] == authorization
-        assert memory.events[2]["details"]["delegationRef"] == "urn:uuid:leaf"
-        # A decision that carries its own delegation wins over the call's.
-        with audit.begin_tool_call("q", credential=vp):
-            audit.tool_audit_sink()({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "kyaos", "agentDid": "did:key:a", "effectiveScopes": [], "delegation": {"delegationRef": "urn:uuid:own"}})
-        assert memory.events[-2]["details"]["delegationRef"] == "urn:uuid:own"
-
-    def test_delegation_evidence_of(self) -> None:
-        assert delegation_evidence_of(None) is None
-        assert delegation_evidence_of({"verifiableCredential": "x"}) is None
-        assert delegation_evidence_of({"verifiableCredential": [{"type": ["VerifiableCredential"]}, "x"]}) is None
-        by_subject = {"credentialSubject": {"type": "HelixAgent", "id": "did:key:a"}, "proof": {"proofValue": "AQIDBA=="}}
-        assert delegation_evidence_of({"verifiableCredential": [by_subject]}) == {
-            "delegationCredentialDigest": credential_digest(by_subject),
-            "delegationChainDigests": [credential_digest(by_subject)],
-        }
-        unsigned = {"id": "urn:uuid:u", "type": ["HelixAgentCredential"]}
-        assert delegation_evidence_of({"verifiableCredential": [unsigned]}) == {"delegationRef": "urn:uuid:u"}
-        assert delegation_evidence_of({"verifiableCredential": [{**unsigned, "delegationChain": "x"}]}) == {"delegationRef": "urn:uuid:u"}
-
 
 def test_async_wrapper_runs_the_same_gate() -> None:
     mw = async_helixid_mcp_middleware(MCPMiddlewareOptions(verifier=verifying(["read"]), tool_scopes={"q": ["read"]}))
