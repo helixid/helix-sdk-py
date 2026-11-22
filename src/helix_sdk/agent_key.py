@@ -26,7 +26,7 @@ import base64
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Union
+from typing import Any, Literal, Mapping, Optional, TypedDict, Union
 
 import nacl.signing
 
@@ -42,6 +42,26 @@ _BASE64URL = re.compile(r"^[A-Za-z0-9_-]*$")
 _HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 # Member names that only ever carry private material.
 _PRIVATE_MATERIAL_MEMBERS = frozenset(["d", "privateKey", "privateKeyHex", "private_key", "seed", "secret"])
+
+
+class _AgentPublicKeyJwkMembers(TypedDict):
+    kty: Literal["OKP"]
+    crv: Literal["Ed25519"]
+    x: str
+
+
+class AgentPublicKeyJwk(_AgentPublicKeyJwkMembers, total=False):
+    """An Ed25519 public key as RFC 8037 writes it; ``kid`` only when given (AgentPublicKeyJwk in helix-sdk-js)."""
+
+    kid: str
+
+
+class AgentKeyRegistration(TypedDict):
+    """The body of POST /v1/agents/{did}/keys (AgentKeyRegistration in helix-sdk-js)."""
+
+    publicKeyJwk: AgentPublicKeyJwk
+    #: Verification-method fragment: the published id is ``<did>#<kid>``.
+    kid: str
 
 
 @dataclass(frozen=True)
@@ -69,19 +89,18 @@ def _public_key_bytes(public_key: Union[str, bytes, bytearray]) -> bytes:
         if _HEX64.match(public_key) is None:
             raise ValueError("An Ed25519 public key is 32 bytes (64 hex characters)")
         return bytes.fromhex(public_key)
-    raw = bytes(public_key)
-    if len(raw) != _ED25519_PUBLIC_KEY_LENGTH:
+    if not isinstance(public_key, (bytes, bytearray)) or len(public_key) != _ED25519_PUBLIC_KEY_LENGTH:
         raise ValueError("An Ed25519 public key is 32 bytes (64 hex characters)")
-    return raw
+    return bytes(public_key)
 
 
 def base64url_encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
-def to_public_key_jwk(public_key: Union[str, bytes, bytearray], kid: Optional[str] = None) -> Dict[str, Any]:
+def to_public_key_jwk(public_key: Union[str, bytes, bytearray], kid: Optional[str] = None) -> AgentPublicKeyJwk:
     """{"kty": "OKP", "crv": "Ed25519", "x": ...} of the public key; ``kid`` only when given."""
-    jwk: Dict[str, Any] = {"kty": "OKP", "crv": "Ed25519", "x": base64url_encode(_public_key_bytes(public_key))}
+    jwk: AgentPublicKeyJwk = {"kty": "OKP", "crv": "Ed25519", "x": base64url_encode(_public_key_bytes(public_key))}
     if kid is not None:
         jwk["kid"] = kid
     return jwk
@@ -147,15 +166,22 @@ def public_key_jwk_bytes(jwk: Any) -> bytes:
 
 def agent_key_registration(
     public_key: Union[str, bytes, bytearray, Mapping[str, Any]], kid: Optional[str] = None
-) -> Dict[str, Any]:
+) -> AgentKeyRegistration:
     """The body of POST /v1/agents/{did}/keys: the public JWK (kty, crv, x, nothing
     else) and the verification-method fragment. Takes the public key as hex,
-    bytes or JWK; a JWK with ``d`` or any other member is refused."""
-    raw = public_key_jwk_bytes(public_key) if isinstance(public_key, Mapping) else _public_key_bytes(public_key)
+    bytes or JWK; a JWK with ``d`` or any other member is refused. Anything
+    else that is not a JSON object (None, a list) is refused as helix-sdk-js
+    refuses it, never read as key bytes."""
+    if isinstance(public_key, (str, bytes, bytearray)):
+        raw = _public_key_bytes(public_key)
+    elif public_key is None or isinstance(public_key, (Mapping, list, tuple)):
+        raw = public_key_jwk_bytes(public_key)
+    else:
+        raw = _public_key_bytes(public_key)
     fragment = DEFAULT_AGENT_KEY_ID if kid is None else kid
     if not isinstance(fragment, str) or not fragment:
         raise ValueError("kid must be a non-empty verification-method fragment")
-    body = {"publicKeyJwk": to_public_key_jwk(raw), "kid": fragment}
+    body: AgentKeyRegistration = {"publicKeyJwk": to_public_key_jwk(raw), "kid": fragment}
     assert_no_private_material(body)
     return body
 
