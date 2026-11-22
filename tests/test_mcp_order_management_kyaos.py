@@ -31,6 +31,7 @@ from helix_sdk import kyaos  # noqa: E402
 from helix_sdk.did import build_did_document  # noqa: E402
 from helix_sdk.keys import generate_key_pair  # noqa: E402
 from helix_sdk.vp_transport import encode_helix_vp  # noqa: E402
+from helix_sdk.audit import MemoryAuditSink  # noqa: E402
 from helix_mcp_middleware import (  # noqa: E402
     KyaOsOptions,
     KyaOsSessionOptions,
@@ -38,6 +39,7 @@ from helix_mcp_middleware import (  # noqa: E402
     MemoryNonceStore,
     RedisNonceStore,
     create_kyaos,
+    create_mcp_audit_trail,
 )
 from mcp_order_management import __main__ as entry  # noqa: E402
 from mcp_order_management.app import create_order_app  # noqa: E402
@@ -82,7 +84,7 @@ class Clock:
 
 
 class App:
-    def __init__(self, nonce_store: Any = None) -> None:
+    def __init__(self, nonce_store: Any = None, audited: bool = False) -> None:
         self.clock = Clock()
         self.errors: List[BaseException] = []
         self.kyaos = create_kyaos(
@@ -91,8 +93,13 @@ class App:
                 nonce_store=nonce_store if nonce_store is not None else MemoryNonceStore(now=self.clock.now),
             )
         )
-        options = MCPMiddlewareOptions(client=fake_client(), service_did=SERVICE, validate_oauth_token=validate)
-        self.http = TestClient(create_order_app(f"{BASE}/mcp", options, on_server_error=self.errors.append, kyaos=self.kyaos), base_url=BASE)
+        # With `audited`, A-1's typed audit trail runs alongside the KYA-OS layer.
+        self.audit_sink = MemoryAuditSink()
+        audit = create_mcp_audit_trail(self.audit_sink, SERVICE) if audited else None
+        options = MCPMiddlewareOptions(
+            client=fake_client(), service_did=SERVICE, validate_oauth_token=validate, audit_sink=audit.tool_audit_sink() if audit else None
+        )
+        self.http = TestClient(create_order_app(f"{BASE}/mcp", options, on_server_error=self.errors.append, kyaos=self.kyaos, audit=audit), base_url=BASE)
         self.next_id = 1
 
     def rpc(self, method: str, params: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> Any:
@@ -354,3 +361,40 @@ class TestKyaOsFromEnv:
         # The public origin defaults to the resource's origin, and is accepted as audience.
         request = kyaos.create_handshake_request(audience="http://localhost:3700")
         assert asyncio.run(defaults.handshake(request))["serverDid"] == SERVICE
+
+
+class TestWithTheTypedAuditTrail:
+    """KYA-OS (story L2-A) and the typed audit events (story A-1) together, as the JS sample's tests do."""
+
+    def test_records_the_lifecycle_of_a_call_and_still_signs_its_proof_and_not_the_handshake(self) -> None:
+        instance = App(audited=True)
+        with instance.http:
+            session = instance.session(agentDid=AGENT)
+            assert instance.audit_sink.events == []
+            res = instance.call("lookup_order", {"orderId": "ORD-1001", "_kyaos_session": session}, vp("vp:ok-9"))
+        assert res.status_code == 200, res.text
+        assert res.json()["result"]["_meta"][PROOF]["meta"]["outcome"] == "allowed"
+        sink = instance.audit_sink
+        assert sink.event_types == ["session.established", "proof.verified", "authorization.approved", "tool.call.started", "tool.call.completed"]
+        assert len({event["correlationId"] for event in sink.events}) == 1
+        assert all(event["actor"]["kind"] == "pairwise_did" for event in sink.events[1:])
+        assert "ORD-1001" not in str(sink.events)
+
+    def test_records_a_denied_call_by_its_code_and_still_answers_with_the_denied_proof(self) -> None:
+        instance = App(audited=True)
+        with instance.http:
+            res = instance.call("refund_order", {"orderId": "ORD-1001", "reason": "x"}, bearer("reader"))
+        assert res.status_code == 403
+        assert res.json()["_meta"][PROOF]["meta"]["outcome"] == "denied"
+        assert instance.audit_sink.event_types == ["session.established", "authorization.denied", "tool.call.denied"]
+        assert instance.audit_sink.events[2]["reason"] == {"code": "insufficient_scope"}
+
+    def test_a_proof_that_cannot_be_started_is_a_failed_call(self) -> None:
+        instance = App(audited=True)
+        with instance.http:
+            instance.kyaos.start = MagicMock(side_effect=RuntimeError("nonce store down"))  # type: ignore[method-assign]
+            res = instance.call("lookup_order", {"orderId": "ORD-1001"}, bearer("reader"))
+        assert res.status_code == 500
+        assert instance.audit_sink.event_types == ["session.established", "tool.call.failed"]
+        assert instance.audit_sink.events[1]["reason"] == {"code": "server_error"}
+
