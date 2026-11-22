@@ -126,7 +126,7 @@ from .entity_card import (
 
 # KYA-OS story F-3: custody preference. helix_init (self-custody onboarding),
 # HelixCustodialSigner (custodial agents sign through the API), the custody
-# API client; the agent runtime takes any Signer (VPBuilder.sign_with).
+# API client; the agent runtime takes any Signer (a request proof: helix_sdk.verifier.sign_request_proof).
 from . import custody  # noqa: F401  (helix-sdk-js exports it as the `custody` namespace)
 from .custody import (
     CustodyApiError,
@@ -151,6 +151,7 @@ from .errors import (  # noqa: F401
     HelixError,
     InvalidJWSError,
     ResponseProofError,
+    NeedsAuthorizationError,
     map_api_error,
     ValidationError,
     InternalError,

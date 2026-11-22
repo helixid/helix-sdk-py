@@ -64,15 +64,32 @@ signature, same base58btc-encoded proof value, in every language. See
 If you regenerate the vectors in `helix-server` (`pnpm generate:golden-vectors`),
 re-copy the three JSON files here too, the same way `helix-sdk-js` does.
 
+## Local verifier (KYA-OS story F-2)
+
+`helix_sdk.verifier.verify(proof, seams, options, chain=..., request=..., card=...)` verifies a KYA-OS request proof
+(`org.kya-os/proof.v1`) and the delegation chain the request carries, in-process, from the presented artifacts and
+what its seams answer (`resolve_did`, `resolve_did_keys`, `fetch_status_list`, `resolve_card`, `nonce_store`, `clock`,
+`trusted_issuers`). It never reads a Helix database, and a missing seam fails closed with its reason code
+(`helix_sdk.verifier.ReasonCodes`). It is the port of helix-sdk-js's `kyaos.verifier.verify`: same seams, same codes,
+same results, which `tests/test_verifier.py` proves over the fixture set helix-core generates
+(`fixtures/verifier/*.json`, read from the sibling checkout or `HELIX_CORE_FIXTURES_DIR`).
+
+`python -m helix_sdk.conformance [vectors_dir]` runs the KYA-OS vector categories `signed-proof`, `delegation-chain`,
+`status-list`, `did-key`, `did-web`, `card-proof` and `entity-card` through `helix_sdk.conformance.HelixConformanceAdapter`.
+
 ## Packages in this repo
 
 - **`helix_sdk`** -- core SDK (see Quick example below).
 - **`helix_mcp_middleware`** -- Model Context Protocol integration, the same
   Phase 1 surface as `@helixid/mcp-middleware`:
   `helixid_mcp_middleware()` / `async_helixid_mcp_middleware()` gate every
-  incoming tool call. A caller presents a HelixID VP
-  (`Authorization: HelixVP`, `X-Helix-VP`, or MCP `_meta["x-helix-vp"]`) or
-  an OAuth 2.1 bearer token; `tool_scopes` maps each tool to the scopes it
+  incoming tool call. A caller presents a KYA-OS request proof (MCP
+  `_meta["org.kya-os/request-proof"]`, with its delegation chain at
+  `_meta["org.kya-os/delegation-chain"]`), which the gate verifies in-process
+  with `helix_sdk.verifier` (`verifier=LocalVerifierOptions(...)` or
+  `create_local_verifier()`, story F-2; the Helix API is never asked), or an
+  OAuth 2.1 bearer token. The Helix VP (`HelixVP`, `X-Helix-VP`,
+  `_meta["x-helix-vp"]`) is no longer read. `tool_scopes` maps each tool to the scopes it
   needs and denies unlisted tools; every decision goes to `audit_sink`
   (`create_helix_audit_sink()` writes to the HelixID audit log).
   `oauth=` takes one trusted issuer or a list: `OAuthIssuerOptions(issuer,
@@ -80,8 +97,7 @@ re-copy the three JSON files here too, the same way `helix-sdk-js` does.
   presets `entra()`, `auth0()`, `okta()`, `keycloak()`; opaque tokens are
   checked by RFC 7662 introspection at the one issuer you run.
   `to_http_error_response()` and `build_protected_resource_metadata()` give
-  the 401 / 403 challenges and the RFC 9728 document. `attach_helix_vp()`
-  attaches a VP to an outgoing call. A runnable server is in
+  the 401 / 403 challenges and the RFC 9728 document. A runnable server is in
   [`examples/mcp_order_management`](examples/mcp_order_management).
   Install with the `mcp-middleware` extra:
   `pip install helixid-sdk-py[mcp-middleware]`.
@@ -159,6 +175,58 @@ falls back to memory. One startup line on the `helix_mcp_middleware.kyaos` logge
 Redis password is shown as `***`); memory with `ENV` or `NODE_ENV` set to `production` also warns that it covers one
 process only.
 
+## KYA-OS signed `needs_authorization` and resume (story L3-E)
+
+Server side (`helix_mcp_middleware`): when a caller is identified but its delegation does not cover the tool's scopes, the gate answers with the SPEC §9.2 challenge instead of a plain 403: `{"error": "needs_authorization", "message", "authorizationUrl", "resumeToken", "expiresAt", "scopes", "display"?}`. Under the KYA-OS runtime it is the call's tool result, signed with `outcome: needs_authorization` and a `responseHash` over the whole result, so `authorizationUrl` is covered by the service signature.
+
+```python
+from helix_mcp_middleware import MCPMiddlewareOptions, NeedsAuthorizationOptions, create_needs_authorization
+
+needs_authorization = create_needs_authorization(NeedsAuthorizationOptions(
+    authorization_url=lambda c: f"https://consent.example/authorize?tool={c.tool}",
+    ttl_seconds=600,              # resume-token lifetime
+    # store: default follows KYAOS_NONCE_STORE (resume_token_store_from_env: Redis on KYAOS_REDIS_URL, else memory)
+    authorizer=verify_delegation, # the seam stories F-2 and L3-H implement; default refuses every retry
+    audit_sink=audit_sink,        # every challenge: AUTHZ_DENIED, reason "needs_authorization"
+))
+options = MCPMiddlewareOptions(..., needs_authorization=needs_authorization)
+```
+
+The resume token is opaque, bound to the agent, tool and scopes, single-use and gone at `expiresAt`; a retry carries it as the `_kyaos_resume` control argument and the new DelegationCredential as `_kyaos_delegation`. Completing consent alone never authorises the call. With `async_helixid_mcp_middleware` the store, authorizer and audit sink may be async. Client side (`helix_sdk.needs_authorization`): `handle_needs_authorization(response, service_did, resolve_did, request=...)` verifies the challenge's proof, recomputing both hashes, before it surfaces the URL; `retry_with_resume(resume_token, hop, call=..., send=...)` retries with the token and the credential.
+
+## The `/.well-known/mcp` discovery document (`helix_mcp_middleware`, story L1-D)
+
+`create_well_known_mcp()` builds the KYA-OS discovery document from config, validates it against the vendored
+`well-known-mcpi.json` schema at startup (raising `WellKnownMcpError` with the schema's complaints) and serves it over
+ASGI; for the same config it is byte for byte the document `@helixid/mcp-middleware`'s `createWellKnownMcp()` serves.
+
+```python
+from helix_mcp_middleware import create_well_known_mcp
+
+well_known = create_well_known_mcp(
+    public_origin="https://mcp.example.com",   # the origin agents connect to; required, never the bind address
+    server_did="did:web:mcp.example.com",       # did:web or did:key; required
+    tools_endpoint="/mcp",                       # path at public_origin, or an absolute URL there
+    kyaos=kya.describe(),                        # proofs, the handshake and the skew from the L2-A layer
+    status_list_credential="https://mcp.example.com/credentials/status/1",  # optional
+    capabilities={"delegation": False, "statusList": False, "crisp": False},  # each true only while that feature is on
+)
+
+async def app(scope, receive, send):
+    if await well_known.handle(scope, receive, send):  # GET / HEAD /.well-known/mcp; False for anything else
+        return
+    ...
+# any other host: well_known.respond() is (status, headers, body)
+```
+
+`enabled=False` answers 404. Validation needs `jsonschema` (in the `mcp-middleware` and `all` extras); the `uri`,
+`uri-reference` and `email` formats are checked with ajv-formats' own expressions, so both languages refuse the same
+documents with the same messages. Route `/.well-known/mcp` at your origin root to the middleware: helix-sdk-js's
+`mcp-middleware/docs/well-known.md` has the nginx, ALB and API Gateway rules and the `public_origin` rule. The client
+side is `helix_sdk.kyaos.fetch_well_known_mcp(origin)` / `read_well_known_mcp(document)`, which fill
+`clockSkewSeconds` with 120 when absent and resolve relative endpoints, for `create_handshake_request()` timing and
+`verify_response_proof(..., skew_seconds=document["clockSkewSeconds"])`.
+
 ## Examples
 
 See `examples/`:
@@ -208,7 +276,7 @@ live.
 
 A self-custody agent's key is generated on its host and never sent. A
 custodial agent signs through `HelixCustodialSigner`, which calls the Helix
-API. Both are Signers, so `VPBuilder.sign_with(signer)` and `sign_jws` work
+API. Both are Signers, so `helix_sdk.verifier.sign_request_proof` and `sign_jws` work
 the same with either. Custodial agents are labelled `custody: helix` and are
 not counted in KYA-OS conformance claims; their proofs still verify.
 

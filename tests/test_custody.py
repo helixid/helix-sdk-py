@@ -35,9 +35,6 @@ from helix_sdk.custody import (
     rotation_proof,
     rotation_proof_message,
 )
-from helix_sdk.proof import verify_ed25519_proof
-from helix_sdk.vp_builder import VPBuilder, VPBuilderSignOverrides
-from helix_sdk.errors import VPInvalidStructureError
 
 FIXTURES_DIR = Path(os.environ.get("HELIX_CORE_FIXTURES_DIR") or Path(__file__).resolve().parents[2] / "helix-core" / "fixtures")
 CUSTODY_FIXTURE = FIXTURES_DIR / "kya-os-helix" / "custody.json"
@@ -277,55 +274,23 @@ def test_custodial_signer_refuses_what_is_not_its_signature() -> None:
 
 # ----------------------------------------------- the runtime takes any Signer
 
-CREDENTIAL = {"id": "vc:1", "type": ["VerifiableCredential", "HelixAgentCredential"], "credentialSubject": {"id": DID}}
+def prove(signer: Any) -> Dict[str, Any]:
+    """The application code: the same whichever custody mode the signer stands for (a KYA-OS request proof)."""
+    from helix_sdk.verifier import sign_request_proof
+
+    request = {"method": "tools/call", "params": {"name": "lookup_order", "arguments": {"orderId": "o-1"}}}
+    return sign_request_proof(request, signer, audience="did:web:orders.example", now_ms=1795392000000, nonce="bi0x")
 
 
-def present(signer: Any) -> Dict[str, Any]:
-    """The application code: the same whichever custody mode the signer stands for."""
-    from datetime import datetime, timezone
+def test_request_proof_through_any_signer_is_the_same_and_verifies() -> None:
+    from helix_sdk.verifier.request_proof import verify_detached_jws
 
-    overrides = VPBuilderSignOverrides(
-        id="vp:helix:fixed",
-        nonce="ab" * 32,
-        expires_at=datetime(2026, 11, 21, 0, 5, tzinfo=timezone.utc),
-        proof_created_at=datetime(2026, 11, 21, tzinfo=timezone.utc),
-    )
-    return VPBuilder(credentials=[CREDENTIAL], holder_did=signer.did, target_service="orders").sign_with(signer, overrides)
-
-
-def test_vp_signed_through_any_signer_matches_sign() -> None:
-    from datetime import datetime, timezone
-
-    overrides = VPBuilderSignOverrides(
-        id="vp:helix:fixed",
-        nonce="ab" * 32,
-        expires_at=datetime(2026, 11, 21, 0, 5, tzinfo=timezone.utc),
-        proof_created_at=datetime(2026, 11, 21, tzinfo=timezone.utc),
-    )
-    legacy = VPBuilder(credentials=[CREDENTIAL], holder_did=DID, target_service="orders").sign(SEED_HEX, f"{DID}#key-1", overrides)
-    via_env = present(EnvSigner(DID, env={"HELIX_SIGNING_KEY": SEED_HEX}))
-    via_helix = present(HelixCustodialSigner(DID, api_url="https://h", http=signing_api(seed=SEED)))
-    assert via_env == legacy
-    assert via_helix == legacy
-    payload = {key: value for key, value in via_helix.items() if key != "proof"}
-    assert verify_ed25519_proof(payload, via_helix["proof"], PUBLIC_HEX)
-
-
-def test_vp_sign_with_refuses_a_foreign_or_broken_signer() -> None:
-    builder = VPBuilder(credentials=[CREDENTIAL], holder_did=DID, target_service="orders")
-    with pytest.raises(VPInvalidStructureError, match="not the VP holder"):
-        builder.sign_with(EnvSigner("did:web:other", env={"HELIX_SIGNING_KEY": SEED_HEX}))
-
-    class Broken:
-        did = DID
-        kid = "key-1"
-
-        def sign(self, data: bytes) -> bytes:
-            return b"\x00"
-
-    with pytest.raises(VPInvalidStructureError, match="64-byte"):
-        builder.sign_with(Broken())
-    assert builder.sign_with(EnvSigner(DID, env={"HELIX_SIGNING_KEY": SEED_HEX}))["proof"]["verificationMethod"] == f"{DID}#key-1"
+    via_env = prove(EnvSigner(DID, env={"HELIX_SIGNING_KEY": SEED_HEX}))
+    api = signing_api(seed=SEED)
+    via_helix = prove(HelixCustodialSigner(DID, api_url="https://h", http=api))
+    assert via_helix == via_env
+    assert via_helix["kid"] == f"{DID}#key-1"
+    assert verify_detached_jws(via_helix, bytes.fromhex(PUBLIC_HEX))
 
 
 # --------------------------------------------------------------- helix_init
