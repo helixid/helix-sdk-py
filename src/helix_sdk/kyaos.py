@@ -8,14 +8,16 @@ KYA-OS primitives in one namespace, the Python twin of helix-sdk-js's
 ``import { kyaos } from '@helixid/sdk-js'`` (stories rule 24): RFC 8785
 canonical JSON and hashing (L1-B), EdDSA JWS and the Signer (L1-C), the
 session handshake and the detached response proof (L2-A), the signed
-needs_authorization challenge and the resume retry (L3-E).
+needs_authorization challenge and the resume retry (L3-E), and reading a
+server's ``/.well-known/mcp`` discovery document (L1-D).
 
     from helix_sdk import kyaos
     request = kyaos.create_handshake_request(audience="did:web:mcp.example.com")
     kyaos.verify_response_proof(result, server_did, resolve_did, request=sent)
 
 The modules behind it stay importable on their own (``helix_sdk.crypto.jcs``,
-``helix_sdk.crypto.jws``, ``helix_sdk.handshake``, ``helix_sdk.response_proof``).
+``helix_sdk.crypto.jws``, ``helix_sdk.handshake``, ``helix_sdk.response_proof``,
+``helix_sdk.discovery``).
 """
 
 from __future__ import annotations
@@ -63,6 +65,15 @@ from .handshake import (
     is_valid_nonce,
     validate_handshake_format,
     within_skew,
+)
+from .discovery import (
+    WELL_KNOWN_MCP_INVALID,
+    WELL_KNOWN_MCP_PATH,
+    WellKnownMcpError,
+    WellKnownMcpProblems,
+    fetch_well_known_mcp,
+    read_well_known_mcp,
+    well_known_mcp_url,
 )
 from .response_proof import (
     CONTROL_ARGUMENT_PREFIX,
@@ -130,4 +141,7 @@ __all__ = [
     "DELEGATION_CONTROL_ARGUMENT", "DISPLAY_HINTS", "NEEDS_AUTHORIZATION", "RESUME_CONTROL_ARGUMENT", "ChallengeReasons",
     "HandledChallenge", "NeedsAuthorizationChallenge", "RetriedCall", "find_challenge", "handle_needs_authorization",
     "is_needs_authorization", "read_challenge", "retry_with_resume", "with_resume", "NeedsAuthorizationError",
+    # discovery: /.well-known/mcp, client side (L1-D)
+    "WELL_KNOWN_MCP_INVALID", "WELL_KNOWN_MCP_PATH", "WellKnownMcpError", "WellKnownMcpProblems",
+    "fetch_well_known_mcp", "read_well_known_mcp", "well_known_mcp_url",
 ]

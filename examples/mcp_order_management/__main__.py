@@ -51,14 +51,21 @@ Configuration (environment), the same as the JS sample:
   KYAOS_RESUME_TTL_SECONDS  resume-token lifetime (default 600)
   AUDIT_LOG_FILE        append every audit event as one JSON line to this file, next to (or instead
                         of) the HelixID audit sink; for local runs and the e2e suite
+  WELL_KNOWN_MCP        KYA-OS discovery (story L1-D): GET /.well-known/mcp is served whenever SERVICE_DID
+                        is a did:web or did:key (the document's serverDid), with endpoints at
+                        KYAOS_PUBLIC_ORIGIN (default: the origin of MCP_RESOURCE) and the KYA-OS values
+                        above. 0 turns the route off (404); 1 makes a SERVICE_DID the document cannot
+                        carry a startup error instead of a notice. Optional:
+  STATUS_LIST_CREDENTIAL  URL of this server's status list credential, advertised in the document
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
-from typing import Any, Callable, Dict, List, NoReturn, Optional
+from typing import Any, Callable, Dict, List, NoReturn, Optional, Tuple
 
 import uvicorn
 
@@ -76,10 +83,14 @@ from helix_mcp_middleware import (
     NeedsAuthorizationOptions,
     OAuthIntrospectionOptions,
     OAuthIssuerOptions,
+    WellKnownMcp,
+    WellKnownMcpConfig,
+    WellKnownMcpError,
     auth0,
     create_helix_audit_sink,
     create_kyaos,
     create_needs_authorization,
+    create_well_known_mcp,
     describe_nonce_store,
     read_nonce_store_config,
     entra,
@@ -318,6 +329,48 @@ def _file_audit_sink(path: str, then_sink: Optional[Callable[[Dict[str, Any]], A
     return sink
 
 
+def well_known_from_env(
+    env: Dict[str, str], resource: str, service_did: Optional[str], kyaos: Optional[KyaOsRuntime]
+) -> Tuple[Optional[WellKnownMcp], Optional[str]]:
+    """The discovery document (story L1-D): built once and validated against the schema, or the reason it is off."""
+    setting = env.get("WELL_KNOWN_MCP")
+    if setting == "0":
+        return create_well_known_mcp(WellKnownMcpConfig(enabled=False)), "off (WELL_KNOWN_MCP=0): 404"
+    if not service_did:
+        return None, "off (set SERVICE_DID)"
+    if not re.match(r"did:(web|key):", service_did) and setting != "1":
+        return None, (
+            f"off (SERVICE_DID {service_did} is not a did:web or did:key, which the document's serverDid must be; "
+            "WELL_KNOWN_MCP=1 makes this an error)"
+        )
+    url = urlsplit(resource)
+    try:
+        return create_well_known_mcp(
+            WellKnownMcpConfig(
+                public_origin=env.get("KYAOS_PUBLIC_ORIGIN") or f"{url.scheme}://{url.netloc}",
+                server_did=service_did,
+                tools_endpoint=url.path or "/",
+                kyaos=kyaos.describe() if kyaos is not None else None,
+                status_list_credential=env.get("STATUS_LIST_CREDENTIAL") or None,
+            )
+        ), None
+    except WellKnownMcpError as error:
+        fail(f"/.well-known/mcp: {error}")
+
+
+def describe_well_known(well_known: Optional[WellKnownMcp], off: Optional[str]) -> str:
+    """The startup line's text, the same as the JS sample's."""
+    document = well_known.document if well_known is not None else None
+    if document is None:
+        return off or "off"
+    tools = urlsplit(document["endpoints"]["tools"])
+    return (
+        f"{tools.scheme}://{tools.netloc}/.well-known/mcp, serverDid {document['serverDid']}, skew {document['clockSkewSeconds']} s, "
+        f"handshake {'advertised' if 'handshake' in document['endpoints'] else 'absent'} "
+        "(route the path at that origin to this server: see helix-sdk-js mcp-middleware/docs/well-known.md)"
+    )
+
+
 def main() -> None:
     env = dict(os.environ)
     try:
@@ -363,6 +416,7 @@ def main() -> None:
 
     kyaos = kyaos_from_env(env, resource, service_did)
     auth.needs_authorization = needs_authorization_from_env(env, service_did, demo, auth.audit_sink)
+    well_known, well_known_off = well_known_from_env(env, resource, service_did, kyaos)
     try:
         app = create_order_app(
             resource,
@@ -370,6 +424,7 @@ def main() -> None:
             authorization_servers=[i.issuer for i in issuers] or None,
             on_server_error=lambda error: print("server error:", repr(error), file=sys.stderr),
             kyaos=kyaos,
+            well_known=well_known,
         )
     except ValueError as error:
         fail(str(error))
@@ -392,6 +447,7 @@ def main() -> None:
         )
     else:
         print("  KYA-OS:      off (set SERVICE_SIGNING_KEY)")
+    print(f"  Discovery:   {describe_well_known(well_known, well_known_off)}")
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
