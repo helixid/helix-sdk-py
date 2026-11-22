@@ -19,9 +19,10 @@ import pytest
 
 from helix_sdk.crypto.jws import EnvSigner
 from helix_sdk.keys import derive_public_key, public_key_to_multibase
-from helix_sdk.verifier import MemoryNonceStore, StatusListError, sign_request_proof
+from helix_sdk.verifier import StatusListError, sign_request_proof
 from helix_mcp_middleware import (
     LocalVerifierOptions,
+    MemoryNonceStore,
     MCPMiddlewareOptions,
     ProofError,
     async_helixid_mcp_middleware,
@@ -330,7 +331,7 @@ def test_the_async_gate_awaits_an_async_report_hook_on_the_loop() -> None:
 
 def test_the_middleware_imports_no_helix_client_and_no_api_urls() -> None:
     package = Path(verify_locally_module.__file__).parent
-    for name in ("middleware.py", "verify_locally.py", "credentials.py", "types.py", "__init__.py", "resolution_fetch.py", "revocation_signals.py", "status_cache_store.py"):
+    for name in ("middleware.py", "verify_locally.py", "credentials.py", "types.py", "__init__.py", "resolution_fetch.py", "revocation_signals.py", "kyaos/status_cache_store.py"):
         content = (package / name).read_text("utf-8")
         assert "HelixClient" not in content, name
         assert "localhost:3000" not in content, name
@@ -418,3 +419,69 @@ def test_a_proof_error_carries_one_of_the_two_proof_codes() -> None:
     assert (err.code, err.reasons) == ("PROOF_INVALID", ("nonce_replayed",))
     with pytest.raises(ValueError, match="PROOF_MISSING or PROOF_INVALID"):
         ProofError("VP_MISSING", "x")
+
+
+# ── the replay store: the middleware's NonceStore (story L2-A), sync or async ──
+
+
+class _AsyncStore:
+    """An asyncio client's shape (redis.asyncio): insert answers with an awaitable; expiry in Unix seconds."""
+
+    def __init__(self) -> None:
+        self.inner = MemoryNonceStore(now=lambda: NOW_MS / 1000)
+        self.expiries: List[float] = []
+
+    async def insert(self, nonce: str, agent_did: Any, expires_at: float) -> bool:
+        self.expiries.append(expires_at)
+        return self.inner.insert(nonce, agent_did, expires_at)
+
+
+def test_an_async_replay_store_is_awaited_on_the_async_gates_loop_and_refuses_a_replay() -> None:
+    import asyncio
+
+    store = _AsyncStore()
+    options = fixture_verifier_options(SERVICE, documents={AGENT_OWN["did"]: AGENT_OWN["document"]}, nonce_store=store)
+    mw = async_helixid_mcp_middleware(MCPMiddlewareOptions(verifier=options, required_scopes=[]))
+    call = {"name": "t", "_meta": proof_meta(AGENT_OWN["signer"], SERVICE, "t")}
+
+    async def twice() -> Any:
+        await mw(call)
+        with pytest.raises(ProofError) as caught:
+            await mw(call)
+        return caught.value
+
+    replay = asyncio.run(twice())
+    assert replay.reasons == ("nonce_replayed",)
+    # The verifier's millisecond expiry reaches the store in Unix seconds.
+    assert all(NOW_MS / 1000 < expiry < NOW_MS / 1000 + 3600 for expiry in store.expiries)
+
+
+def test_an_async_replay_store_under_the_sync_gate_runs_on_a_loop_of_its_own() -> None:
+    store = _AsyncStore()
+    mw = gate(verifier=own_verifier(nonce_store=store), required_scopes=[])
+    call = {"name": "t", "_meta": proof_meta(AGENT_OWN["signer"], SERVICE, "t")}
+    assert mw(call) is call
+    assert refusal(lambda: mw(call)).reasons == ("nonce_replayed",)
+
+
+def test_a_replay_store_that_answers_anything_but_true_or_fails_is_never_fresh() -> None:
+    class Odd:
+        def insert(self, nonce: str, agent_did: Any, expires_at: float) -> Any:
+            return "yes"
+
+    class Down:
+        def insert(self, nonce: str, agent_did: Any, expires_at: float) -> Any:
+            raise ConnectionError("redis down")
+
+    odd = gate(verifier=own_verifier(nonce_store=Odd()), required_scopes=[])
+    assert refusal(lambda: odd({"name": "t", "_meta": proof_meta(AGENT_OWN["signer"], SERVICE, "t")})).reasons == ("nonce_replayed",)
+    down = gate(verifier=own_verifier(nonce_store=Down()), required_scopes=[])
+    assert refusal(lambda: down({"name": "t", "_meta": proof_meta(AGENT_OWN["signer"], SERVICE, "t")})).code == "PROOF_INVALID"
+
+
+def test_the_default_replay_store_is_the_middlewares_memory_store_in_seconds() -> None:
+    verifier = quiet(resolve_did=lambda did: PLAIN_DOCUMENT)
+    assert isinstance(verifier.nonce_store, MemoryNonceStore)
+    meta = proof_meta(SIGNER, SERVICE, "t")
+    assert verifier.verify_call({"name": "t", "_meta": meta}).ok
+    assert verifier.verify_call({"name": "t", "_meta": meta}).reasons == ["nonce_replayed"]

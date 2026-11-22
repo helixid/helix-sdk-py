@@ -36,8 +36,9 @@ Configuration (environment), the same as the JS sample:
   KYAOS_REVOCATION_WEBHOOK_PATH a path on this server that receives pushed SETs (RFC 8935)
   KYAOS_VERIFICATION_LOG      1: print each verification (level, fresh, reasons) and each revocation signal
                               as one JSON line; a file path: append them there as JSON lines instead
-  KYAOS_REDIS_URL             redis://host:port: the status cache shared by every instance; without it the
-                              cache is in memory and covers this instance only
+  KYAOS_REDIS_URL             also the status cache's Redis, whatever KYAOS_NONCE_STORE says: lists and
+                              verdicts shared by every instance, JS or Python (pip install 'helixid-sdk-py[redis]');
+                              without it the cache is in memory and covers this instance only
   OAUTH_ISSUER          OAuth door, one authorization server. The issuer alone is enough: its keys are
                         read from its metadata (aud must be MCP_RESOURCE). Optional:
   OAUTH_JWKS_URI          its jwks_uri, to skip discovery
@@ -51,6 +52,21 @@ Configuration (environment), the same as the JS sample:
                         or custom {"issuer", "jwksUri"?, "introspection"?: {"clientId", "clientSecret", "endpoint"?}}
   DEMO_MODE=1           local demo only: accept the fixed bearer tokens below instead of an
                         authorization server. Refused unless HOST is loopback.
+  SERVICE_SIGNING_KEY   KYA-OS (story L2-A): this server's Ed25519 private key (hex), the key
+                        SERVICE_DID's document lists as key-1. Turns on the _kyaos_handshake tool,
+                        sessions and a server-signed proof on every tool call outcome. Optional:
+  KYAOS_PUBLIC_ORIGIN     the origin agents connect to, accepted as handshake audience next to the
+                          DID (default: the origin of MCP_RESOURCE)
+  KYAOS_CLOCK_SKEW_SECONDS  30 to 600 (default 120)
+  KYAOS_SESSIONS=0        no sessions: the handshake is refused, calls are proven without one
+  KYAOS_SESSION_TTL_MINUTES idle TTL (default 30; fractions allowed)
+  KYAOS_NONCE_STORE       the replay store: memory (default, this instance only), redis or dynamo,
+                          read by helix_mcp_middleware itself (nonce_store_from_env); with it:
+                          redis: KYAOS_REDIS_URL, KYAOS_NONCE_KEY_PREFIX (pip install 'helixid-sdk-py[redis]')
+                          dynamo: KYAOS_DYNAMO_TABLE, KYAOS_DYNAMO_KEY_ATTRIBUTE, KYAOS_DYNAMO_TTL_ATTRIBUTE,
+                                  KYAOS_DYNAMO_REGION, KYAOS_DYNAMO_ENDPOINT (pip install 'helixid-sdk-py[dynamo]';
+                                  AWS credentials: boto3's chain). JS and Python instances share one store.
+                          See .env.example.
 """
 
 from __future__ import annotations
@@ -62,8 +78,14 @@ from typing import Any, Callable, Dict, List, NoReturn, Optional, Tuple
 
 import uvicorn
 
+from urllib.parse import urlsplit
+
+from helix_sdk.crypto.jws import EnvSigner
 from helix_mcp_middleware import (
     AuthResult,
+    KyaOsOptions,
+    KyaOsRuntime,
+    KyaOsSessionOptions,
     LocalVerifierOptions,
     MCPMiddlewareOptions,
     OAuthIntrospectionOptions,
@@ -73,8 +95,11 @@ from helix_mcp_middleware import (
     SignalReport,
     auth0,
     create_helix_audit_sink,
+    create_kyaos,
     create_local_verifier,
     create_revocation_signal_client,
+    describe_nonce_store,
+    read_nonce_store_config,
     entra,
     keycloak,
     okta,
@@ -83,7 +108,6 @@ from helix_sdk.verifier import StatusCache
 
 from .app import create_order_app
 from .orders import TOOL_SCOPES
-from .redis_client import RedisClient
 
 L3C_SETTINGS = (
     "KYAOS_STATUS_CACHE_TTL",
@@ -228,6 +252,51 @@ def oauth_issuers_from_env(env: Dict[str, str], resource: str) -> List[OAuthIssu
     return issuers
 
 
+_KYAOS_SETTINGS = ("KYAOS_NONCE_STORE", "KYAOS_PUBLIC_ORIGIN", "KYAOS_CLOCK_SKEW_SECONDS", "KYAOS_SESSIONS", "KYAOS_SESSION_TTL_MINUTES")
+
+
+def _positive_number(env: Dict[str, str], name: str, integer: bool) -> Optional[float]:
+    """A positive number from an optional variable; `integer` demands a whole one."""
+    raw = env.get(name)
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not value > 0 or value == float("inf") or (integer and not value.is_integer()):
+        fail(f"{name} must be a positive {'integer' if integer else 'number'}")
+    return value
+
+
+def kyaos_from_env(env: Dict[str, str], resource: str, service_did: Optional[str]) -> Optional[KyaOsRuntime]:
+    """The KYA-OS layer from SERVICE_SIGNING_KEY and the KYAOS_* variables, or None when it is off."""
+    if not env.get("SERVICE_SIGNING_KEY"):
+        if any(env.get(name) for name in _KYAOS_SETTINGS):
+            fail("KYAOS_* settings need SERVICE_SIGNING_KEY")
+        return None
+    if not service_did:
+        fail("SERVICE_SIGNING_KEY needs SERVICE_DID (the DID whose document lists the key)")
+    skew = _positive_number(env, "KYAOS_CLOCK_SKEW_SECONDS", True)
+    ttl_minutes = _positive_number(env, "KYAOS_SESSION_TTL_MINUTES", False)
+    url = urlsplit(resource)
+    try:
+        return create_kyaos(
+            KyaOsOptions(
+                # The key is read from the environment at every signature; the server never holds it.
+                signer=EnvSigner(service_did, env_var="SERVICE_SIGNING_KEY"),
+                public_origin=env.get("KYAOS_PUBLIC_ORIGIN") or f"{url.scheme}://{url.netloc}",
+                clock_skew_seconds=int(skew) if skew is not None else None,
+                session=KyaOsSessionOptions(enabled=env.get("KYAOS_SESSIONS") != "0", ttl_minutes=ttl_minutes),
+                # The replay store: the one KYAOS_NONCE_STORE names (nonce_store_from_env), read from the same environment.
+                env=env,
+                tools_endpoint=resource,
+            )
+        )
+    except ValueError as error:
+        fail(f"KYA-OS: {error}")
+
+
 def did_list(env: Dict[str, str], name: str) -> Optional[List[str]]:
     """A comma-separated list of DIDs, or None when the variable is unset or `*`."""
     raw = (env.get(name) or "").strip()
@@ -282,7 +351,22 @@ def event_logger(env: Dict[str, str]) -> Optional[Callable[[str, Dict[str, Any]]
     return log_event
 
 
-def status_cache_from_env(env: Dict[str, str], redis: Optional[RedisClient]) -> StatusCache:
+def status_cache_redis_from_env(env: Dict[str, str]) -> Any:
+    """The status cache's Redis (story L3-C): a redis-py client for KYAOS_REDIS_URL, loaded only when it is set.
+    The replay store's comes from nonce_store_from_env (story L2-A), whatever KYAOS_NONCE_STORE says."""
+    url = env.get("KYAOS_REDIS_URL") or None
+    if url is None:
+        return None
+    if not url.startswith(("redis://", "rediss://")):
+        fail("KYAOS_REDIS_URL must be a redis:// or rediss:// URL")
+    try:
+        import redis  # noqa: PLC0415 - optional: pip install 'helixid-sdk-py[redis]'
+    except ImportError:
+        fail("KYAOS_REDIS_URL needs the redis package: pip install 'helixid-sdk-py[redis]'")
+    return redis.Redis.from_url(url)
+
+
+def status_cache_from_env(env: Dict[str, str], redis: Any) -> StatusCache:
     """The status cache (story L3-C point 6), shared through KYAOS_REDIS_URL when set."""
     scopes = [scope.strip() for scope in (env.get("KYAOS_HIGH_PRIVILEGE_SCOPES") or "").split(",") if scope.strip()]
     settings: Dict[str, Any] = {"high_privilege_scopes": scopes}
@@ -334,7 +418,7 @@ def revocation_signals_from_env(
     return client, webhook_path
 
 
-def verifier_from_env(env: Dict[str, str], service_did: str) -> LocalVerifierOptions:
+def verifier_from_env(env: Dict[str, str], service_did: str, kyaos: Optional[KyaOsRuntime] = None) -> LocalVerifierOptions:
     """The local verifier's settings (story F-2), the same variables as the JS sample."""
     max_chain_length: Optional[int] = None
     if env.get("KYAOS_MAX_CHAIN_LENGTH"):
@@ -354,11 +438,7 @@ def verifier_from_env(env: Dict[str, str], service_did: str) -> LocalVerifierOpt
         if not isinstance(cards, dict):
             fail("KYAOS_CARDS_FILE must hold a JSON object of agent DID to card")
     trusted = did_list(env, "KYAOS_TRUSTED_ISSUERS")
-    redis_url = env.get("KYAOS_REDIS_URL") or None
-    try:
-        redis = RedisClient(redis_url) if redis_url else None
-    except ValueError as error:
-        fail(f"KYAOS_REDIS_URL: {error}")
+    redis = status_cache_redis_from_env(env)
     log_event = event_logger(env)
     return LocalVerifierOptions(
         service_did=service_did,
@@ -371,6 +451,8 @@ def verifier_from_env(env: Dict[str, str], service_did: str) -> LocalVerifierOpt
         status_cache=status_cache_from_env(env, redis),
         status_list_issuers=json_object_from_env(env, "KYAOS_STATUS_LIST_ISSUERS"),
         report_verification=(lambda report: log_event("verification", report)) if log_event is not None else None,
+        # One replay store for the handshake, the response proofs and the request proofs.
+        nonce_store=kyaos.nonce_store if kyaos is not None else None,
         # Story A-1 connects the audit trail here; until then each verification is logged once as unrecorded.
         log=lambda message: print(message, file=sys.stderr),
     )
@@ -404,11 +486,12 @@ def main() -> None:
     if api_url and api_key:
         # The audit sink is the only thing that talks to the Helix API, and never on the request path.
         auth.audit_sink = create_helix_audit_sink(api_url, api_key, service_did=service_did or None)
+    kyaos = kyaos_from_env(env, resource, service_did)
     signals: Optional[RevocationSignalClient] = None
     webhook_path: Optional[str] = None
     if service_did:
         # The KYA-OS door (story F-2): every request proof is verified here, in-process.
-        local = create_local_verifier(verifier_from_env(env, service_did))
+        local = create_local_verifier(verifier_from_env(env, service_did, kyaos))
         auth.verifier = local
         signals, webhook_path = revocation_signals_from_env(env, local, event_logger(env))
     elif any(env.get(name) for name in ("KYAOS_TRUSTED_ISSUERS", "KYAOS_TRUSTED_ROOTS", "KYAOS_MAX_CHAIN_LENGTH", "KYAOS_CARDS_FILE", *L3C_SETTINGS)):
@@ -431,28 +514,35 @@ def main() -> None:
             auth,
             authorization_servers=[i.issuer for i in issuers] or None,
             on_server_error=lambda error: print("server error:", repr(error), file=sys.stderr),
+            kyaos=kyaos,
             revocation_webhook=(webhook_path, signals.asgi_webhook()) if signals is not None and webhook_path else None,
         )
     except ValueError as error:
         fail(str(error))
 
     print(f"order-management MCP server on {resource}")
-    verifier = auth.verifier
     print(
         "  KYA-OS proofs: "
         + (
             f"verified in-process for {service_did}, trusted issuers {env.get('KYAOS_TRUSTED_ISSUERS') or '*'}, "
             f"chain length <= {env.get('KYAOS_MAX_CHAIN_LENGTH') or 10}"
-            if verifier is not None
+            if auth.verifier is not None
             else "off (set SERVICE_DID)"
         )
     )
-    if verifier is not None:
+    if auth.verifier is not None:
         channels = [f"SSE {signals.events_url}" if signals is not None and signals.events_url else "", f"webhook {webhook_path}" if webhook_path else ""]
         cache = f"redis {env['KYAOS_REDIS_URL']}" if env.get("KYAOS_REDIS_URL") else "in memory"
         print(f"  Revocation:  list proofs verified, cache {cache}, signals {' + '.join(c for c in channels if c) or 'off'}")
     print(f"  OAuth:       {'DEMO tokens demo-reader, demo-admin' if demo else ', '.join(i.issuer for i in issuers) or 'off'}")
     print(f"  Audit:       {api_url + '/v1/audit-log/events' if auth.audit_sink else 'off (set HELIX_API_URL + HELIX_API_KEY)'}")
+    if kyaos is not None:
+        print(
+            f"  KYA-OS:      proofs by {kyaos.server_did}, sessions {'on' if kyaos.sessions_enabled else 'off'}, "
+            f"skew {kyaos.clock_skew_seconds} s, {describe_nonce_store(read_nonce_store_config(env))}"
+        )
+    else:
+        print("  KYA-OS:      off (set SERVICE_SIGNING_KEY)")
     sys.stdout.flush()
     if signals is not None and signals.events_url:
         signals.start()

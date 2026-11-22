@@ -63,3 +63,18 @@ proof's `requestHash` covers it) and the request headers; a denial becomes a
 401 / 400 / 403 through `to_http_error_response()`, an unreachable authorization server a 503, and anything else is
 handed, body intact, to the transport. `initialize` and `tools/list` are not gated. The tools
 ([`orders.py`](orders.py)) contain no auth code.
+
+## KYA-OS session and response proof (story L2-A)
+
+Set `SERVICE_SIGNING_KEY` (the Ed25519 private key, hex, that `SERVICE_DID`'s document lists as `key-1`) and the
+server registers the `_kyaos_handshake` tool, opens sessions and signs a detached proof into
+`_meta["org.kya-os/response-proof"]` on every tool call outcome, the same as the JS sample (a refusal carries its
+`denied` proof in the 400/401/403 body; a tool error is proven like any result). Optional: `KYAOS_PUBLIC_ORIGIN`
+(default: the origin of `MCP_RESOURCE`), `KYAOS_CLOCK_SKEW_SECONDS` (30 to 600, default 120), `KYAOS_SESSIONS=0`,
+`KYAOS_SESSION_TTL_MINUTES` (default 30).
+
+The replay store is chosen by `KYAOS_NONCE_STORE`, which `helix_mcp_middleware` reads itself
+(`nonce_store_from_env()`): `memory` (the default) covers this instance only; `redis` (`KYAOS_REDIS_URL`, needs
+`pip install 'helixid-sdk-py[redis]'`) or `dynamo` (`KYAOS_DYNAMO_TABLE`, needs `pip install 'helixid-sdk-py[dynamo]'`)
+is shared by every instance, JS or Python. See [`.env.example`](.env.example) and the package README for every
+variable. A bad setting or a missing package stops the server at startup.

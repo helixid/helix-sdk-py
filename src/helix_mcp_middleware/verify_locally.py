@@ -10,8 +10,10 @@ The middleware runs :func:`helix_sdk.verifier.verify` on the request proof
 and the carried chain, with seams built from local config and public
 resolution only:
 
-- a replay store (default :class:`helix_sdk.verifier.MemoryNonceStore`,
-  this process only; story L2-A brings the middleware's shared stores);
+- the middleware's replay store (story L2-A: a ``NonceStore`` such as the
+  memory, Redis or DynamoDB one ``nonce_store_from_env`` picks, shared with
+  the handshake and the response proofs; default one in memory, this process
+  only);
 - DID documents over HTTPS (did:web) or offline (did:key), through an
   injected ``fetch`` where the host has one of its own;
 - status lists over HTTPS, each list's own proof verified before any bit is
@@ -36,6 +38,7 @@ unrecorded.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import sys
 from dataclasses import dataclass
@@ -44,7 +47,6 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
 from helix_sdk.verifier import (
-    MemoryNonceStore,
     StatusCache,
     VerifierOptions,
     VerifierResult,
@@ -59,6 +61,7 @@ from helix_sdk.verifier import (
 )
 
 from .credentials import meta_mapping
+from .kyaos.nonce_store import MemoryNonceStore
 from .resolution_fetch import ResolverFetch, create_resolution_fetch, status_list_http_fetch
 
 KYA_OS_CARD_SERVICE_TYPE = "KyaOsEntityCard"
@@ -97,7 +100,10 @@ class LocalVerifierOptions:
     catalog: Optional[Sequence[str]] = None
     """The scopes this service offers; ``effectiveScopes`` is intersected with it."""
     nonce_store: Any = None
-    """The replay store (``insert(nonce, agent_did, expires_at_ms) -> bool``); default in memory, this process only."""
+    """The middleware's replay store, a :class:`helix_mcp_middleware.NonceStore`
+    (``insert(nonce, agent_did, expires_at)``, Unix seconds, answering a bool
+    or an awaitable): share the KYA-OS runtime's store across the handshake,
+    the response proofs and the request proofs. Default one in memory, this process only."""
     fetch: Optional[ResolverFetch] = None
     """``url -> parsed JSON``: the host's SafeFetch (story C-A). Default: :func:`create_resolution_fetch`
     (https only, public IP literals only, same-origin redirects, 5 s, 1 MiB)."""
@@ -183,6 +189,36 @@ def unrecorded_reporter(log: Optional[Callable[[str], Any]] = None) -> ReportVer
     return report
 
 
+async def _awaited(value: Any) -> Any:
+    return await value
+
+
+def _settle(value: Any) -> Any:
+    """An answer of the replay store, awaited when it is awaitable: on the event
+    loop of the async gate that called us (an asyncio client is bound to it),
+    or, with no gate loop, on a loop of its own in this thread."""
+    if not inspect.isawaitable(value):
+        return value
+    from .middleware import _LOOP  # the async gate's loop, set around its worker thread
+
+    loop = _LOOP.get()
+    if loop is not None:
+        return asyncio.run_coroutine_threadsafe(_awaited(value), loop).result()
+    return asyncio.run(_awaited(value))
+
+
+class _ReplaySeam:
+    """helix_sdk.verifier's replay seam over the middleware's NonceStore: the
+    verifier's millisecond expiry in the store's Unix seconds, and only a real
+    ``True`` counts as fresh (an unresolved answer would otherwise pass every replay)."""
+
+    def __init__(self, store: Any) -> None:
+        self._store = store
+
+    def insert(self, nonce: str, agent_did: Optional[str], expires_at_ms: int) -> bool:
+        return _settle(self._store.insert(nonce, agent_did, expires_at_ms / 1000)) is True
+
+
 class LocalVerifier:
     """Verifies tool calls in-process. Build it with :func:`create_local_verifier`."""
 
@@ -194,7 +230,7 @@ class LocalVerifier:
         self._options = options
         clock = options.clock or (lambda: int(datetime.now(timezone.utc).timestamp() * 1000))
         self._clock = clock
-        self.nonce_store = options.nonce_store if options.nonce_store is not None else MemoryNonceStore(now_ms=clock)
+        self.nonce_store = options.nonce_store if options.nonce_store is not None else MemoryNonceStore(now=lambda: clock() / 1000)
         allow = options.allow_loopback_http
         host_fetch = options.fetch
         if host_fetch is None:
@@ -246,7 +282,7 @@ class LocalVerifier:
             fetch_status_list=fetch_status_list,
             check_revocation=check_revocation,
             resolve_card=resolve_card,
-            nonce_store=self.nonce_store,
+            nonce_store=_ReplaySeam(self.nonce_store),
             clock=clock,
             trusted_issuers=options.trusted_issuers if options.trusted_issuers is not None else "*",
         )

@@ -1,16 +1,14 @@
 # Copyright 2026 DgVerse LLP
 # Licensed under the Apache License, Version 2.0
 """KYA-OS story L3-C in the Python sample: the revocation settings read from
-the environment (status cache, shared Redis, signal client, verification
-log), the webhook route, and the tiny RESP client. Mirrors the JS sample's
-main.ts settings and tests/redis-client.test.ts."""
+the environment (status cache and its redis-py client, signal client,
+verification log), the webhook route, and the store shared by two instances.
+Mirrors the JS sample's main.ts settings."""
 
 from __future__ import annotations
 
 import json
-import socket
 import sys
-import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -26,7 +24,6 @@ from helix_mcp_middleware import MCPMiddlewareOptions, RedisStatusCacheStore, cr
 from helix_sdk.verifier import MemoryStatusCacheStore, sign_revocation_signal  # noqa: E402
 from mcp_order_management import __main__ as sample  # noqa: E402
 from mcp_order_management.app import create_order_app  # noqa: E402
-from mcp_order_management.redis_client import RedisClient, RedisError, parse_reply  # noqa: E402
 from mcp_proof_helpers import NOW_MS, fixture_signer, have_verifier_fixtures, load_environment  # noqa: E402
 
 SERVICE = "did:web:orders.example"
@@ -63,7 +60,7 @@ def test_builds_the_status_cache_from_the_environment_on_memory_or_redis() -> No
     assert (cache.status_cache_ttl, cache.high_privilege_ttl, cache.max_stale_seconds) == (120, 30, 5)
     assert cache.high_privilege_scopes == frozenset({"orders:admin", "orders:refund"})
     assert isinstance(cache._store, MemoryStatusCacheStore)
-    shared = sample.status_cache_from_env({}, RedisClient("redis://127.0.0.1:1"))
+    shared = sample.status_cache_from_env({}, object())
     assert isinstance(shared._store, RedisStatusCacheStore)
     # SPEC.md §6.5.2: a high-privilege read is cached at most 60 s.
     exits(sample.status_cache_from_env, {"KYAOS_HIGH_PRIVILEGE_TTL": "61"}, None)
@@ -97,6 +94,17 @@ def test_verifier_settings_carry_the_cache_the_keeper_bindings_and_the_log(tmp_p
     assert json.loads(target.read_text()) == {"kind": "verification", "ok": False}
     assert sample.verifier_from_env({}, SERVICE).report_verification is None
     exits(sample.verifier_from_env, {"KYAOS_REDIS_URL": "http://not-redis"}, SERVICE)
+
+
+def test_the_status_cache_gets_a_redis_py_client_only_when_kyaos_redis_url_is_set(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    assert sample.status_cache_redis_from_env({}) is None
+    redis = pytest.importorskip("redis")
+    # A client is made, not connected: redis-py connects at the first command.
+    client = sample.status_cache_redis_from_env({"KYAOS_REDIS_URL": "redis://127.0.0.1:1/0"})
+    assert isinstance(client, redis.Redis)
+    monkeypatch.setitem(sys.modules, "redis", None)  # as if the extra were not installed
+    exits(sample.status_cache_redis_from_env, {"KYAOS_REDIS_URL": "redis://127.0.0.1:6380"})
+    assert "pip install 'helixid-sdk-py[redis]'" in capsys.readouterr().err
 
 
 def test_builds_the_signal_client_only_with_its_issuers_and_a_channel(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
@@ -154,6 +162,7 @@ def test_main_refuses_revocation_settings_without_a_service_did(monkeypatch: pyt
 
 
 def test_main_starts_and_stops_the_signal_stream_around_the_server(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    pytest.importorskip("redis")
     started: List[str] = []
 
     def fake_run(app: Any, host: str, port: int, log_level: str) -> None:
@@ -188,85 +197,7 @@ def test_main_without_signals_says_so(monkeypatch: pytest.MonkeyPatch, capsys: p
     assert "cache in memory, signals off" in capsys.readouterr().out
 
 
-# ── the RESP client ──────────────────────────────────────────────────────────
-
-
-def test_parses_every_resp2_reply_and_waits_for_a_whole_one() -> None:
-    assert parse_reply(b"+OK\r\n") == ("OK", 5)
-    assert parse_reply(b":42\r\n") == (42, 5)
-    assert parse_reply(b"_\r\n") == (None, 3)
-    assert parse_reply(b"$-1\r\n") == (None, 5)
-    assert parse_reply(b"$3\r\nabc\r\n") == ("abc", 9)
-    assert parse_reply(b"$3\r\nab") == (None, 0)
-    assert parse_reply(b"+O") == (None, 0)
-    error, used = parse_reply(b"-ERR wrong type\r\n")
-    assert isinstance(error, RedisError) and str(error) == "redis: ERR wrong type" and used == 17
-    odd, _ = parse_reply(b"?what\r\n")
-    assert isinstance(odd, RedisError)
-
-
-class FakeRedis:
-    """A loopback server answering scripted RESP replies, recording each command it receives."""
-
-    def __init__(self, replies: List[bytes], hang_up_after: Optional[int] = None) -> None:
-        self.replies = replies
-        self.received: List[bytes] = []
-        self.listener = socket.socket()
-        self.listener.bind(("127.0.0.1", 0))
-        self.listener.listen()
-        self.url = f"redis://127.0.0.1:{self.listener.getsockname()[1]}"
-        self.hang_up_after = hang_up_after
-        threading.Thread(target=self._serve, daemon=True).start()
-
-    def _serve(self) -> None:
-        while True:
-            try:
-                connection, _ = self.listener.accept()
-            except OSError:
-                return
-            with connection:
-                while self.replies:
-                    data = connection.recv(65536)
-                    if not data:
-                        break
-                    self.received.append(data)
-                    if self.hang_up_after is not None and len(self.received) > self.hang_up_after:
-                        break
-                    reply = self.replies.pop(0)
-                    # Split the reply, as a slow network would.
-                    connection.sendall(reply[:2])
-                    connection.sendall(reply[2:])
-
-    def close(self) -> None:
-        self.listener.close()
-
-
-def test_speaks_get_set_px_del_and_incr_over_one_connection() -> None:
-    server = FakeRedis([b"+OK\r\n", b"$1\r\nv\r\n", b"$-1\r\n", b":1\r\n", b":3\r\n", b"-ERR nope\r\n"])
-    client = RedisClient(server.url)
-    assert client.set("k", "v", px=1500) == "OK"
-    assert client.get("k") == "v"
-    assert client.get("missing") is None
-    assert client.delete("k") == 1
-    assert client.incr("g") == 3
-    with pytest.raises(RedisError, match="nope"):
-        client.incr("g")
-    assert server.received[0] == b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nPX\r\n$4\r\n1500\r\n"
-    client.close()
-    client.close()
-    server.close()
-
-
-def test_a_connection_that_closes_before_a_reply_fails_the_command_and_the_next_one_reconnects() -> None:
-    server = FakeRedis([b"+OK\r\n", b"$1\r\nw\r\n"], hang_up_after=0)
-    client = RedisClient(server.url)
-    with pytest.raises(RedisError, match="closed before a reply"):
-        client.get("k")
-    server.hang_up_after = None
-    assert client.get("k") == "OK"
-    server.close()
-    with pytest.raises(ValueError, match="redis://"):
-        RedisClient("http://127.0.0.1:6379")
+# ── the shared store ─────────────────────────────────────────────────────────
 
 
 def test_the_store_and_client_share_a_cache_between_two_instances_over_redis() -> None:

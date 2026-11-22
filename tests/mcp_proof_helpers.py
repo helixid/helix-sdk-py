@@ -22,13 +22,12 @@ from helix_sdk.verifier import (
     DELEGATION_CHAIN_META_KEY,
     LEGACY_REQUEST_PROOF_META_KEY,
     REQUEST_PROOF_META_KEY,
-    MemoryNonceStore,
     StatusListRead,
     decode_status_list_bits,
     did_key_document,
     sign_request_proof,
 )
-from helix_mcp_middleware import LocalVerifierOptions
+from helix_mcp_middleware import LocalVerifierOptions, MemoryNonceStore
 
 from verifier_harness import have_verifier_fixtures, load_cases, load_environment
 
@@ -90,7 +89,7 @@ def fixture_verifier_options(service_did: Optional[str], env: Optional[Mapping[s
     defaults: Dict[str, Any] = {
         "service_did": service_did,
         "clock": lambda: NOW_MS,
-        "nonce_store": MemoryNonceStore(now_ms=lambda: NOW_MS),
+        "nonce_store": MemoryNonceStore(now=lambda: NOW_MS / 1000),
         "resolve_did": resolve_did,
         "fetch_status_list": fetch_status_list,
         "report_verification": lambda entry: None,
