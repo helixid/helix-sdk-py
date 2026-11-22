@@ -372,6 +372,15 @@ class InvalidJWSError(HelixError):
         self.reason = reason
 
 
+class ResponseProofError(HelixError):
+    """A KYA-OS detached response proof that does not bind the call it answers
+    (story L2-A). ``reason`` is one of helix_sdk.response_proof.ProofReasons."""
+
+    def __init__(self, reason: str, message: str = "Response proof is invalid") -> None:
+        super().__init__(codes.RESPONSE_PROOF_INVALID, message, 400, {"reason": reason})
+        self.reason = reason
+
+
 class JWTExpiredError(HelixError):
     def __init__(self, message: str = "JWT has expired") -> None:
         super().__init__(codes.JWT_EXPIRED, message, 401)

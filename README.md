@@ -160,6 +160,49 @@ print(result["valid"], result["effectiveScopes"])
 See `examples/verify_vp_demo.py` for this flow end to end, including scope
 checks and a revoked-credential rejection.
 
+## KYA-OS session, replay store and response proof (`helix_mcp_middleware`, story L2-A)
+
+The Python twin of `@helixid/mcp-middleware`'s KYA-OS layer, with the same wire format, error codes and replay-store
+keys, so JS and Python instances serve one DID side by side:
+
+```python
+from helix_sdk import kyaos
+from helix_mcp_middleware import KyaOsOptions, create_kyaos
+
+kya = create_kyaos(KyaOsOptions(
+    signer=kyaos.EnvSigner("did:web:mcp.example.com", env_var="SERVICE_SIGNING_KEY"),  # the key stays in the environment
+    public_origin="https://mcp.example.com",
+))
+# The handshake tool: await kya.handshake_tool_result(args). Every other tool call:
+started = await kya.start({"name": name, "arguments": args, "_meta": meta}, authorize=lambda: gate.authorize(tool_call))
+if started.outcome == "denied":
+    ...  # to_http_error_response(started.error, metadata_url, proof=started.proof)
+result = await started.finish(await handler(started.arguments))  # the result with _meta["org.kya-os/response-proof"]
+```
+
+The client side is `helix_sdk.kyaos` (`create_handshake_request()`, `verify_response_proof()`, which recomputes both
+hashes against the server DID). The replay store is the one the environment names unless `nonce_store=` is passed
+(`nonce_store_from_env()`):
+
+| Variable | Values | Default |
+|---|---|---|
+| `KYAOS_NONCE_STORE` | `memory`, `redis`, `dynamo` | `memory` |
+| `KYAOS_REDIS_URL` | `redis://` or `rediss://` URL; required for `redis` | |
+| `KYAOS_NONCE_KEY_PREFIX` | Redis key prefix | `kyaos:nonce:` |
+| `KYAOS_DYNAMO_TABLE` | table name; required for `dynamo` | |
+| `KYAOS_DYNAMO_KEY_ATTRIBUTE` | partition key attribute (string) | `pk` |
+| `KYAOS_DYNAMO_TTL_ATTRIBUTE` | the table's TTL attribute (Unix seconds) | `expiresAt` |
+| `KYAOS_DYNAMO_REGION` | AWS region | boto3's own |
+| `KYAOS_DYNAMO_ENDPOINT` | endpoint URL, for DynamoDB Local | boto3's own |
+
+AWS credentials come from boto3's standard chain, never from these variables. The clients are optional extras,
+imported only when chosen: `pip install 'helixid-sdk-py[redis]'` (redis-py, used through `redis.asyncio`) and
+`pip install 'helixid-sdk-py[dynamo]'` (boto3, called from a worker thread). It fails closed: an unknown store, a
+missing required variable or a missing package raises `NonceStoreConfigError` when the runtime is built, and nothing
+falls back to memory. One startup line on the `helix_mcp_middleware.kyaos` logger names the store without secrets (a
+Redis password is shown as `***`); memory with `ENV` or `NODE_ENV` set to `production` also warns that it covers one
+process only.
+
 ## Examples
 
 See `examples/`:

@@ -17,11 +17,12 @@ and onboarding endpoints hand back.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import quote, urlencode
 
 from . import jwt as helix_jwt
 from . import keys
+from .agent_key import agent_key_registration
 from .errors import SDKOnlyModeNoAPIError
 from .http_adapter import HttpAdapter
 
@@ -312,6 +313,21 @@ class HelixClient:
         return helix_jwt.verify_jwt(token, public_key_hex)
 
     # -- Onboarding ------------------------------------------------------------
+
+    def register_agent_key(
+        self, agent_did: str, public_key: Union[str, bytes, Dict[str, Any]], kid: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Registers the public half of a key the agent generated itself (KYA-OS
+        story L1-A, generate_agent_key()): POST /v1/agents/{did}/keys with the
+        public JWK and the verification-method fragment, nothing else. The body
+        is checked for private material before it is sent (self-custody
+        invariant: no API request from the SDK ever carries a private key).
+        Helix republishes the agent's did:web document with the key as
+        ``<did>#<kid>``, the ``kid`` every JWS the agent signs must carry.
+        Returns {did, kid, didKey, didDocument}."""
+        self._assert_api_configured()
+        body = agent_key_registration(public_key, kid)
+        return self._http_required().post(f"/v1/agents/{quote(agent_did, safe='')}/keys", body)
 
     def onboard_agent(self, enrollment_token: str, domains: Optional[List[str]] = None) -> Dict[str, Any]:
         """Onboards an agent in one call -- agent self-custody has been

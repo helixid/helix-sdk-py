@@ -21,8 +21,15 @@ HelixID, mirroring helix-sdk-js's mcp-middleware package.
   helix_sdk.audit.AuditTrail; create_mcp_audit_trail() /
   create_helix_audit_reporter() build one over `POST /v1/audit-log/events`,
   create_helix_audit_sink() is the one-call legacy `audit_sink` over them.
+- TrustedIssuers / DEFAULT_TRUSTED_ISSUERS ("*"), is_trusted_issuer(),
+  attestation_trust(): which issuers' capability attestations count (KYA-OS
+  story C-B).
 - attach_helix_vp(): client-side, attaches a VP signed server-side (via
   HelixClient.sign_vp()) to an outgoing tool call.
+- create_kyaos() (KYA-OS story L2-A): the `_kyaos_handshake` tool, sessions,
+  a replay store (MemoryNonceStore, RedisNonceStore, DynamoNonceStore) and a
+  server-signed detached proof on every tool call outcome at
+  `_meta["org.kya-os/response-proof"]`; describe_kyaos() for /.well-known/mcp.
 """
 
 from __future__ import annotations
@@ -52,7 +59,7 @@ from .audit_delivery import (
     mark_audit_degraded,
     run_audited_tool,
 )
-from .credentials import ExtractedCredential, extract_credential
+from .credentials import DEFAULT_TRUSTED_ISSUERS, ExtractedCredential, TrustedIssuers, extract_credential
 from .errors import AuthorizationServerUnavailableError, MCPAuthError, ToolScopeError
 from .metadata import (
     HttpErrorResponse,
@@ -60,7 +67,7 @@ from .metadata import (
     protected_resource_metadata_url,
     to_http_error_response,
 )
-from .middleware import async_helixid_mcp_middleware, helixid_mcp_middleware
+from .middleware import AuthorizedCaller, async_helixid_mcp_middleware, helixid_mcp_middleware
 from .oauth import (
     AuthResult,
     OAuthIntrospectionOptions,
@@ -71,6 +78,7 @@ from .oauth import (
 )
 from .providers import auth0, entra, keycloak, okta
 from .types import AttachHelixVPOptions, MCPMiddlewareOptions, MCPToolCall
+from .trusted_issuers import attestation_trust, is_trusted_issuer
 
 __all__ = [
     "AUDIT_META_KEY",
@@ -98,6 +106,10 @@ __all__ = [
     "keycloak",
     "extract_credential",
     "ExtractedCredential",
+    "TrustedIssuers",
+    "DEFAULT_TRUSTED_ISSUERS",
+    "is_trusted_issuer",
+    "attestation_trust",
     "MCPAuthError",
     "ToolScopeError",
     "AuthorizationServerUnavailableError",
@@ -118,4 +130,11 @@ __all__ = [
     "ToolAuditEvent",
     "ToolCallAudit",
     "OAUTH_SUBJECT_KEY_ID",
+    "AuthorizedCaller",
 ]
+
+# KYA-OS session, replay store and server response proof (story L2-A).
+from .kyaos import *  # noqa: E402,F401,F403
+from .kyaos import __all__ as _kyaos_all  # noqa: E402
+
+__all__ += _kyaos_all
