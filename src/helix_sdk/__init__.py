@@ -90,6 +90,7 @@ from .errors import (  # noqa: F401
     HelixError,
     InvalidJWSError,
     ResponseProofError,
+    NeedsAuthorizationError,
     map_api_error,
     ValidationError,
     InternalError,

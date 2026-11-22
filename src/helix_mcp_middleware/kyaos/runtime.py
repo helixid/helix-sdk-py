@@ -144,7 +144,23 @@ class KyaOsAllowed:
         return await self._finish(result)
 
 
-KyaOsStarted = Union[KyaOsDenied, KyaOsAllowed]
+@dataclass
+class KyaOsNeedsAuthorization:
+    """KYA-OS story L3-E: the call lacks authority; ``result`` is the signed challenge to answer with (a tool result)."""
+
+    #: The challenge, in its wire shape.
+    challenge: Dict[str, Any]
+    #: The NeedsAuthorizationError the host's authorization raised.
+    error: BaseException
+    proof: Dict[str, Any]
+    request_hash: str
+    #: challenge_tool_result(challenge) with the proof at ``_meta["org.kya-os/response-proof"]``; responseHash covers all of it.
+    result: Dict[str, Any]
+    session: Optional[KyaOsSession] = None
+    outcome: str = "needs_authorization"
+
+
+KyaOsStarted = Union[KyaOsDenied, KyaOsAllowed, KyaOsNeedsAuthorization]
 
 
 def _reason_of(error: BaseException) -> str:
@@ -343,6 +359,31 @@ class KyaOsRuntime:
                 )
         except Exception as error:  # noqa: BLE001 - every refusal becomes a signed denied proof
             reason = _reason_of(error)
+            # Imported here: needs_authorization imports this package (its store's sync-or-async helper).
+            from ..needs_authorization import challenge_tool_result, is_needs_authorization_error
+
+            if is_needs_authorization_error(error):
+                # L3-E: the challenge is a response body, so its proof carries responseHash over all of it (authorizationUrl included).
+                challenge = dict(getattr(error, "challenge", {}))
+                body = challenge_tool_result(challenge)
+                proof = await self._sign(
+                    session_id=session.id if session is not None else NO_SESSION_ID,
+                    audience=session.audience if session is not None else None,
+                    request_hash=request_hash,
+                    responseHash=hash_response(body, RESPONSE_PROOF_ENVELOPE_PROFILE),
+                    outcome="needs_authorization",
+                    reason=f"requires delegation with scope: {' '.join(challenge.get('scopes') or [])}",
+                    clientDid=caller_did,
+                    prf=RESPONSE_PROOF_ENVELOPE_PROFILE,
+                )
+                return KyaOsNeedsAuthorization(
+                    challenge=challenge,
+                    error=error,
+                    proof=proof,
+                    request_hash=request_hash,
+                    result=attach_response_proof(body, proof),
+                    session=session,
+                )
             proof = await self._sign(
                 session_id=session.id if session is not None else NO_SESSION_ID,
                 audience=session.audience if session is not None else None,
@@ -380,10 +421,10 @@ class KyaOsRuntime:
         client_did: Optional[str] = None,
     ) -> KyaOsStarted:
         """start(), then ``run(arguments, {"session", "client_did"})`` on the
-        stripped arguments (sync or async), then finish(); a denial is
-        returned instead of running."""
+        stripped arguments (sync or async), then finish(); a denial or a
+        needs_authorization challenge is returned instead of running."""
         started = await self.start(call, authorize, client_did)
-        if isinstance(started, KyaOsDenied):
+        if not isinstance(started, KyaOsAllowed):
             return started
         result = await resolve(run(started.arguments, {"session": started.session, "client_did": started.client_did}))
         started.result = await started.finish(result)
@@ -402,6 +443,7 @@ __all__: List[str] = [
     "KyaOsOptions",
     "KyaOsDenied",
     "KyaOsAllowed",
+    "KyaOsNeedsAuthorization",
     "KyaOsStarted",
     "KyaOsRuntime",
     "Authorize",

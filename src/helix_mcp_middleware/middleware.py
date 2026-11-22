@@ -34,6 +34,7 @@ from .errors import (
     MCPAuthError,
     ToolScopeError,
 )
+from .needs_authorization_guard import challenge_for, resume_retry
 from .oauth import AuthResult, create_oauth_validator
 from .types import MCPMiddlewareOptions, MCPToolCall
 
@@ -222,8 +223,16 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
         else:
             required = list(options.required_scopes or [])
 
+        # KYA-OS story L3-E: a retry after consent carries its resume token and credential (needs_authorization_guard.py).
+        retry = resume_retry(options.needs_authorization, caller, tool_call, tool_name, required)
+        if retry is not None:
+            caller = retry
         missing = next((scope for scope in required if scope not in caller["scopes"]), None)
         if missing is not None:
+            # KYA-OS story L3-E: an identified caller without the authority gets a signed challenge instead of the plain 403.
+            challenge = challenge_for(options.needs_authorization, caller, tool_name, required) if retry is None else None
+            if challenge is not None:
+                raise challenge
             audit(caller, tool_name, {"scope": missing, "reason": "insufficient scope"})
             raise ToolScopeError(missing, required)
 
@@ -264,7 +273,8 @@ def _on_loop(callback: Callable[..., Any]) -> Callable[..., Any]:
 def async_helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCall], Awaitable[MCPToolCall]]:
     """The same gate for async MCP servers: runs the (blocking, network-bound)
     check in a worker thread so the event loop stays free. `validate_oauth_token`,
-    `audit_sink` and `on_audit_error` may be sync or async here.
+    `audit_sink` and `on_audit_error` may be sync or async here, as may the
+    `needs_authorization` layer's store, authorizer and audit sink (story L3-E).
     ``await middleware.authorize(tool_call)`` returns the AuthorizedCaller."""
     if options.oauth is not None and options.validate_oauth_token is not None:
         raise ValueError("Provide either `oauth` or `validate_oauth_token`, not both")
@@ -273,6 +283,7 @@ def async_helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCP
         validate_oauth_token=_on_loop(options.validate_oauth_token) if options.validate_oauth_token else None,
         audit_sink=_on_loop(options.audit_sink) if options.audit_sink else None,
         on_audit_error=_on_loop(options.on_audit_error) if options.on_audit_error else None,
+        needs_authorization=options.needs_authorization.bridged(_on_loop) if options.needs_authorization is not None else None,
     )
     gate = helixid_mcp_middleware(bridged)
 
