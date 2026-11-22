@@ -27,6 +27,7 @@ be sync or async. Only KYA-OS ``_meta`` keys are ever read; everything else in
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Set, Union
@@ -49,7 +50,8 @@ from helix_sdk.response_proof import RESPONSE_PROOF_ENVELOPE_PROFILE, hash_reque
 from ._util import resolve
 from .describe import describe_kyaos
 from .errors import KyaOsError, KyaOsReasons
-from .nonce_store import MemoryNonceStore, NonceStore
+from .nonce_store import NonceStore
+from .nonce_store_env import nonce_store_from_env
 from .response_proof import attach_response_proof, build_response_proof
 from .session_store import IDENTITY_ANONYMOUS, IDENTITY_AUTHENTICATED, KyaOsSession, MemorySessionStore, SessionStore
 
@@ -94,8 +96,13 @@ class KyaOsOptions:
     public_origin: Optional[str] = None
     #: Default 120; 30 to 600.
     clock_skew_seconds: Optional[int] = None
-    #: Default MemoryNonceStore (one process). Share a RedisNonceStore or DynamoNonceStore across instances.
+    #: Default: the store KYAOS_NONCE_STORE names (nonce_store_from_env: memory, redis or dynamo; memory
+    #: when unset). An explicit store wins. Share a RedisNonceStore or DynamoNonceStore across instances.
     nonce_store: Optional[NonceStore] = None
+    #: Where the default nonce store reads its settings; default ``os.environ``.
+    env: Optional[Mapping[str, str]] = None
+    #: Where the default nonce store logs its startup line and warnings; default the ``helix_mcp_middleware.kyaos`` logger.
+    logger: Optional[logging.Logger] = None
     session: KyaOsSessionOptions = field(default_factory=KyaOsSessionOptions)
     #: The MCP endpoint, for describe().
     tools_endpoint: Optional[str] = None
@@ -176,13 +183,22 @@ class KyaOsRuntime:
         session = options.session if options.session is not None else KyaOsSessionOptions()
         self.sessions_enabled: bool = session.enabled
         self._now: Callable[[], float] = options.now if options.now is not None else time.time
-        self.nonce_store: NonceStore = options.nonce_store if options.nonce_store is not None else MemoryNonceStore(now=self._now)
+        self.nonce_store: NonceStore = (
+            options.nonce_store
+            if options.nonce_store is not None
+            else nonce_store_from_env(options.env, now=self._now, logger=options.logger)
+        )
         self.session_store: SessionStore = session.store if session.store is not None else MemorySessionStore(ttl_minutes=session.ttl_minutes)
         self.handshake_tool_name: str = HANDSHAKE_TOOL_NAME
         self._audiences: Set[str] = {server_did} | ({options.public_origin} if options.public_origin is not None else set())
         fragment = signer.kid[1:] if signer.kid.startswith("#") else signer.kid
         self._kid = f"{server_did}#{fragment}"
         self._tools_endpoint = options.tools_endpoint
+
+    async def ready(self) -> None:
+        """Resolves at once: in Python the nonce store's settings and package
+        are checked when the runtime is built, and a problem raises there.
+        Kept so hosts can await it as they do helix-sdk-js's ``kya.ready()``."""
 
     # ── description ──────────────────────────────────────────────────────────
 

@@ -32,8 +32,13 @@ Configuration (environment), the same as the JS sample:
   KYAOS_CLOCK_SKEW_SECONDS  30 to 600 (default 120)
   KYAOS_SESSIONS=0        no sessions: the handshake is refused, calls are proven without one
   KYAOS_SESSION_TTL_MINUTES idle TTL (default 30; fractions allowed)
-  KYAOS_REDIS_URL         redis://host:port: a replay store shared by every instance (JS or Python);
-                          without it the store is in memory and covers this instance only
+  KYAOS_NONCE_STORE       the replay store: memory (default, this instance only), redis or dynamo,
+                          read by helix_mcp_middleware itself (nonce_store_from_env); with it:
+                          redis: KYAOS_REDIS_URL, KYAOS_NONCE_KEY_PREFIX (pip install 'helixid-sdk-py[redis]')
+                          dynamo: KYAOS_DYNAMO_TABLE, KYAOS_DYNAMO_KEY_ATTRIBUTE, KYAOS_DYNAMO_TTL_ATTRIBUTE,
+                                  KYAOS_DYNAMO_REGION, KYAOS_DYNAMO_ENDPOINT (pip install 'helixid-sdk-py[dynamo]';
+                                  AWS credentials: boto3's chain). JS and Python instances share one store.
+                          See .env.example.
 """
 
 from __future__ import annotations
@@ -57,17 +62,17 @@ from helix_mcp_middleware import (
     MCPMiddlewareOptions,
     OAuthIntrospectionOptions,
     OAuthIssuerOptions,
-    RedisNonceStore,
     auth0,
     create_helix_audit_sink,
     create_kyaos,
+    describe_nonce_store,
+    read_nonce_store_config,
     entra,
     keycloak,
     okta,
 )
 
 from .app import create_order_app
-from .redis_client import RedisClient
 
 DEMO_TOKENS = {
     "demo-reader": AuthResult(sub="demo-reader", scopes=["orders:read"]),
@@ -199,7 +204,7 @@ def oauth_issuers_from_env(env: Dict[str, str], resource: str) -> List[OAuthIssu
     return issuers
 
 
-_KYAOS_SETTINGS = ("KYAOS_REDIS_URL", "KYAOS_PUBLIC_ORIGIN", "KYAOS_CLOCK_SKEW_SECONDS", "KYAOS_SESSIONS", "KYAOS_SESSION_TTL_MINUTES")
+_KYAOS_SETTINGS = ("KYAOS_NONCE_STORE", "KYAOS_PUBLIC_ORIGIN", "KYAOS_CLOCK_SKEW_SECONDS", "KYAOS_SESSIONS", "KYAOS_SESSION_TTL_MINUTES")
 
 
 def _positive_number(env: Dict[str, str], name: str, integer: bool) -> Optional[float]:
@@ -226,7 +231,6 @@ def kyaos_from_env(env: Dict[str, str], resource: str, service_did: Optional[str
         fail("SERVICE_SIGNING_KEY needs SERVICE_DID (the DID whose document lists the key)")
     skew = _positive_number(env, "KYAOS_CLOCK_SKEW_SECONDS", True)
     ttl_minutes = _positive_number(env, "KYAOS_SESSION_TTL_MINUTES", False)
-    redis_url = env.get("KYAOS_REDIS_URL")
     url = urlsplit(resource)
     try:
         return create_kyaos(
@@ -236,7 +240,8 @@ def kyaos_from_env(env: Dict[str, str], resource: str, service_did: Optional[str
                 public_origin=env.get("KYAOS_PUBLIC_ORIGIN") or f"{url.scheme}://{url.netloc}",
                 clock_skew_seconds=int(skew) if skew is not None else None,
                 session=KyaOsSessionOptions(enabled=env.get("KYAOS_SESSIONS") != "0", ttl_minutes=ttl_minutes),
-                nonce_store=RedisNonceStore(RedisClient(redis_url)) if redis_url else None,
+                # The replay store: the one KYAOS_NONCE_STORE names (nonce_store_from_env), read from the same environment.
+                env=env,
                 tools_endpoint=resource,
             )
         )
@@ -302,10 +307,9 @@ def main() -> None:
     print(f"  OAuth:       {'DEMO tokens demo-reader, demo-admin' if demo else ', '.join(i.issuer for i in issuers) or 'off'}")
     print(f"  Audit:       {api_url + '/v1/audit-log/events' if auth.audit_sink else 'off (set HELIX_API_URL + HELIX_API_KEY)'}")
     if kyaos is not None:
-        store = f"redis {env.get('KYAOS_REDIS_URL')}" if env.get("KYAOS_REDIS_URL") else "in memory (this instance only)"
         print(
             f"  KYA-OS:      proofs by {kyaos.server_did}, sessions {'on' if kyaos.sessions_enabled else 'off'}, "
-            f"skew {kyaos.clock_skew_seconds} s, replay store {store}"
+            f"skew {kyaos.clock_skew_seconds} s, {describe_nonce_store(read_nonce_store_config(env))}"
         )
     else:
         print("  KYA-OS:      off (set SERVICE_SIGNING_KEY)")

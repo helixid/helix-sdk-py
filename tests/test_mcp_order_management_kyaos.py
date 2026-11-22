@@ -6,10 +6,8 @@
 """
 KYA-OS story L2-A in examples/mcp_order_management: the handshake tool,
 sessions and a proof on every call outcome through the real MCP Streamable
-HTTP transport; the sample's minimal Redis client against an in-process RESP
-server; and the KYAOS_* environment. The same cases as the JS sample's
-tests/kyaos.test.ts and tests/redis-client.test.ts. Needs the `mcp` extra,
-so Python 3.10+.
+HTTP transport, and the KYAOS_* environment. The same cases as the JS
+sample's tests/kyaos.test.ts. Needs the `mcp` extra, so Python 3.10+.
 """
 
 from __future__ import annotations
@@ -43,7 +41,6 @@ from helix_mcp_middleware import (  # noqa: E402
 )
 from mcp_order_management import __main__ as entry  # noqa: E402
 from mcp_order_management.app import create_order_app  # noqa: E402
-from mcp_order_management.redis_client import RedisClient  # noqa: E402
 
 BASE = "http://127.0.0.1:3700"
 SERVICE = "did:web:orders.example"
@@ -309,105 +306,6 @@ class TestSendWithProof:
         assert sent[1]["body"] == error and len(finished) == 1
 
 
-# ── the sample's Redis client ────────────────────────────────────────────────
-
-
-class FakeRespServer:
-    """SET key value PX ms NX over RESP2, with special keys that answer an error, a hang-up or an odd reply."""
-
-    def __init__(self) -> None:
-        self.entries: Dict[str, float] = {}
-        self.reply: Optional[bytes] = None
-
-    async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        while True:
-            header = await reader.readline()
-            if not header:
-                break
-            parts = []
-            for _ in range(int(header[1:])):
-                await reader.readline()
-                parts.append((await reader.readline()).decode().rstrip("\r\n"))
-            command, key = parts[0], parts[1]
-            if self.reply is not None:
-                writer.write(self.reply)
-            elif key == "hangup":
-                writer.close()
-                return
-            elif command != "SET" or "NX" not in parts or "PX" not in parts:
-                writer.write(b"-ERR syntax error\r\n")
-            else:
-                expiry = self.entries.get(key)
-                if expiry is not None and expiry > time.time():
-                    writer.write(b"$-1\r\n")
-                else:
-                    self.entries[key] = time.time() + int(parts[parts.index("PX") + 1]) / 1000
-                    writer.write(b"+OK\r\n")
-            await writer.drain()
-
-
-async def with_server(scenario: Any) -> Any:
-    fake = FakeRespServer()
-    server = await asyncio.start_server(fake.handle, "127.0.0.1", 0)
-    port = server.sockets[0].getsockname()[1]
-    try:
-        return await scenario(f"redis://127.0.0.1:{port}", fake)
-    finally:
-        server.close()
-        await server.wait_closed()
-
-
-class TestRedisClient:
-    def test_set_nx_px_replies_and_reconnects(self) -> None:
-        async def scenario(url: str, fake: FakeRespServer) -> None:
-            client = RedisClient(url)
-            assert await client.set("k", "v", px=60_000, nx=True) is True
-            assert await client.set("k", "v", px=60_000, nx=True) is None
-            assert await client.set("k2", "v", px=1, nx=True) is True
-            await asyncio.sleep(0.01)
-            assert await client.set("k2", "v", px=60_000, nx=True) is True
-            await client.close()
-            assert await client.set("k3", "v", px=60_000, nx=True) is True  # reopens after its own close
-            with pytest.raises(ConnectionError, match="closed before a reply"):
-                await client.set("hangup", "v", px=60_000, nx=True)
-            assert await client.set("k4", "v", px=60_000, nx=True) is True  # and after the server hung up
-            assert await client.set("plain", "v") is None  # no PX / NX: the fake refuses, the client reports it
-            await client.close()
-
-        with pytest.raises(RuntimeError, match="syntax error"):
-            asyncio.run(with_server(scenario))
-
-    def test_errors_odd_replies_and_resp3_null(self) -> None:
-        async def scenario(url: str, fake: FakeRespServer) -> None:
-            client = RedisClient(url)
-            fake.reply = b"-ERR nope\r\n"
-            with pytest.raises(RuntimeError, match="redis: ERR nope"):
-                await client.set("k", "v", px=1, nx=True)
-            fake.reply = b":1\r\n"
-            with pytest.raises(RuntimeError, match="unexpected reply"):
-                await client.set("k", "v", px=1, nx=True)
-            fake.reply = b"_\r\n"
-            assert await client.set("k", "v", px=1, nx=True) is None
-            await client.close()
-            await client.close()
-
-        asyncio.run(with_server(scenario))
-        with pytest.raises(ValueError, match="redis://"):
-            RedisClient("http://x")
-        assert RedisClient("redis://")._port == 6379
-
-    def test_backs_a_redis_nonce_store_shared_by_two_instances_under_concurrent_load(self) -> None:
-        async def scenario(url: str, fake: FakeRespServer) -> List[bool]:
-            clients = [RedisClient(url), RedisClient(url)]
-            stores = [RedisNonceStore(clients[0]), RedisNonceStore(clients[1])]
-            results = await asyncio.gather(*[stores[i % 2].insert("k7Hy9mNpQrStUvWxYz01Aa", AGENT, time.time() + 60) for i in range(40)])
-            for client in clients:
-                await client.close()
-            return list(results)
-
-        assert asyncio.run(with_server(scenario)).count(True) == 1
-
-
 # ── the KYAOS_* environment ──────────────────────────────────────────────────
 
 
@@ -420,7 +318,9 @@ class TestKyaOsFromEnv:
     @pytest.mark.parametrize(
         "env,service_did",
         [
-            ({"KYAOS_REDIS_URL": "redis://x"}, SERVICE),
+            ({"KYAOS_NONCE_STORE": "redis"}, SERVICE),
+            ({"SERVICE_SIGNING_KEY": KEYS.private_key, "KYAOS_NONCE_STORE": "postgres"}, SERVICE),
+            ({"SERVICE_SIGNING_KEY": KEYS.private_key, "KYAOS_NONCE_STORE": "redis"}, SERVICE),
             ({"KYAOS_SESSIONS": "0"}, SERVICE),
             ({"SERVICE_SIGNING_KEY": KEYS.private_key}, None),
             ({"SERVICE_SIGNING_KEY": KEYS.private_key, "KYAOS_CLOCK_SKEW_SECONDS": "12.5"}, SERVICE),
@@ -436,14 +336,16 @@ class TestKyaOsFromEnv:
 
     def test_builds_the_runtime_from_the_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SERVICE_SIGNING_KEY", KEYS.private_key)
+        pytest.importorskip("redis")
         env = {
             "SERVICE_SIGNING_KEY": KEYS.private_key, "KYAOS_CLOCK_SKEW_SECONDS": "300", "KYAOS_SESSION_TTL_MINUTES": "0.05",
-            "KYAOS_SESSIONS": "0", "KYAOS_REDIS_URL": "redis://127.0.0.1:6380",
+            "KYAOS_SESSIONS": "0", "KYAOS_NONCE_STORE": "redis", "KYAOS_REDIS_URL": "redis://127.0.0.1:6380",
         }
         runtime = entry.kyaos_from_env(env, self.RESOURCE, SERVICE)
         assert runtime is not None
         assert (runtime.server_did, runtime.clock_skew_seconds, runtime.sessions_enabled) == (SERVICE, 300, False)
         assert runtime.session_store.ttl_minutes == 0.05
+        # The store is the middleware's own choice from the same environment.
         assert isinstance(runtime.nonce_store, RedisNonceStore)
         assert runtime.describe()["endpoints"] == {}
         defaults = entry.kyaos_from_env({"SERVICE_SIGNING_KEY": KEYS.private_key}, self.RESOURCE, SERVICE)
