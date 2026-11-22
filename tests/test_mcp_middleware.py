@@ -47,6 +47,7 @@ from helix_mcp_middleware import (
     AuthResult,
     McpAuditTrail,
     MCPMiddlewareOptions,
+    NeedsAuthorizationOptions,
     OAuthIntrospectionOptions,
     OAuthIssuerOptions,
     async_helixid_mcp_middleware,
@@ -55,6 +56,7 @@ from helix_mcp_middleware import (
     create_helix_audit_reporter,
     create_helix_audit_sink,
     create_mcp_audit_trail,
+    create_needs_authorization,
     current_tool_call,
     delegation_evidence_of,
     create_introspection_validator,
@@ -744,6 +746,18 @@ class TestAudit:
         assert len(events) == 1 and str(errors[0]) == "sink down"
 
     # -- create_helix_audit_reporter (JS: createHelixAuditReporter) -------------
+
+    def test_an_l3e_needs_authorization_challenge_keeps_its_reason(self) -> None:
+        sink = MemoryAuditSink()
+        trail = create_mcp_audit_trail(sink, "did:web:orders.example")
+        layer = create_needs_authorization(
+            NeedsAuthorizationOptions(authorization_url="https://consent.example/authorize", audit_sink=trail.tool_audit_sink(), service_did="did:web:orders.example")
+        )
+        layer.challenge(agent_did="did:key:zAgent", tool="delete_order", scopes=["orders:admin"], effective_scopes=["orders:read"], vp_id="vp:helix:1")
+        assert sink.event_types == ["proof.verified", "authorization.denied"]
+        denied = sink.events[1]
+        assert denied["outcome"] == "denied" and denied["reason"] == {"code": "needs_authorization"}
+        assert denied["authorization"]["decision"] == "denied" and denied["authorization"]["scopeId"] == "orders:admin"
 
     def test_reporter_posts_the_canonical_event_text_with_the_bearer_key(self) -> None:
         http = FakeHttp({"http://api.test/v1/audit-log/events": {}})

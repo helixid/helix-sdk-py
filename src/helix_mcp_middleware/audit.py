@@ -338,9 +338,9 @@ class McpAuditTrail:
         """The middleware's ``audit_sink``: translates each authorization
         decision into the typed events. A HelixID caller: ``proof.verified``,
         then ``delegation.verified`` when the presented credential is known,
-        then ``authorization.approved`` or ``authorization.denied``. An OAuth
-        caller: only the authorization event, with the subject as a keyed
-        commitment."""
+        then ``authorization.approved`` or ``authorization.denied`` (reason
+        ``needs_authorization`` for an L3-E challenge). An OAuth caller: only
+        the authorization event, with the subject as a keyed commitment."""
 
         def sink(event: ToolAuditEvent) -> None:
             call = _CURRENT_CALL.get()
@@ -388,7 +388,12 @@ class McpAuditTrail:
                 self.authorization(
                     "denied",
                     "denied",
-                    reason_code="insufficient_scope" if scope_id is not None else "tool_not_permitted",
+                    # KYA-OS story L3-E: a signed needs_authorization challenge keeps its reason.
+                    reason_code=(
+                        "needs_authorization"
+                        if event.get("reason") == "needs_authorization"
+                        else "insufficient_scope" if scope_id is not None else "tool_not_permitted"
+                    ),
                     context=context,
                     tool_name=tool_name,
                 )
