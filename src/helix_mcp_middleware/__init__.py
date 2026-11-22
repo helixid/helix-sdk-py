@@ -21,6 +21,9 @@ HelixID, mirroring helix-sdk-js's mcp-middleware package.
   helix_sdk.audit.AuditTrail; create_mcp_audit_trail() /
   create_helix_audit_reporter() build one over `POST /v1/audit-log/events`,
   create_helix_audit_sink() is the one-call legacy `audit_sink` over them.
+- TrustedIssuers / DEFAULT_TRUSTED_ISSUERS ("*"), is_trusted_issuer(),
+  attestation_trust(): which issuers' capability attestations count (KYA-OS
+  story C-B).
 - attach_helix_vp(): client-side, attaches a VP signed server-side (via
   HelixClient.sign_vp()) to an outgoing tool call.
 - create_kyaos() (KYA-OS story L2-A): the `_kyaos_handshake` tool, sessions,
@@ -47,7 +50,7 @@ from .audit import (
     current_tool_call,
     delegation_evidence_of,
 )
-from .credentials import ExtractedCredential, extract_credential
+from .credentials import DEFAULT_TRUSTED_ISSUERS, ExtractedCredential, TrustedIssuers, extract_credential
 from .errors import AuthorizationServerUnavailableError, MCPAuthError, ToolScopeError
 from .metadata import (
     HttpErrorResponse,
@@ -66,6 +69,7 @@ from .oauth import (
 )
 from .providers import auth0, entra, keycloak, okta
 from .types import AttachHelixVPOptions, MCPMiddlewareOptions, MCPToolCall
+from .trusted_issuers import attestation_trust, is_trusted_issuer
 
 __all__ = [
     "helixid_mcp_middleware",
@@ -86,6 +90,10 @@ __all__ = [
     "keycloak",
     "extract_credential",
     "ExtractedCredential",
+    "TrustedIssuers",
+    "DEFAULT_TRUSTED_ISSUERS",
+    "is_trusted_issuer",
+    "attestation_trust",
     "MCPAuthError",
     "ToolScopeError",
     "AuthorizationServerUnavailableError",
