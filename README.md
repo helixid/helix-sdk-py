@@ -83,9 +83,13 @@ same results, which `tests/test_verifier.py` proves over the fixture set helix-c
 - **`helix_mcp_middleware`** -- Model Context Protocol integration, the same
   Phase 1 surface as `@helixid/mcp-middleware`:
   `helixid_mcp_middleware()` / `async_helixid_mcp_middleware()` gate every
-  incoming tool call. A caller presents a HelixID VP
-  (`Authorization: HelixVP`, `X-Helix-VP`, or MCP `_meta["x-helix-vp"]`) or
-  an OAuth 2.1 bearer token; `tool_scopes` maps each tool to the scopes it
+  incoming tool call. A caller presents a KYA-OS request proof (MCP
+  `_meta["org.kya-os/request-proof"]`, with its delegation chain at
+  `_meta["org.kya-os/delegation-chain"]`), which the gate verifies in-process
+  with `helix_sdk.verifier` (`verifier=LocalVerifierOptions(...)` or
+  `create_local_verifier()`, story F-2; the Helix API is never asked), or an
+  OAuth 2.1 bearer token. The Helix VP (`HelixVP`, `X-Helix-VP`,
+  `_meta["x-helix-vp"]`) is no longer read. `tool_scopes` maps each tool to the scopes it
   needs and denies unlisted tools; every decision goes to `audit_sink`
   (`create_helix_audit_sink()` writes to the HelixID audit log).
   `oauth=` takes one trusted issuer or a list: `OAuthIssuerOptions(issuer,
@@ -93,8 +97,7 @@ same results, which `tests/test_verifier.py` proves over the fixture set helix-c
   presets `entra()`, `auth0()`, `okta()`, `keycloak()`; opaque tokens are
   checked by RFC 7662 introspection at the one issuer you run.
   `to_http_error_response()` and `build_protected_resource_metadata()` give
-  the 401 / 403 challenges and the RFC 9728 document. `attach_helix_vp()`
-  attaches a VP to an outgoing call. A runnable server is in
+  the 401 / 403 challenges and the RFC 9728 document. A runnable server is in
   [`examples/mcp_order_management`](examples/mcp_order_management).
   Install with the `mcp-middleware` extra:
   `pip install helixid-sdk-py[mcp-middleware]`.

@@ -10,9 +10,9 @@ The gate runs at the HTTP layer, in front of the MCP transport, so a missing
 or invalid credential gets a real HTTP 401 with `WWW-Authenticate` pointing
 at the RFC 9728 metadata (which is how OAuth clients discover the
 authorization server), and a scope failure gets a 403. Only `tools/call` is
-gated: `initialize` and `tools/list` stay open, so HelixID clients that send
-their VP in `params._meta` (not a header) keep working, and a VP is verified
-once per tool call, not once per request."""
+gated: `initialize` and `tools/list` stay open, and a KYA-OS request proof
+(in `params._meta`) is verified once per tool call, in-process, over the
+JSON-RPC request exactly as received (story F-2)."""
 
 from __future__ import annotations
 
@@ -140,6 +140,8 @@ def create_order_app(
                     "input": params.get("arguments") if isinstance(params.get("arguments"), dict) else {},
                     "_meta": params.get("_meta") if isinstance(params.get("_meta"), dict) else None,
                     "headers": headers,
+                    # The proof's requestHash covers the request as sent.
+                    "request": {"method": message["method"], "params": params},
                 })
             except Exception as error:  # noqa: BLE001
                 denial = to_http_error_response(error, metadata_url)

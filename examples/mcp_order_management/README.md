@@ -8,9 +8,11 @@ environment variables, so a client or test written against one works against the
 | `lookup_order` | `orders:read` | Returns an order by id |
 | `refund_order` | `orders:admin` | Refunds an order in full (destructive) |
 
-Any other tool name is denied before it runs. Callers present a HelixID VP (`Authorization: HelixVP <vp>`, legacy
-`X-Helix-VP`, or MCP `params._meta["x-helix-vp"]`) or an OAuth 2.1 bearer token, discovered through the RFC 9728
-metadata at `/.well-known/oauth-protected-resource/mcp`.
+Any other tool name is denied before it runs. Callers present a KYA-OS request proof in MCP
+`params._meta["org.kya-os/request-proof"]` (with the delegation chain the request carries in
+`params._meta["org.kya-os/delegation-chain"]`), verified in-process by the local verifier, or an OAuth 2.1 bearer
+token, discovered through the RFC 9728 metadata at `/.well-known/oauth-protected-resource/mcp`. The Helix VP is no
+longer read (story F-2).
 
 ## Quickstart (no accounts, no authorization server)
 
@@ -36,15 +38,19 @@ curl    "${H[@]}" -H 'authorization: Bearer demo-admin'  $MCP -d "$CALL"   # ref
 
 ## With HelixID, and with real authorization servers
 
-The variables are the JS sample's: `HELIX_API_URL` + `HELIX_API_KEY` + `SERVICE_DID` to verify agent VPs and write the
-audit log; `OAUTH_ISSUER` (alone, or with `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` for opaque tokens) for one
+The variables are the JS sample's. `SERVICE_DID` turns on the KYA-OS door: each request proof is verified in-process
+against that DID, from public DID documents, status lists and the agent's Entity Card alone, so the server authorises
+with the Helix API unreachable (`KYAOS_TRUSTED_ISSUERS`, `KYAOS_TRUSTED_ROOTS`, `KYAOS_MAX_CHAIN_LENGTH`,
+`KYAOS_CARDS_FILE` and, in development, `KYAOS_ALLOW_LOOPBACK_HTTP=1` tune it). `HELIX_API_URL` + `HELIX_API_KEY`
+only write the audit log, never on the request path. `OAUTH_ISSUER` (alone, or with `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` for opaque tokens) for one
 authorization server; `OAUTH_ISSUERS` for several, with the `entra`, `auth0`, `okta` and `keycloak` presets. See the
 docstring of [`__main__.py`](__main__.py) and the JS sample's README for the full table.
 
 ## How it is wired ([`app.py`](app.py))
 
 A small ASGI wrapper sits in front of the MCP SDK's Streamable HTTP app. For each `tools/call` in the request body it
-awaits `async_helixid_mcp_middleware` with the tool name, `params._meta` and the request headers; a denial becomes a
+awaits `async_helixid_mcp_middleware` with the tool name, `params._meta`, the JSON-RPC request as received (the
+proof's `requestHash` covers it) and the request headers; a denial becomes a
 401 / 400 / 403 through `to_http_error_response()`, an unreachable authorization server a 503, and anything else is
 handed, body intact, to the transport. `initialize` and `tools/list` are not gated. The tools
 ([`orders.py`](orders.py)) contain no auth code.
