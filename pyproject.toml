@@ -25,6 +25,8 @@ dev = [
 ]
 mcp-middleware = [
     "mcp>=1.9,<2; python_version >= '3.10'",
+    # /.well-known/mcp: the discovery document is validated against the KYA-OS schema (story L1-D).
+    "jsonschema>=4.18",
 ]
 # KYA-OS replay store clients for helix_mcp_middleware (KYAOS_NONCE_STORE=redis / dynamo).
 redis = [
@@ -41,6 +43,7 @@ crewai = [
 ]
 all = [
     "mcp>=1.9,<2; python_version >= '3.10'",
+    "jsonschema>=4.18",
     "redis>=5.0",
     "boto3>=1.28",
     "langchain-core>=0.3; python_version >= '3.10'",
@@ -61,7 +64,7 @@ where = ["src"]
 helix_sdk = ["py.typed"]
 helix_langchain = ["py.typed"]
 helix_crewai = ["py.typed"]
-helix_mcp_middleware = ["py.typed"]
+helix_mcp_middleware = ["py.typed", "schemas/*.json"]
 
 [tool.pytest.ini_options]
 addopts = [
