@@ -56,6 +56,15 @@ from .audit import (
     create_mcp_audit_trail,
     current_tool_call,
 )
+from .audit_delivery import (
+    AUDIT_META_KEY,
+    async_run_audited_tool,
+    audit_tool_handlers,
+    audit_unavailable_response,
+    create_helix_audit_delivery,
+    mark_audit_degraded,
+    run_audited_tool,
+)
 from .credentials import DEFAULT_TRUSTED_ISSUERS, ExtractedCredential, TrustedIssuers, extract_credential
 from .errors import PROOF_INVALID, PROOF_MISSING, AuthorizationServerUnavailableError, MCPAuthError, ProofError, ToolScopeError
 from .metadata import (
@@ -91,6 +100,13 @@ from .verify_locally import (
 )
 
 __all__ = [
+    "AUDIT_META_KEY",
+    "async_run_audited_tool",
+    "audit_tool_handlers",
+    "audit_unavailable_response",
+    "create_helix_audit_delivery",
+    "mark_audit_degraded",
+    "run_audited_tool",
     "helixid_mcp_middleware",
     "async_helixid_mcp_middleware",
     "MCPMiddlewareOptions",

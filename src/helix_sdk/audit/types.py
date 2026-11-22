@@ -19,7 +19,7 @@ object's metadata (see ``evidence.py``), never its bytes.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Literal, Tuple
+from typing import Any, Dict, Literal, Optional, Tuple
 
 PartyRef = Dict[str, Any]
 EvidenceRef = Dict[str, Any]
@@ -165,3 +165,5 @@ class AuditTrailEntry:
     """RFC 8785 text of ``event``."""
     event_digest: str
     """``sha256:`` over ``org.kya-os.audit.event.v1 NUL canonical``."""
+    receipt: Optional[Dict[str, Any]] = None
+    """The recorder's signed entry when the sink delivered in ``required`` mode (story A-2)."""

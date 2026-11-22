@@ -214,8 +214,10 @@ class AuditTrail:
                 source["previousSourceEventDigest"] = self._last_digest
             event = {**built, "source": source}
             entry = AuditTrailEntry(event=event, canonical=canonicalize(event), event_digest=audit_event_digest(event))
-            self._sink.append(entry)
+            receipt = self._sink.append(entry)
             self._last_digest = entry.event_digest
+            if isinstance(receipt, dict):
+                entry.receipt = receipt
             return entry
 
     def evidence(

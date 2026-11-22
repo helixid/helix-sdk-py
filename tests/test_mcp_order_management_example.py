@@ -238,22 +238,33 @@ class _FailingAfter:
         self.entries.append(entry)
 
 
-@pytest.mark.parametrize(
-    "limit, status, recorded",
-    [
-        (0, 500, []),  # session.established cannot be recorded: the call does not run
-        (2, 500, ["session.established", "authorization.approved"]),  # tool.call.started fails: still no run
-    ],
-)
-def test_a_call_that_cannot_be_recorded_does_not_run(limit: int, status: int, recorded: List[str]) -> None:
-    reporter = _FailingAfter(limit)
+def test_a_call_whose_session_cannot_be_recorded_does_not_run() -> None:
+    reporter = _FailingAfter(0)  # session.established cannot be recorded: a 500, before the guard
     instance = App(reporter=reporter)
     with instance.http:
         res = instance.call("refund_order", {"orderId": "ORD-1002", "reason": "x"}, bearer("admin"))
-        assert res.status_code == status and res.json() == {"error": "server_error"}
-        assert [e.event["eventType"] for e in reporter.entries] == recorded
+        assert res.status_code == 500 and res.json() == {"error": "server_error"}
+        assert reporter.entries == []
         assert len(instance.errors) == 1 and str(instance.errors[0]) == "audit API down"
         # The refund never ran: a second, recorded attempt still finds the order refundable.
+        reporter.limit = 100
+        assert json.loads(text(instance.call("refund_order", {"orderId": "ORD-1002", "reason": "x"}, bearer("admin"))))["status"] == "refunded"
+
+
+def test_a_call_whose_intent_cannot_be_recorded_answers_audit_delivery_failed_and_does_not_run() -> None:
+    # As the JS sample (A-2): tool.call.started fails, the tool does not run,
+    # and the answer is the tool error audit_delivery_failed, marked degraded.
+    reporter = _FailingAfter(2)
+    instance = App(reporter=reporter)
+    with instance.http:
+        res = instance.call("refund_order", {"orderId": "ORD-1002", "reason": "x"}, bearer("admin"))
+        assert res.status_code == 200
+        result = res.json()["result"]
+        assert result["isError"] is True
+        assert json.loads(result["content"][0]["text"])["error"]["code"] == "audit_delivery_failed"
+        assert result["_meta"]["org.kya-os/audit"]["status"] == "degraded"
+        assert [e.event["eventType"] for e in reporter.entries] == ["session.established", "authorization.approved"]
+        assert instance.errors == []
         reporter.limit = 100
         assert json.loads(text(instance.call("refund_order", {"orderId": "ORD-1002", "reason": "x"}, bearer("admin"))))["status"] == "refunded"
 
@@ -266,13 +277,19 @@ def test_a_denial_that_cannot_be_recorded_is_a_500() -> None:
     assert res.status_code == 500 and len(instance.errors) == 1
 
 
-def test_a_completion_that_cannot_be_recorded_is_reported_after_the_answer() -> None:
-    reporter = _FailingAfter(3)  # session, authorization, started; completed fails after the answer went out
+def test_a_completion_that_cannot_be_recorded_marks_the_held_answer_degraded() -> None:
+    # As the JS sample (A-2): the tool ran, so its answer goes out, held until
+    # the completion append and marked degraded when that append fails.
+    reporter = _FailingAfter(3)  # session, authorization, started; completed fails
     instance = App(reporter=reporter)
     with instance.http:
         res = instance.call("lookup_order", {"orderId": "ORD-1001"}, bearer("reader"))
-    assert res.status_code == 200 and json.loads(text(res))["id"] == "ORD-1001"
-    assert len(instance.errors) == 1 and str(instance.errors[0]) == "audit API down"
+    assert res.status_code == 200
+    result = res.json()["result"]
+    assert json.loads(result["content"][0]["text"])["id"] == "ORD-1001"
+    assert result["isError"] is True
+    assert result["_meta"]["org.kya-os/audit"] == {"status": "degraded", "reason": "Required terminal audit delivery failed after the tool ran"}
+    assert instance.errors == []
 
 
 @needs_fixtures
@@ -338,17 +355,17 @@ def test_batches_are_refused_before_the_gate_so_nothing_is_audited(app: App) -> 
     assert app.audit == []
 
 
-def test_a_transport_refusal_after_the_gate_is_a_failed_call(app: App) -> None:
+def test_a_transport_refusal_after_the_gate_records_no_tool_events(app: App) -> None:
     # The MCP transport wants `accept: application/json, text/event-stream`; without it the
-    # call was authorized but never ran, so it is recorded as failed, not completed.
+    # call was authorized but the tool never ran. The tool events come from the tool itself
+    # (audit_tool_handlers, as the JS sample's auditToolHandlers), so none are recorded.
     res = app.http.post(
         "/mcp",
         json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "lookup_order", "arguments": {"orderId": "ORD-1001"}}},
         headers={"content-type": "application/json", "accept": "text/plain", **bearer("reader")},
     )
     assert res.status_code == 406
-    assert app.event_types == ["session.established", "authorization.approved", "tool.call.started", "tool.call.failed"]
-    assert app.audit[-1]["reason"] == {"code": "handler_error"}
+    assert app.event_types == ["session.established", "authorization.approved"]
 
 
 def test_the_legacy_audit_sink_alone_still_receives_decisions() -> None:

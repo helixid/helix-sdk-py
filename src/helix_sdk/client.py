@@ -256,11 +256,16 @@ class HelixClient:
         since: Optional[str] = None,
         limit: Optional[int] = None,
         family: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """``GET /v1/audit-log``: rows ``{id, recordedAt, eventDigest, event}``,
-        newest first, where ``event`` is the typed KYA-OS producer event
-        (helix_sdk.audit)."""
-        qs = _query_string({"eventType": event_type, "family": family, "since": since, "limit": limit})
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """``GET /v1/audit-log``: one page, ``{"items": [...], "nextCursor": str | None}``,
+        newest first. Pass ``nextCursor`` back as ``cursor`` for the next page
+        (``None`` on the last). On helix-core each item is a row ``{id,
+        recordedAt, eventDigest, event, ledgerId, ledgerEpochId, sequence,
+        entryDigest, receipt}``, ``event`` the typed KYA-OS producer event
+        (helix_sdk.audit); a hosted deployment's account view answers the same
+        page shape with the event at the account's tier."""
+        qs = _query_string({"eventType": event_type, "family": family, "since": since, "cursor": cursor, "limit": limit})
         return self._http_required().get(f"/v1/audit-log{qs}")
 
     def record_audit_event(self, event: Dict[str, Any]) -> None:

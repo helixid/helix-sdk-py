@@ -19,8 +19,12 @@ by typed KYA-OS audit events: `session.established` before the gate, the
 gate's own decision events (`proof.verified` or `proof.rejected` for a
 KYA-OS request proof, `authorization.approved` / `denied`), then `tool.call.started`
 and `tool.call.completed` / `tool.call.failed`, or `tool.call.denied` when
-the gate refused, all under one correlationId. An audit write that fails
-fails the call (a 500): a call that cannot be recorded does not run.
+the gate refused, all under one correlationId. A session that cannot be
+recorded fails the call (a 500) before the gate. Each tool runs through
+``audit_tool_handlers`` (A-2, as the JS sample): under required delivery a
+tool whose intent cannot be recorded does not run and answers
+``audit_delivery_failed``, and an answer whose completion cannot be recorded
+is marked degraded (``_meta["org.kya-os/audit"]``).
 
 With `kyaos` set, the same layer runs the KYA-OS session and proof flow (story
 L2-A): the `_kyaos_handshake` tool opens a session (credentials, when present,
@@ -59,6 +63,7 @@ from helix_mcp_middleware import (
     MCPMiddlewareOptions,
     WellKnownMcp,
     async_helixid_mcp_middleware,
+    audit_tool_handlers,
     build_protected_resource_metadata,
     protected_resource_metadata_url,
     to_http_error_response,
@@ -191,6 +196,10 @@ def create_order_app(
             ],
         ),
     )
+    if audit is not None:
+        # A-2: each tool runs audited, under the tool call begin_tool_call opens per request
+        # (the handshake, opened without one, runs unaudited).
+        audit_tool_handlers(server)
     register_order_tools(server, store if store is not None else create_order_store())
     if kyaos is not None:
         _register_handshake(server, kyaos)
@@ -348,7 +357,7 @@ def create_order_app(
                     raw = json.dumps(body).encode("utf-8")
                     finish = started_call.finish
 
-                await handle(scope, raw, receive, send, call_audit, finish, server_error)
+                await handle(scope, raw, receive, send, finish, server_error)
         except Exception as error:  # noqa: BLE001 - not the caller's fault: a 500 (or 503), reported
             if on_server_error is not None:
                 on_server_error(error)
@@ -368,16 +377,14 @@ def create_order_app(
         raw: bytes,
         receive: Any,
         send: Any,
-        call_audit: Any,
         finish: Optional[Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         server_error: Optional[Callable[[BaseException], Awaitable[None]]] = None,
     ) -> None:
         """Hands the request (its control arguments stripped) to the MCP
-        transport: with KYA-OS the result is signed on its way out; with a tool
-        call's audit, `tool.call.started` first and `completed` on a 2xx
-        answer, else `failed`."""
+        transport: with KYA-OS the result is signed on its way out, over the
+        tool's final answer (a degraded audit marker included). A tool call's
+        audit events come from the tools themselves (audit_tool_handlers)."""
         replayed = False
-        status: Optional[int] = None
 
         async def replay() -> Any:
             nonlocal replayed
@@ -386,28 +393,10 @@ def create_order_app(
                 return {"type": "http.request", "body": raw, "more_body": False}
             return await receive()
 
-        async def observe(message: Any) -> None:
-            nonlocal status
-            if message["type"] == "http.response.start":
-                status = message["status"]
-            await send(message)
-
-        target = observe if call_audit is not None else send
+        target = send
         if finish is not None:
             target = await _send_with_proof(target, finish, server_error)
-        if call_audit is None:
-            await mcp_app(scope, replay, target)
-            return
-        call_audit.started()
-        try:
-            await mcp_app(scope, replay, target)
-        except Exception:
-            call_audit.failed("handler_error")
-            raise
-        if status is not None and 200 <= status < 300:
-            call_audit.completed()
-        else:
-            call_audit.failed("handler_error")
+        await mcp_app(scope, replay, target)
 
     return app
 

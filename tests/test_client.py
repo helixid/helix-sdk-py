@@ -359,14 +359,14 @@ class TestEnterpriseMode:
 
 
 class TestAuditLog:
-    def test_get_audit_log_passes_filters(self, http) -> None:
-        rows = [{"id": "1", "recordedAt": "t", "eventDigest": "sha256:" + "0" * 64, "event": {"eventType": "consent.approved"}}]
-        http.respond(200, rows)
+    def test_get_audit_log_returns_one_page_and_passes_filters_and_cursor(self, http) -> None:
+        page = {"items": [{"id": "1", "recordedAt": "t", "eventDigest": "sha256:" + "0" * 64, "event": {"eventType": "consent.approved"}}], "nextCursor": "abc_-1"}
+        http.respond(200, page)
         client = HelixClient(BASE_URL, api_key="hak")
-        assert client.get_audit_log(event_type="consent.approved", since="2026-01-01", limit=5, family="consent") == rows
-        assert http.calls[0].url == BASE_URL + "/v1/audit-log?eventType=consent.approved&family=consent&since=2026-01-01&limit=5"
-        http.respond(200, [])
-        assert client.get_audit_log() == [] and http.calls[1].url == BASE_URL + "/v1/audit-log"
+        assert client.get_audit_log(event_type="consent.approved", since="2026-01-01", limit=5, family="consent", cursor="prev") == page
+        assert http.calls[0].url == BASE_URL + "/v1/audit-log?eventType=consent.approved&family=consent&since=2026-01-01&cursor=prev&limit=5"
+        http.respond(200, {"items": [], "nextCursor": None})
+        assert client.get_audit_log() == {"items": [], "nextCursor": None} and http.calls[1].url == BASE_URL + "/v1/audit-log"
 
     def test_record_audit_event_posts_the_event_and_lets_a_refusal_propagate(self, http) -> None:
         event = {"eventType": "consent.approved", "schema": "x"}
