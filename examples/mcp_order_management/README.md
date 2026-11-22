@@ -8,9 +8,11 @@ environment variables, so a client or test written against one works against the
 | `lookup_order` | `orders:read` | Returns an order by id |
 | `refund_order` | `orders:admin` | Refunds an order in full (destructive) |
 
-Any other tool name is denied before it runs. Callers present a HelixID VP (`Authorization: HelixVP <vp>`, legacy
-`X-Helix-VP`, or MCP `params._meta["x-helix-vp"]`) or an OAuth 2.1 bearer token, discovered through the RFC 9728
-metadata at `/.well-known/oauth-protected-resource/mcp`.
+Any other tool name is denied before it runs. Callers present a KYA-OS request proof in MCP
+`params._meta["org.kya-os/request-proof"]` (with the delegation chain the request carries in
+`params._meta["org.kya-os/delegation-chain"]`), verified in-process by the local verifier, or an OAuth 2.1 bearer
+token, discovered through the RFC 9728 metadata at `/.well-known/oauth-protected-resource/mcp`. The Helix VP is no
+longer read (story F-2).
 
 ## Quickstart (no accounts, no authorization server)
 
@@ -36,20 +38,25 @@ curl    "${H[@]}" -H 'authorization: Bearer demo-admin'  $MCP -d "$CALL"   # ref
 
 ## With HelixID, and with real authorization servers
 
-The variables are the JS sample's: `HELIX_API_URL` + `HELIX_API_KEY` + `SERVICE_DID` to verify agent VPs and write the
-audit log (typed KYA-OS audit events, one `session.established` / `tool.call.*` bracket per call plus the gate's
-decisions, with `delegation.verified` naming the presented agent credential; tool names are withheld unless
-`AUDIT_INCLUDE_TOOL_NAMES=1`; a session that cannot be recorded fails the call with a 500, and under the default
-`AUDIT_DELIVERY=required` a tool whose intent cannot be recorded does not run and answers `audit_delivery_failed`,
-while one whose completion cannot be recorded is marked degraded; `AUDIT_DELIVERY=buffered` with `AUDIT_OUTBOX_DIR`,
-or `best-effort` with `AUDIT_ACCEPT_AAP1=1`, as in the JS sample); `OAUTH_ISSUER` (alone, or with `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` for opaque tokens) for one
+The variables are the JS sample's. `SERVICE_DID` turns on the KYA-OS door: each request proof is verified in-process
+against that DID, from public DID documents, status lists and the agent's Entity Card alone, so the server authorises
+with the Helix API unreachable (`KYAOS_TRUSTED_ISSUERS`, `KYAOS_TRUSTED_ROOTS`, `KYAOS_MAX_CHAIN_LENGTH`,
+`KYAOS_CARDS_FILE` and, in development, `KYAOS_ALLOW_LOOPBACK_HTTP=1` tune it). `HELIX_API_URL` + `HELIX_API_KEY`
+(with `SERVICE_DID`) only write the audit log, never on the request path: typed KYA-OS audit events, one
+`session.established` / `tool.call.*` bracket per call plus the gate's decisions (`proof.verified` at the proof's level,
+or `proof.rejected`), delivered to the recorder (`POST /v1/audit/submissions`, story A-2); tool names are withheld unless
+`AUDIT_INCLUDE_TOOL_NAMES=1`. A session that cannot be recorded fails the call with a 500; under the default
+`AUDIT_DELIVERY=required` a tool whose intent cannot be recorded does not run and answers `audit_delivery_failed`, and
+one whose completion cannot be recorded is marked degraded; `AUDIT_DELIVERY=buffered` takes `AUDIT_OUTBOX_DIR`, and
+`best-effort` needs `AUDIT_ACCEPT_AAP1=1`, as in the JS sample. `OAUTH_ISSUER` (alone, or with `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` for opaque tokens) for one
 authorization server; `OAUTH_ISSUERS` for several, with the `entra`, `auth0`, `okta` and `keycloak` presets. See the
 docstring of [`__main__.py`](__main__.py) and the JS sample's README for the full table.
 
 ## How it is wired ([`app.py`](app.py))
 
 A small ASGI wrapper sits in front of the MCP SDK's Streamable HTTP app. For each `tools/call` in the request body it
-awaits `async_helixid_mcp_middleware` with the tool name, `params._meta` and the request headers; a denial becomes a
+awaits `async_helixid_mcp_middleware` with the tool name, `params._meta`, the JSON-RPC request as received (the
+proof's `requestHash` covers it) and the request headers; a denial becomes a
 401 / 400 / 403 through `to_http_error_response()`, an unreachable authorization server a 503, and anything else is
 handed, body intact, to the transport. `initialize` and `tools/list` are not gated. The tools
 ([`orders.py`](orders.py)) contain no auth or audit code: with an audit trail, `audit_tool_handlers(server)` wraps
@@ -70,3 +77,26 @@ The replay store is chosen by `KYAOS_NONCE_STORE`, which `helix_mcp_middleware` 
 `pip install 'helixid-sdk-py[redis]'`) or `dynamo` (`KYAOS_DYNAMO_TABLE`, needs `pip install 'helixid-sdk-py[dynamo]'`)
 is shared by every instance, JS or Python. See [`.env.example`](.env.example) and the package README for every
 variable. A bad setting or a missing package stops the server at startup.
+
+## KYA-OS `needs_authorization` and resume (story L3-E)
+
+Set `KYAOS_AUTHORIZATION_URL` (the consent page) and a caller whose scopes do not cover a tool gets the signed `needs_authorization` challenge as the call's result instead of a 403, with a resume token bound to the agent, tool and scopes (`KYAOS_RESUME_TTL_SECONDS`, default 600; the token store follows `KYAOS_NONCE_STORE`, chosen by `helix_mcp_middleware` itself: Redis on `KYAOS_REDIS_URL` when the replay store is Redis, sharing records with JS instances, memory otherwise). The retry carries `_kyaos_resume` and the DelegationCredential as `_kyaos_delegation`. In `DEMO_MODE` the bearers `demo-agent` and `demo-agent-2` are agents with a DID and `orders:read` only, and the retry's credential is checked structurally by `demo_authorizer.py` (invoker, invocationTarget, allowedAction, validUntil, a `proof` present; no signature verification, which stories F-2 and L3-H bring); outside demo mode every retry is refused until a verifier is wired in. `AUDIT_LOG_FILE` appends every audit event as a JSON line. The same wire behaviour as the JS sample.
+
+## Discovery at `/.well-known/mcp` (story L1-D)
+
+Whenever `SERVICE_DID` is a `did:web` or `did:key`, the server answers `GET /.well-known/mcp` with the KYA-OS
+discovery document, the same bytes the JS sample serves for the same environment: the DID, `endpoints.tools` at
+`KYAOS_PUBLIC_ORIGIN` (default: the origin of `MCP_RESOURCE`), `endpoints.handshake` while the KYA-OS layer runs with
+sessions, `clockSkewSeconds` (the handshake's), `capabilities` (`proofs` true with `SERVICE_SIGNING_KEY`; the rest
+false, nothing else is on in this sample) and, with `STATUS_LIST_CREDENTIAL`, that URL. The document is validated
+against the schema at startup; `WELL_KNOWN_MCP=0` turns the route off (404) and `WELL_KNOWN_MCP=1` makes a
+`SERVICE_DID` the document cannot carry a startup error. Behind a proxy, forward `/.well-known/mcp` at the origin root
+to this process and set `KYAOS_PUBLIC_ORIGIN` (helix-sdk-js's `mcp-middleware/docs/well-known.md` has the nginx, ALB
+and API Gateway rules).
+
+```bash
+curl -s localhost:3700/.well-known/mcp | python -m json.tool
+```
+
+A `SERVICE_DID` of another method (a `did:hedera` from a Helix stack, say) cannot be the document's `serverDid`, so
+the route stays off and the `Discovery:` startup line says why.

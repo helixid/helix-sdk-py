@@ -10,14 +10,14 @@ The gate runs at the HTTP layer, in front of the MCP transport, so a missing
 or invalid credential gets a real HTTP 401 with `WWW-Authenticate` pointing
 at the RFC 9728 metadata (which is how OAuth clients discover the
 authorization server), and a scope failure gets a 403. Only `tools/call` is
-gated: `initialize` and `tools/list` stay open, so HelixID clients that send
-their VP in `params._meta` (not a header) keep working, and a VP is verified
-once per tool call, not once per request.
+gated: `initialize` and `tools/list` stay open, and a KYA-OS request proof
+(in `params._meta`) is verified once per tool call, in-process, over the
+JSON-RPC request exactly as received (story F-2).
 
 With an `audit` trail (McpAuditTrail), every gated tools/call is bracketed
 by typed KYA-OS audit events: `session.established` before the gate, the
-gate's own decision events (`proof.verified`, `delegation.verified` for a
-HelixID VP, `authorization.approved` / `denied`), then `tool.call.started`
+gate's own decision events (`proof.verified` or `proof.rejected` for a
+KYA-OS request proof, `authorization.approved` / `denied`), then `tool.call.started`
 and `tool.call.completed` / `tool.call.failed`, or `tool.call.denied` when
 the gate refused, all under one correlationId. A session that cannot be
 recorded fails the call (a 500) before the gate. Each tool runs through
@@ -32,7 +32,12 @@ make it an authenticated one); every other tool call is started before the
 transport sees it (session lookup, authorization, control arguments stripped)
 and its JSON-RPC result is finished on the way out, where it is hashed and the
 proof signed into `_meta["org.kya-os/response-proof"]`. A refusal carries its
-`denied` proof in the 400/401/403 body."""
+`denied` proof in the 400/401/403 body.
+
+With `auth.needs_authorization` set (story L3-E), a caller whose delegation
+does not cover the tool gets the signed `needs_authorization` challenge as the
+call's result, and a retry carrying `_kyaos_resume` and `_kyaos_delegation` is
+verified through that layer before the tool runs."""
 
 from __future__ import annotations
 
@@ -49,17 +54,17 @@ from pydantic import Field, StrictInt
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 
-from helix_sdk import decode_helix_vp
 from helix_mcp_middleware import (
     AuthorizationServerUnavailableError,
     KyaOsDenied,
+    KyaOsNeedsAuthorization,
     KyaOsRuntime,
     McpAuditTrail,
     MCPMiddlewareOptions,
+    WellKnownMcp,
     async_helixid_mcp_middleware,
     audit_tool_handlers,
     build_protected_resource_metadata,
-    extract_credential,
     protected_resource_metadata_url,
     to_http_error_response,
 )
@@ -146,6 +151,7 @@ def create_order_app(
     on_server_error: Optional[Callable[[BaseException], None]] = None,
     audit: Optional[McpAuditTrail] = None,
     kyaos: Optional[KyaOsRuntime] = None,
+    well_known: Optional[WellKnownMcp] = None,
 ) -> Any:
     """An ASGI app. `resource` is this server's MCP endpoint URL (MCP is
     served at its path); `auth` is everything except the scopes, which this
@@ -153,7 +159,9 @@ def create_order_app(
     events (pair it with `auth.audit_sink = audit.tool_audit_sink()`);
     `kyaos` turns on the KYA-OS layer (story L2-A): the handshake tool,
     sessions, the replay store and a server-signed proof on every tool call
-    outcome."""
+    outcome. `well_known` serves the KYA-OS discovery document at
+    `/.well-known/mcp` (story L1-D, from create_well_known_mcp()); a disabled
+    one answers 404."""
     url = urlsplit(resource)
     if url.scheme not in ("http", "https") or not url.hostname:
         raise ValueError(f"resource must be an http(s) URL, got {resource!r}")
@@ -167,7 +175,9 @@ def create_order_app(
         scopes_supported=list(dict.fromkeys(s for scopes in TOOL_SCOPES.values() for s in scopes)),
         resource_name="Order Management (HelixID sample)",
     )
-    gate = async_helixid_mcp_middleware(replace(auth, tool_scopes=TOOL_SCOPES, required_scopes=[]))
+    # The handshake needs an identified caller, not a scope: it is listed with none (story F-2).
+    tool_scopes = {**TOOL_SCOPES, kyaos.handshake_tool_name: []} if kyaos is not None else TOOL_SCOPES
+    gate = async_helixid_mcp_middleware(replace(auth, tool_scopes=tool_scopes, required_scopes=[]))
 
     server = FastMCP(
         "order-management",
@@ -210,6 +220,8 @@ def create_order_app(
         async def respond(status: int, body: Any, headers: Optional[dict] = None) -> None:
             await JSONResponse(body, status_code=status, headers=headers)(scope, receive, send)
 
+        if well_known is not None and await well_known.handle(scope, receive, send):
+            return
         path, method = scope["path"], scope["method"]
         if path == metadata_path and method == "GET":
             await respond(200, metadata)
@@ -250,12 +262,11 @@ def create_order_app(
         is_tool_call = isinstance(body, dict) and body.get("method") == "tools/call"
         first_params = body.get("params") if is_tool_call and isinstance(body.get("params"), dict) else {}
         first_name = first_params.get("name") if isinstance(first_params.get("name"), str) else None
-        first_meta = first_params.get("_meta") if isinstance(first_params.get("_meta"), dict) else None
         # One audited call per tools/call; the KYA-OS handshake is no gated tool call, so it is not audited as one.
         audited = audit is not None and is_tool_call and not (kyaos is not None and kyaos.is_handshake(first_name))
         try:
             audit_scope = (
-                audit.begin_tool_call(first_name, credential=_presented_vp(headers, first_meta))  # type: ignore[union-attr]
+                audit.begin_tool_call(first_name)  # type: ignore[union-attr]
                 if audited
                 else nullcontext()
             )
@@ -297,15 +308,16 @@ def create_order_app(
                     name = params.get("name")
                     arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
                     meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else None
-                    tool_call = {"name": name, "input": arguments, "_meta": meta, "headers": headers}
+                    # The proof's requestHash covers the request as sent (story F-2).
+                    tool_call = {"name": name, "input": arguments, "_meta": meta, "headers": headers, "request": {"method": message["method"], "params": params}}
 
                     if kyaos is not None and kyaos.is_handshake(name):
                         # The handshake is open to anonymous agents; a credential, when
                         # sent, must be good and makes the session an authenticated one.
                         try:
-                            caller = await gate.authorize({**tool_call, "name": "lookup_order"})  # type: ignore[attr-defined]
+                            caller = await gate.authorize(tool_call)  # type: ignore[attr-defined]
                         except Exception as error:  # noqa: BLE001
-                            if getattr(error, "code", None) != "VP_MISSING":
+                            if getattr(error, "code", None) != "PROOF_MISSING":
                                 await refuse(error)
                                 return
                         else:
@@ -332,6 +344,13 @@ def create_order_app(
                         return
                     if isinstance(started_call, KyaOsDenied):
                         await refuse(started_call.error, started_call.proof)
+                        return
+                    if isinstance(started_call, KyaOsNeedsAuthorization):
+                        # KYA-OS story L3-E: the signed challenge is the call's result (a tool error result with the
+                        # proof in _meta), answered here since the tool itself never runs: audited as a denied call.
+                        if call_audit is not None:
+                            call_audit.denied(_reason_code(started_call.error))
+                        await respond(200, {"jsonrpc": "2.0", "id": message.get("id"), "result": started_call.result})
                         return
                     # Control arguments (`_kyaos*`) never reach the tool.
                     message["params"] = {**params, "arguments": started_call.arguments}
@@ -386,14 +405,3 @@ def _reason_code(error: BaseException) -> str:
     """The code a refused or failed call is audited with: the error's code (never its message), lower-cased, else `server_error`."""
     code = getattr(error, "code", None)
     return code.lower() if isinstance(code, str) and code else "server_error"
-
-
-def _presented_vp(headers: Any, meta: Optional[dict]) -> Optional[dict]:
-    """The HelixID VP a tool call presents, decoded, so the audit trail can
-    derive the delegation evidence (SPEC section 7.8). None when there is none
-    or it does not decode: the gate, not this, answers a bad credential."""
-    try:
-        credential = extract_credential(headers, meta)
-        return decode_helix_vp(credential.value) if credential is not None and credential.kind == "vp" else None
-    except Exception:  # noqa: BLE001
-        return None

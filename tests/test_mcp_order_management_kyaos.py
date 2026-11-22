@@ -17,6 +17,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
 from unittest.mock import MagicMock
 
 import pytest
@@ -29,12 +30,13 @@ from starlette.testclient import TestClient  # noqa: E402
 
 from helix_sdk import kyaos  # noqa: E402
 from helix_sdk.did import build_did_document  # noqa: E402
-from helix_sdk.keys import generate_key_pair  # noqa: E402
-from helix_sdk.vp_transport import encode_helix_vp  # noqa: E402
+from helix_sdk.keys import generate_key_pair, public_key_to_multibase  # noqa: E402
+from helix_sdk.verifier import REQUEST_PROOF_META_KEY, sign_request_proof  # noqa: E402
 from helix_sdk.audit import MemoryAuditSink  # noqa: E402
 from helix_mcp_middleware import (  # noqa: E402
     KyaOsOptions,
     KyaOsSessionOptions,
+    LocalVerifierOptions,
     MCPMiddlewareOptions,
     MemoryNonceStore,
     RedisNonceStore,
@@ -46,7 +48,10 @@ from mcp_order_management.app import create_order_app  # noqa: E402
 
 BASE = "http://127.0.0.1:3700"
 SERVICE = "did:web:orders.example"
-AGENT = "did:key:z6Mkagent"
+AGENT_KEYS = generate_key_pair()
+_AGENT_MULTIBASE = public_key_to_multibase(AGENT_KEYS.public_key)
+AGENT = f"did:key:{_AGENT_MULTIBASE}"
+AGENT_SIGNER = kyaos.EnvSigner(AGENT, kid=_AGENT_MULTIBASE, env_var="AGENT_KEY", env={"AGENT_KEY": AGENT_KEYS.private_key})
 KEYS = generate_key_pair()
 DOCUMENT = build_did_document(SERVICE, KEYS.public_key)
 SIGNER = kyaos.EnvSigner(SERVICE, env_var="SAMPLE_SERVICE_KEY", env={"SAMPLE_SERVICE_KEY": KEYS.private_key})
@@ -59,14 +64,6 @@ def resolve_did(did: str) -> Optional[Dict[str, Any]]:
     return DOCUMENT if did == SERVICE else None
 
 
-def fake_client() -> MagicMock:
-    client = MagicMock()
-    client.verify_vp.side_effect = lambda vp, **kw: (
-        {"valid": True, "agentDid": AGENT, "effectiveScopes": ["orders:read"], "vpId": vp["id"]}
-        if vp["id"].startswith("vp:ok")
-        else {"valid": False, "error": "bad signature"}
-    )
-    return client
 
 
 def validate(token: str) -> Dict[str, Any]:
@@ -93,11 +90,13 @@ class App:
                 nonce_store=nonce_store if nonce_store is not None else MemoryNonceStore(now=self.clock.now),
             )
         )
+        # Story F-2: request proofs are verified in-process, sharing the runtime's replay store.
+        verifier = LocalVerifierOptions(clock=lambda: int(self.clock.now() * 1000), nonce_store=self.kyaos.nonce_store, report_verification=lambda entry: None)
         # With `audited`, A-1's typed audit trail runs alongside the KYA-OS layer.
         self.audit_sink = MemoryAuditSink()
         audit = create_mcp_audit_trail(self.audit_sink, SERVICE) if audited else None
         options = MCPMiddlewareOptions(
-            client=fake_client(), service_did=SERVICE, validate_oauth_token=validate, audit_sink=audit.tool_audit_sink() if audit else None
+            verifier=verifier, service_did=SERVICE, validate_oauth_token=validate, audit_sink=audit.tool_audit_sink() if audit else None
         )
         self.http = TestClient(create_order_app(f"{BASE}/mcp", options, on_server_error=self.errors.append, kyaos=self.kyaos, audit=audit), base_url=BASE)
         self.next_id = 1
@@ -109,11 +108,17 @@ class App:
     def call(self, name: str, args: Dict[str, Any], headers: Optional[Dict[str, str]] = None, meta: Optional[Dict[str, Any]] = None) -> Any:
         return self.rpc("tools/call", {"name": name, "arguments": args, **({"_meta": meta} if meta else {})}, headers)
 
-    def handshake(self, headers: Optional[Dict[str, str]] = None, **args: Any) -> Any:
-        return self.call("_kyaos_handshake", {**kyaos.create_handshake_request(audience=SERVICE, now=self.clock.now()), **args}, headers)
+    def handshake(self, headers: Optional[Dict[str, str]] = None, proven: bool = False, **args: Any) -> Any:
+        arguments = {**kyaos.create_handshake_request(audience=SERVICE, now=self.clock.now()), **args}
+        return self.call("_kyaos_handshake", arguments, headers, self.proof("_kyaos_handshake", arguments) if proven else None)
 
-    def session(self, headers: Optional[Dict[str, str]] = None, **args: Any) -> str:
-        response = self.handshake(headers, **args)
+    def proof(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """The agent's request proof for exactly this call, minted now (story F-2)."""
+        signed = sign_request_proof(request(name, args), AGENT_SIGNER, audience=SERVICE, now_ms=int(self.clock.now() * 1000))
+        return {REQUEST_PROOF_META_KEY: signed}
+
+    def session(self, headers: Optional[Dict[str, str]] = None, proven: bool = False, **args: Any) -> str:
+        response = self.handshake(headers, proven, **args)
         assert response.status_code == 200, response.text
         assert "isError" not in response.json()["result"] or not response.json()["result"]["isError"], response.text
         return response.json()["result"]["structuredContent"]["sessionId"]
@@ -128,10 +133,6 @@ def app() -> Any:
 
 def bearer(token: str) -> Dict[str, str]:
     return {"authorization": f"Bearer {token}"}
-
-
-def vp(identifier: str) -> Dict[str, str]:
-    return {"authorization": f"HelixVP {encode_helix_vp({'id': identifier})}"}
 
 
 def request(name: str, args: Dict[str, Any], meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -174,11 +175,16 @@ class TestHandshakeTool:
         app.session(audience=BASE)
 
     def test_a_good_credential_makes_the_session_authenticated_and_a_bad_one_is_refused(self, app: App) -> None:
-        session_id = app.session(vp("vp:ok-1"))
+        session_id = app.session(proven=True)
         session = app.kyaos.session_store.get(session_id, app.clock.now())
         assert (session.agent_did, session.identity_state) == (AGENT, "authenticated")
-        assert app.handshake(vp("vp:bad")).status_code == 401
-        mismatch = app.handshake(vp("vp:ok-2"), agentDid="did:key:z6Mkother").json()["result"]
+        # The same proof again is a replayed nonce: refused before the handshake runs.
+        arguments = kyaos.create_handshake_request(audience=SERVICE, now=app.clock.now())
+        stale = app.proof("_kyaos_handshake", arguments)
+        assert app.call("_kyaos_handshake", arguments, None, stale).status_code == 200
+        replayed = app.call("_kyaos_handshake", arguments, None, stale)
+        assert replayed.status_code == 401 and "nonce_replayed" in replayed.json()["error_description"]
+        mismatch = app.handshake(None, True, agentDid="did:key:z6Mkother").json()["result"]
         assert mismatch["structuredContent"]["error"] == "agent_did_mismatch"
         # An OAuth caller has no agent DID: the session stays anonymous.
         oauth_session = app.kyaos.session_store.get(app.session(bearer("reader")), app.clock.now())
@@ -189,8 +195,9 @@ class TestProofs:
     def test_allowed_call_carries_a_proof_the_sdk_verifies_by_recomputing_both_hashes(self, app: App) -> None:
         session_id = app.session(agentDid=AGENT)
         args = {"orderId": "ORD-1001", "_kyaos_session": session_id}
-        meta = {"traceparent": "00-1-2-01", "io.modelcontextprotocol/trace": "x", "org.example/other": {"deep": True}}
-        response = app.call("lookup_order", args, vp("vp:ok-3"), meta)
+        # Unknown _meta keys are ignored; the retired x-helix-vp is one of them now.
+        meta = {"traceparent": "00-1-2-01", "io.modelcontextprotocol/trace": "x", "org.example/other": {"deep": True}, "x-helix-vp": "ignored"}
+        response = app.call("lookup_order", args, bearer("reader"), meta)
         assert response.status_code == 200, response.text
         result = response.json()["result"]
         assert '"ORD-1001"' in result["content"][0]["text"]
@@ -235,7 +242,7 @@ class TestProofs:
         assert verified.outcome == "denied"
         anonymous = app.call("lookup_order", {"orderId": "ORD-1001"})
         assert anonymous.status_code == 401
-        assert anonymous.json()["_meta"][PROOF]["meta"]["reason"] == "VP_MISSING"
+        assert anonymous.json()["_meta"][PROOF]["meta"]["reason"] == "PROOF_MISSING"
 
     def test_unknown_malformed_and_expired_sessions_are_refused_with_400(self, app: App) -> None:
         malformed = app.call("lookup_order", {"orderId": "ORD-1001", "_kyaos_session": "sess_x"}, bearer("reader"))
@@ -371,14 +378,41 @@ class TestWithTheTypedAuditTrail:
         with instance.http:
             session = instance.session(agentDid=AGENT)
             assert instance.audit_sink.events == []
-            res = instance.call("lookup_order", {"orderId": "ORD-1001", "_kyaos_session": session}, vp("vp:ok-9"))
+            res = instance.call("lookup_order", {"orderId": "ORD-1001", "_kyaos_session": session}, bearer("reader"))
         assert res.status_code == 200, res.text
         assert res.json()["result"]["_meta"][PROOF]["meta"]["outcome"] == "allowed"
         sink = instance.audit_sink
-        assert sink.event_types == ["session.established", "proof.verified", "authorization.approved", "tool.call.started", "tool.call.completed"]
+        assert sink.event_types == ["session.established", "authorization.approved", "tool.call.started", "tool.call.completed"]
         assert len({event["correlationId"] for event in sink.events}) == 1
-        assert all(event["actor"]["kind"] == "pairwise_did" for event in sink.events[1:])
-        assert "ORD-1001" not in str(sink.events)
+        assert all(event["actor"]["kind"] == "keyed_commitment" for event in sink.events[1:])
+        assert "ORD-1001" not in str(sink.events) and "user-reader" not in str(sink.events)
+
+    def test_records_a_kyaos_caller_by_its_verified_proof_then_the_decision(self) -> None:
+        instance = App(audited=True)
+        with instance.http:
+            args = {"orderId": "ORD-1001"}
+            res = instance.call("lookup_order", args, None, instance.proof("lookup_order", args))
+        assert res.status_code == 403
+        assert res.json()["_meta"][PROOF]["meta"]["outcome"] == "denied"
+        sink = instance.audit_sink
+        assert sink.event_types == ["session.established", "proof.verified", "authorization.denied", "tool.call.denied"]
+        assert sink.events[1]["actor"] == {"kind": "pairwise_did", "did": AGENT}
+        assert sink.events[1]["details"]["verificationCode"].startswith("KYAOS_PROOF")
+        assert sink.events[2]["reason"] == {"code": "insufficient_scope"}
+
+    def test_records_a_refused_request_proof_as_proof_rejected(self) -> None:
+        instance = App(audited=True)
+        with instance.http:
+            args = {"orderId": "ORD-1001"}
+            meta = instance.proof("lookup_order", args)
+            instance.call("lookup_order", args, None, meta)
+            del instance.audit_sink.entries[:]
+            res = instance.call("lookup_order", args, None, meta)
+        assert res.status_code == 401
+        sink = instance.audit_sink
+        assert sink.event_types == ["session.established", "proof.rejected", "tool.call.denied"]
+        assert sink.events[1]["outcome"] == "denied" and sink.events[1]["actor"] == {"kind": "pairwise_did", "did": AGENT}
+        assert sink.events[2]["reason"] == {"code": "proof_invalid"}
 
     def test_records_a_denied_call_by_its_code_and_still_answers_with_the_denied_proof(self) -> None:
         instance = App(audited=True)

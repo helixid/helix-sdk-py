@@ -8,10 +8,10 @@
 Configuration (environment), the same as the JS sample:
   PORT, HOST            listen address (default 3700 on 127.0.0.1)
   MCP_RESOURCE          public URL of the MCP endpoint (default http://localhost:$PORT/mcp); the OAuth audience
-  HELIX_API_URL         HelixID API to verify VPs and write audit events. Required whenever
-  HELIX_API_KEY         HELIX_API_KEY is set: there is deliberately no default URL.
-  SERVICE_DID           this server's DID: VPs for other services are rejected; the producer of
-                        its audit events (required with HELIX_API_KEY)
+  HELIX_API_URL         HelixID API the audit trail writes to. Required whenever HELIX_API_KEY
+  HELIX_API_KEY         is set: there is deliberately no default URL. Never on the request path. The
+                        key turns on the audit trail (KYA-OS typed events), whose producer is this
+                        server, so it also needs SERVICE_DID.
   AUDIT_INCLUDE_TOOL_NAMES=1
                         record tool names (`action.name`) in audit events; off by default, a tool
                         name being a caller-presented reference
@@ -20,6 +20,18 @@ Configuration (environment), the same as the JS sample:
                         best-effort: only with AUDIT_ACCEPT_AAP1=1
   AUDIT_OUTBOX_DIR      buffered delivery's durable outbox directory (AUDIT_OUTBOX=memory asks for the
                         ephemeral one, which buffered delivery refuses at startup)
+  SERVICE_DID           this server's DID: the KYA-OS door (story F-2). Every tool call that carries
+                        a request proof in _meta["org.kya-os/request-proof"] (and its delegation chain
+                        in _meta["org.kya-os/delegation-chain"]) is verified in-process against this
+                        DID as audience and resource, from public DID documents, status lists and the
+                        agent's Entity Card alone. Optional:
+  KYAOS_TRUSTED_ISSUERS   comma-separated attestation issuers, or * (default: allow all)
+  KYAOS_TRUSTED_ROOTS     comma-separated DIDs the root hop may be issued by (default: any)
+  KYAOS_MAX_CHAIN_LENGTH  longest carried chain read (default 10)
+  KYAOS_CARDS_FILE        JSON file mapping agent DIDs to their Entity Cards (local config, read before
+                          the card is fetched from the agent's DID document)
+  KYAOS_ALLOW_LOOPBACK_HTTP=1  development only: read DID documents, cards and status lists over
+                          http on loopback hosts
   OAUTH_ISSUER          OAuth door, one authorization server. The issuer alone is enough: its keys are
                         read from its metadata (aud must be MCP_RESOURCE). Optional:
   OAUTH_JWKS_URI          its jwks_uri, to skip discovery
@@ -48,33 +60,59 @@ Configuration (environment), the same as the JS sample:
                                   KYAOS_DYNAMO_REGION, KYAOS_DYNAMO_ENDPOINT (pip install 'helixid-sdk-py[dynamo]';
                                   AWS credentials: boto3's chain). JS and Python instances share one store.
                           See .env.example.
+  KYAOS_AUTHORIZATION_URL KYA-OS (story L3-E): the consent page a caller without the authority for a
+                        tool is sent to. Turns on the signed needs_authorization challenge and the
+                        resume flow; the resume-token store follows KYAOS_NONCE_STORE, read by
+                        helix_mcp_middleware itself (resume_token_store_from_env): Redis on
+                        KYAOS_REDIS_URL, key prefix KYAOS_RESUME_KEY_PREFIX, when the replay store is
+                        Redis (records shared with JS instances), memory otherwise. In
+                        DEMO_MODE the retry's DelegationCredential is checked structurally only (see
+                        demo_authorizer.py); outside it every retry is refused until a verifier
+                        (stories F-2, L3-H) is wired in. Optional:
+  KYAOS_RESUME_TTL_SECONDS  resume-token lifetime (default 600)
+  AUDIT_LOG_FILE        append every audit event as one JSON line to this file, next to (or instead
+                        of) the HelixID audit sink; for local runs and the e2e suite
+  WELL_KNOWN_MCP        KYA-OS discovery (story L1-D): GET /.well-known/mcp is served whenever SERVICE_DID
+                        is a did:web or did:key (the document's serverDid), with endpoints at
+                        KYAOS_PUBLIC_ORIGIN (default: the origin of MCP_RESOURCE) and the KYA-OS values
+                        above. 0 turns the route off (404); 1 makes a SERVICE_DID the document cannot
+                        carry a startup error instead of a notice. Optional:
+  STATUS_LIST_CREDENTIAL  URL of this server's status list credential, advertised in the document
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
-from typing import Any, Dict, List, NoReturn, Optional
+from typing import Any, Callable, Dict, List, NoReturn, Optional, Tuple
 
 import uvicorn
 
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from helix_sdk import HelixClient
 from helix_sdk.crypto.jws import EnvSigner
 from helix_mcp_middleware import (
     AuthResult,
     KyaOsOptions,
     KyaOsRuntime,
     KyaOsSessionOptions,
+    LocalVerifierOptions,
     MCPMiddlewareOptions,
+    NeedsAuthorization,
+    NeedsAuthorizationOptions,
     OAuthIntrospectionOptions,
     OAuthIssuerOptions,
+    WellKnownMcp,
+    WellKnownMcpConfig,
+    WellKnownMcpError,
     auth0,
     create_helix_audit_delivery,
     create_kyaos,
     create_mcp_audit_trail,
+    create_needs_authorization,
+    create_well_known_mcp,
     describe_nonce_store,
     read_nonce_store_config,
     entra,
@@ -83,10 +121,15 @@ from helix_mcp_middleware import (
 )
 
 from .app import create_order_app
+from .demo_authorizer import demo_retry_authorizer
+from .orders import TOOL_SCOPES
 
 DEMO_TOKENS = {
     "demo-reader": AuthResult(sub="demo-reader", scopes=["orders:read"]),
     "demo-admin": AuthResult(sub="demo-admin", scopes=["orders:read", "orders:admin"]),
+    # Agents with a DID as subject, for the needs_authorization flow (story L3-E): read only until a delegation grants more.
+    "demo-agent": AuthResult(sub="did:key:z6MkdemoAgentOrdersRead", scopes=["orders:read"]),
+    "demo-agent-2": AuthResult(sub="did:key:z6MkdemoAgentTwoOrdersRead", scopes=["orders:read"]),
 }
 
 
@@ -259,6 +302,144 @@ def kyaos_from_env(env: Dict[str, str], resource: str, service_did: Optional[str
         fail(f"KYA-OS: {error}")
 
 
+def did_list(env: Dict[str, str], name: str) -> Optional[List[str]]:
+    """A comma-separated list of DIDs, or None when the variable is unset or `*`."""
+    raw = (env.get(name) or "").strip()
+    if not raw or raw == "*":
+        return None
+    dids = [did.strip() for did in raw.split(",") if did.strip()]
+    if any(not did.startswith("did:") for did in dids):
+        fail(f"{name} must list DIDs")
+    return dids
+
+
+def verifier_from_env(env: Dict[str, str], service_did: str, kyaos: Optional[KyaOsRuntime]) -> LocalVerifierOptions:
+    """The local verifier's settings (story F-2), the same variables as the JS sample."""
+    max_chain_length: Optional[int] = None
+    if env.get("KYAOS_MAX_CHAIN_LENGTH"):
+        try:
+            max_chain_length = int(env["KYAOS_MAX_CHAIN_LENGTH"])
+        except ValueError:
+            max_chain_length = 0
+        if max_chain_length < 1:
+            fail("KYAOS_MAX_CHAIN_LENGTH must be a positive integer")
+    cards: Optional[Dict[str, Any]] = None
+    if env.get("KYAOS_CARDS_FILE"):
+        try:
+            with open(env["KYAOS_CARDS_FILE"], encoding="utf-8") as handle:
+                cards = json.load(handle)
+        except (OSError, ValueError) as error:
+            fail(f"KYAOS_CARDS_FILE: {error}")
+        if not isinstance(cards, dict):
+            fail("KYAOS_CARDS_FILE must hold a JSON object of agent DID to card")
+    trusted = did_list(env, "KYAOS_TRUSTED_ISSUERS")
+    return LocalVerifierOptions(
+        service_did=service_did,
+        trusted_issuers=trusted if trusted is not None else "*",
+        trusted_root_issuers=did_list(env, "KYAOS_TRUSTED_ROOTS"),
+        max_chain_length=max_chain_length,
+        cards=cards,
+        allow_loopback_http=env.get("KYAOS_ALLOW_LOOPBACK_HTTP") == "1",
+        catalog=list(dict.fromkeys(scope for scopes in TOOL_SCOPES.values() for scope in scopes)),
+        # One replay store for the handshake, the response proofs and the request proofs.
+        nonce_store=kyaos.nonce_store if kyaos is not None else None,
+        # Story A-1 connects the audit trail here; until then each verification is logged once as unrecorded.
+        log=lambda message: print(message, file=sys.stderr),
+    )
+
+
+def needs_authorization_from_env(
+    env: Dict[str, str], service_did: Optional[str], demo: bool, audit_sink: Optional[Callable[[Dict[str, Any]], Any]]
+) -> Optional[NeedsAuthorization]:
+    """The L3-E layer from KYAOS_AUTHORIZATION_URL and KYAOS_RESUME_TTL_SECONDS, or None when it is off."""
+    authorization_url = env.get("KYAOS_AUTHORIZATION_URL")
+    if not authorization_url:
+        if env.get("KYAOS_RESUME_TTL_SECONDS"):
+            fail("KYAOS_RESUME_TTL_SECONDS needs KYAOS_AUTHORIZATION_URL")
+        return None
+    if not service_did:
+        fail("KYAOS_AUTHORIZATION_URL needs SERVICE_DID (the challenge binds the token to this service)")
+    ttl_seconds = _positive_number(env, "KYAOS_RESUME_TTL_SECONDS", False)
+
+    def url_for(context: Any) -> str:
+        # The consent page, with the binding in its query so the page knows what to show (the token stays out of the URL).
+        parts = urlsplit(authorization_url)
+        query = urlencode([*parse_qsl(parts.query), ("agent", context.agent_did), ("tool", context.tool), ("scope", " ".join(context.scopes))])
+        return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", query, parts.fragment))
+
+    base = urlsplit(authorization_url)
+    if base.scheme not in ("http", "https") or not base.netloc:
+        fail(f"KYAOS_AUTHORIZATION_URL must be an absolute http(s) URL, got {authorization_url!r}")
+    try:
+        return create_needs_authorization(
+            NeedsAuthorizationOptions(
+                authorization_url=url_for,
+                ttl_seconds=ttl_seconds,
+                # The resume-token store follows KYAOS_NONCE_STORE, chosen by helix_mcp_middleware itself from the same environment.
+                env=env,
+                authorizer=demo_retry_authorizer(service_did) if demo else None,
+                audit_sink=audit_sink,
+                on_audit_error=lambda error: print("audit write failed:", error, file=sys.stderr),
+                service_did=service_did,
+            )
+        )
+    except ValueError as error:
+        fail(f"KYA-OS needs_authorization: {error}")
+
+
+def _file_audit_sink(path: str, then_sink: Optional[Callable[[Dict[str, Any]], Any]]) -> Callable[[Dict[str, Any]], Any]:
+    """Appends every event as one JSON line to ``path``, then hands it to ``then_sink`` when there is one."""
+
+    def sink(event: Dict[str, Any]) -> Any:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, separators=(",", ":")) + "\n")
+        return then_sink(event) if then_sink is not None else None
+
+    return sink
+
+
+def well_known_from_env(
+    env: Dict[str, str], resource: str, service_did: Optional[str], kyaos: Optional[KyaOsRuntime]
+) -> Tuple[Optional[WellKnownMcp], Optional[str]]:
+    """The discovery document (story L1-D): built once and validated against the schema, or the reason it is off."""
+    setting = env.get("WELL_KNOWN_MCP")
+    if setting == "0":
+        return create_well_known_mcp(WellKnownMcpConfig(enabled=False)), "off (WELL_KNOWN_MCP=0): 404"
+    if not service_did:
+        return None, "off (set SERVICE_DID)"
+    if not re.match(r"did:(web|key):", service_did) and setting != "1":
+        return None, (
+            f"off (SERVICE_DID {service_did} is not a did:web or did:key, which the document's serverDid must be; "
+            "WELL_KNOWN_MCP=1 makes this an error)"
+        )
+    url = urlsplit(resource)
+    try:
+        return create_well_known_mcp(
+            WellKnownMcpConfig(
+                public_origin=env.get("KYAOS_PUBLIC_ORIGIN") or f"{url.scheme}://{url.netloc}",
+                server_did=service_did,
+                tools_endpoint=url.path or "/",
+                kyaos=kyaos.describe() if kyaos is not None else None,
+                status_list_credential=env.get("STATUS_LIST_CREDENTIAL") or None,
+            )
+        ), None
+    except WellKnownMcpError as error:
+        fail(f"/.well-known/mcp: {error}")
+
+
+def describe_well_known(well_known: Optional[WellKnownMcp], off: Optional[str]) -> str:
+    """The startup line's text, the same as the JS sample's."""
+    document = well_known.document if well_known is not None else None
+    if document is None:
+        return off or "off"
+    tools = urlsplit(document["endpoints"]["tools"])
+    return (
+        f"{tools.scheme}://{tools.netloc}/.well-known/mcp, serverDid {document['serverDid']}, skew {document['clockSkewSeconds']} s, "
+        f"handshake {'advertised' if 'handshake' in document['endpoints'] else 'absent'} "
+        "(route the path at that origin to this server: see helix-sdk-js mcp-middleware/docs/well-known.md)"
+    )
+
+
 def main() -> None:
     env = dict(os.environ)
     try:
@@ -271,7 +452,7 @@ def main() -> None:
     demo = env.get("DEMO_MODE") == "1"
 
     if api_key and not api_url:
-        # HelixClient given only an API key talks to the hosted production API.
+        # An audit sink given only an API key would talk to the hosted production API.
         fail("HELIX_API_KEY is set but HELIX_API_URL is not; set HELIX_API_URL explicitly (e.g. a local server)")
     if demo and host not in ("127.0.0.1", "localhost", "::1"):
         fail("DEMO_MODE accepts fixed tokens and is only allowed on a loopback HOST")
@@ -285,31 +466,39 @@ def main() -> None:
         on_audit_error=lambda error: print("audit write failed:", error, file=sys.stderr),
     )
     audit = None
-    if api_url:
-        auth.client = HelixClient(api_url, api_key=api_key) if api_key else HelixClient(api_url)
-        if api_key:
-            if not service_did:
-                fail("HELIX_API_KEY writes audit events, whose producer is this server: set SERVICE_DID")
-            delivery = env.get("AUDIT_DELIVERY") or "required"
-            try:
-                reporter = create_helix_audit_delivery(
-                    api_url,
-                    api_key,
-                    delivery=delivery,
-                    outbox_dir=env.get("AUDIT_OUTBOX_DIR") or None,
-                    outbox="memory" if env.get("AUDIT_OUTBOX") == "memory" else None,
-                    accept_aap1=env.get("AUDIT_ACCEPT_AAP1") == "1",
-                    on_delivery_failure=lambda error, _event: print("audit delivery failed:", error, file=sys.stderr),
-                )
-            except ValueError as error:
-                fail(f"audit delivery refused: {error}")
-            audit = create_mcp_audit_trail(
-                reporter,
-                service_did,
-                include_tool_names=env.get("AUDIT_INCLUDE_TOOL_NAMES") == "1",
+    if api_url and api_key:
+        # The audit trail is the only thing that talks to the Helix API, and never on the request path.
+        if not service_did:
+            fail("HELIX_API_KEY writes audit events, whose producer is this server: set SERVICE_DID")
+        # A-2: delivery to the HelixID recorder (POST /v1/audit/submissions).
+        delivery = env.get("AUDIT_DELIVERY") or "required"
+        try:
+            reporter = create_helix_audit_delivery(
+                api_url,
+                api_key,
+                delivery=delivery,
+                outbox_dir=env.get("AUDIT_OUTBOX_DIR") or None,
+                outbox="memory" if env.get("AUDIT_OUTBOX") == "memory" else None,
+                accept_aap1=env.get("AUDIT_ACCEPT_AAP1") == "1",
+                on_delivery_failure=lambda error, _event: print("audit delivery failed:", error, file=sys.stderr),
             )
-            # The gate's decisions and the call lifecycle share one trail (one source, one sequence).
-            auth.audit_sink = audit.tool_audit_sink()
+        except ValueError as error:
+            fail(f"audit delivery refused: {error}")
+        audit = create_mcp_audit_trail(
+            reporter,
+            service_did,
+            include_tool_names=env.get("AUDIT_INCLUDE_TOOL_NAMES") == "1",
+        )
+        # The gate's decisions and the call lifecycle share one trail (one source, one sequence).
+        auth.audit_sink = audit.tool_audit_sink()
+    if env.get("AUDIT_LOG_FILE"):
+        auth.audit_sink = _file_audit_sink(env["AUDIT_LOG_FILE"], auth.audit_sink)
+    kyaos = kyaos_from_env(env, resource, service_did)
+    if service_did:
+        # The KYA-OS door (story F-2): every request proof is verified here, in-process.
+        auth.verifier = verifier_from_env(env, service_did, kyaos)
+    elif any(env.get(name) for name in ("KYAOS_TRUSTED_ISSUERS", "KYAOS_TRUSTED_ROOTS", "KYAOS_MAX_CHAIN_LENGTH", "KYAOS_CARDS_FILE")):
+        fail("KYAOS_TRUSTED_ISSUERS / KYAOS_TRUSTED_ROOTS / KYAOS_MAX_CHAIN_LENGTH / KYAOS_CARDS_FILE need SERVICE_DID")
     if demo:
         def demo_token(token: str) -> AuthResult:
             if token not in DEMO_TOKENS:
@@ -319,10 +508,11 @@ def main() -> None:
         auth.validate_oauth_token = demo_token
     elif issuers:
         auth.oauth = issuers
-    if auth.client is None and auth.validate_oauth_token is None and auth.oauth is None:
-        fail("no way to authenticate callers: set HELIX_API_URL (HelixID VPs), OAUTH_ISSUER / OAUTH_ISSUERS, or DEMO_MODE=1")
+    if auth.verifier is None and auth.validate_oauth_token is None and auth.oauth is None:
+        fail("no way to authenticate callers: set SERVICE_DID (KYA-OS request proofs), OAUTH_ISSUER / OAUTH_ISSUERS, or DEMO_MODE=1")
 
-    kyaos = kyaos_from_env(env, resource, service_did)
+    auth.needs_authorization = needs_authorization_from_env(env, service_did, demo, auth.audit_sink)
+    well_known, well_known_off = well_known_from_env(env, resource, service_did, kyaos)
     try:
         app = create_order_app(
             resource,
@@ -331,19 +521,33 @@ def main() -> None:
             on_server_error=lambda error: print("server error:", repr(error), file=sys.stderr),
             audit=audit,
             kyaos=kyaos,
+            well_known=well_known,
         )
     except ValueError as error:
         fail(str(error))
 
     print(f"order-management MCP server on {resource}")
-    print(f"  HelixID VPs: {'verified via ' + api_url if auth.client else 'off (set HELIX_API_URL)'}")
-    print(f"  OAuth:       {'DEMO tokens demo-reader, demo-admin' if demo else ', '.join(i.issuer for i in issuers) or 'off'}")
-    audit_line = (
-        f"{api_url}/v1/audit-log/events (KYA-OS typed events; tool names {'recorded' if audit.include_tool_names else 'withheld'})"
-        if audit
-        else "off (set HELIX_API_URL + HELIX_API_KEY + SERVICE_DID)"
+    print(
+        "  KYA-OS proofs: "
+        + (
+            f"verified in-process for {service_did}, trusted issuers {env.get('KYAOS_TRUSTED_ISSUERS') or '*'}, "
+            f"chain length <= {env.get('KYAOS_MAX_CHAIN_LENGTH') or 10}"
+            if auth.verifier is not None
+            else "off (set SERVICE_DID)"
+        )
     )
-    print(f"  Audit:       {audit_line}")
+    print(f"  OAuth:       {'DEMO tokens demo-reader, demo-admin, demo-agent, demo-agent-2' if demo else ', '.join(i.issuer for i in issuers) or 'off'}")
+    audits = [
+        f"{api_url}/v1/audit-log/events (KYA-OS typed events; tool names {'recorded' if audit.include_tool_names else 'withheld'})" if audit else "",
+        f"file {env['AUDIT_LOG_FILE']}" if env.get("AUDIT_LOG_FILE") else "",
+    ]
+    print(f"  Audit:       {' + '.join(a for a in audits if a) or 'off (set HELIX_API_URL + HELIX_API_KEY + SERVICE_DID, or AUDIT_LOG_FILE)'}")
+    if auth.needs_authorization is not None:
+        store = "in redis (KYAOS_REDIS_URL)" if read_nonce_store_config(env).kind == "redis" else "in memory"
+        retries = "checked structurally (DEMO_MODE, no signature verification)" if demo else "refused until a verifier is wired in"
+        print(f"  Consent:     needs_authorization challenges to {env['KYAOS_AUTHORIZATION_URL']}, resume tokens {store}, retries {retries}")
+    else:
+        print("  Consent:     off (set KYAOS_AUTHORIZATION_URL)")
     if kyaos is not None:
         print(
             f"  KYA-OS:      proofs by {kyaos.server_did}, sessions {'on' if kyaos.sessions_enabled else 'off'}, "
@@ -351,6 +555,7 @@ def main() -> None:
         )
     else:
         print("  KYA-OS:      off (set SERVICE_SIGNING_KEY)")
+    print(f"  Discovery:   {describe_well_known(well_known, well_known_off)}")
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 

@@ -35,93 +35,63 @@ def fake_client_and_did():
     return client, did
 
 
+class _Verifier:
+    """Stands in for the local verifier (story F-2): every proof verifies with ``scopes``."""
+
+    def __init__(self, scopes: Any) -> None:
+        self.scopes = list(scopes)
+        self.calls: list = []
+
+    def verify_call(self, call: Dict[str, Any]) -> Any:
+        from types import SimpleNamespace
+
+        self.calls.append(call)
+        return SimpleNamespace(ok=True, effective_scopes=self.scopes, proof_did="did:key:zTestAgent", level="L1", fresh=True, reasons=[], proof_assurance="L3-minus")
+
+
+PROOF_META = {"org.kya-os/request-proof": {"prf": "org.kya-os/proof.v1"}}
+
+
 class TestMCP:
-    def test_attach_helix_vp_adds_vp_to_meta(self, fake_client_and_did) -> None:
-        from helix_mcp_middleware import attach_helix_vp, AttachHelixVPOptions
-        from helix_sdk import decode_helix_vp
+    def test_middleware_rejects_a_call_without_a_proof(self) -> None:
+        from helix_mcp_middleware import MCPMiddlewareOptions, ProofError, helixid_mcp_middleware
 
-        client, did = fake_client_and_did
-        tool_call = {"name": "get_orders", "input": {"orderId": "123"}}
-        result = attach_helix_vp(
-            tool_call,
-            AttachHelixVPOptions(client=client, agent_did=did, target_service="https://svc.example.invalid"),
-        )
-        assert result["input"] == {"orderId": "123"}
-        assert decode_helix_vp(result["_meta"]["x-helix-vp"])["holder"] == did
-        client.sign_vp.assert_called_once_with(did, "https://svc.example.invalid", user_did=None)
-        # Original tool_call must be untouched (shallow-copy semantics,
-        # matching the JS spread-based implementation).
-        assert "_meta" not in tool_call
-
-    def test_middleware_rejects_missing_vp(self) -> None:
-        from helix_mcp_middleware import helixid_mcp_middleware, MCPMiddlewareOptions
-        from helix_sdk.errors import VPMissingError
-
-        fake_client = MagicMock()
-        middleware = helixid_mcp_middleware(MCPMiddlewareOptions(client=fake_client))
-        with pytest.raises(VPMissingError):
+        middleware = helixid_mcp_middleware(MCPMiddlewareOptions(verifier=_Verifier([])))
+        with pytest.raises(ProofError) as excinfo:
             middleware({"name": "get_orders", "input": {}})
+        assert excinfo.value.code == "PROOF_MISSING"
 
-    def test_middleware_ignores_vp_in_tool_arguments(self) -> None:
-        from helix_mcp_middleware import helixid_mcp_middleware, MCPMiddlewareOptions
-        from helix_sdk.errors import VPMissingError
+    def test_middleware_ignores_a_proof_in_tool_arguments(self) -> None:
+        from helix_mcp_middleware import MCPMiddlewareOptions, ProofError, helixid_mcp_middleware
 
-        fake_client = MagicMock()
-        middleware = helixid_mcp_middleware(MCPMiddlewareOptions(client=fake_client))
-        with pytest.raises(VPMissingError):
-            middleware({"name": "get_orders", "input": {"_helixVP": {"id": "vp:1"}}})
-        fake_client.verify_vp.assert_not_called()
+        verifier = _Verifier([])
+        middleware = helixid_mcp_middleware(MCPMiddlewareOptions(verifier=verifier))
+        with pytest.raises(ProofError):
+            middleware({"name": "get_orders", "input": {"org.kya-os/request-proof": {"prf": "x"}}})
+        assert verifier.calls == []
 
-    def test_middleware_rejects_malformed_meta_vp(self) -> None:
-        from helix_mcp_middleware import helixid_mcp_middleware, MCPMiddlewareOptions
-        from helix_sdk.errors import VPInvalidStructureError
+    def test_middleware_no_longer_reads_a_helix_vp(self) -> None:
+        from helix_mcp_middleware import MCPMiddlewareOptions, ProofError, helixid_mcp_middleware
 
-        middleware = helixid_mcp_middleware(MCPMiddlewareOptions(client=MagicMock()))
-        with pytest.raises(VPInvalidStructureError):
-            middleware({"name": "get_orders", "_meta": {"x-helix-vp": "not json"}})
-
-    def test_middleware_reads_x_helix_vp_header(self) -> None:
-        from helix_mcp_middleware import helixid_mcp_middleware, MCPMiddlewareOptions
-        from helix_sdk import encode_helix_vp
-
-        fake_client = MagicMock()
-        fake_client.verify_vp.return_value = {"valid": True, "effectiveScopes": ["read:orders"]}
-        middleware = helixid_mcp_middleware(
-            MCPMiddlewareOptions(client=fake_client, required_scopes=["read:orders"])
-        )
-        call = {"name": "get_orders", "headers": {"x-helix-vp": encode_helix_vp({"id": "vp:1"})}}
-        assert middleware(call) is call
-        assert fake_client.verify_vp.call_args.args[0] == {"id": "vp:1"}
+        verifier = _Verifier(["read:orders"])
+        middleware = helixid_mcp_middleware(MCPMiddlewareOptions(verifier=verifier))
+        for call in ({"_meta": {"x-helix-vp": "e30"}}, {"headers": {"x-helix-vp": "e30"}}, {"headers": {"authorization": "HelixVP e30"}}):
+            with pytest.raises(ProofError):
+                middleware({"name": "get_orders", **call})
+        assert verifier.calls == []
 
     def test_middleware_verifies_and_checks_scope(self) -> None:
-        from helix_mcp_middleware import helixid_mcp_middleware, MCPMiddlewareOptions
-        from helix_sdk import encode_helix_vp
+        from helix_mcp_middleware import MCPMiddlewareOptions, helixid_mcp_middleware
         from helix_sdk.errors import InsufficientScopeError
 
-        fake_client = MagicMock()
-        fake_client.verify_vp.return_value = {"valid": True, "effectiveScopes": ["read:orders"]}
-        middleware = helixid_mcp_middleware(
-            MCPMiddlewareOptions(client=fake_client, required_scopes=["write:orders"])
-        )
+        verifier = _Verifier(["read:orders"])
+        allowed = helixid_mcp_middleware(MCPMiddlewareOptions(verifier=verifier, required_scopes=["read:orders"]))
+        call = {"name": "get_orders", "_meta": PROOF_META}
+        assert allowed(call) is call
+        refused = helixid_mcp_middleware(MCPMiddlewareOptions(verifier=verifier, required_scopes=["write:orders"]))
         with pytest.raises(InsufficientScopeError):
-            middleware({"name": "get_orders", "_meta": {"x-helix-vp": encode_helix_vp({"id": "vp:1"})}})
-
-        fake_client.verify_vp.assert_called_once()
-
-    def test_middleware_passes_expected_target_service(self) -> None:
-        from helix_mcp_middleware import helixid_mcp_middleware, MCPMiddlewareOptions
-        from helix_sdk import encode_helix_vp
-
-        fake_client = MagicMock()
-        fake_client.verify_vp.return_value = {"valid": True, "effectiveScopes": []}
-        middleware = helixid_mcp_middleware(
-            MCPMiddlewareOptions(client=fake_client, expected_target_service="did:web:svc.example.invalid")
-        )
-        middleware({"name": "get_orders", "_meta": {"x-helix-vp": encode_helix_vp({"id": "vp:1"})}})
-
-        assert (
-            fake_client.verify_vp.call_args.kwargs["expected_target_service"] == "did:web:svc.example.invalid"
-        )
+            refused(call)
+        assert len(verifier.calls) == 2
 
 
 class TestLangChain:

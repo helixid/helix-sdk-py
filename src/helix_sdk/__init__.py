@@ -92,6 +92,7 @@ from .errors import (  # noqa: F401
     AuditEventInvalidError,
     AuditEvidenceError,
     ResponseProofError,
+    NeedsAuthorizationError,
     map_api_error,
     ValidationError,
     InternalError,

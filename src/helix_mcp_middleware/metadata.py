@@ -61,15 +61,18 @@ class HttpErrorResponse:
 # authorization server being down) is a server fault and must not be reported
 # to the caller as a 401.
 _MAPPED: Dict[str, Tuple[int, str]] = {
-    "VP_MISSING": (401, ""),
-    "VP_INVALID_STRUCTURE": (401, "invalid_token"),
-    "VP_VERIFICATION_FAILED": (401, "invalid_token"),
+    # KYA-OS request proofs (story F-2): absent, or refused by the local verifier.
+    _errors.PROOF_MISSING: (401, ""),
+    _errors.PROOF_INVALID: (401, "invalid_token"),
     _errors.OAUTH_TOKEN_INVALID: (401, "invalid_token"),
     _errors.CREDENTIAL_CONFLICT: (400, "invalid_request"),
     "INSUFFICIENT_SCOPE": (403, "insufficient_scope"),
     _errors.TOOL_NOT_PERMITTED: (403, "insufficient_scope"),
     # KYA-OS session layer (story L2-A): a session id that is unknown, expired, malformed or another agent's.
     "KYAOS_REJECTED": (400, "invalid_request"),
+    # KYA-OS story L3-E: the challenge (hosts without the signing runtime answer it here, unsigned) and a refused retry.
+    "NEEDS_AUTHORIZATION": (403, "needs_authorization"),
+    "RESUME_REFUSED": (403, "insufficient_scope"),
 }
 
 # RFC 6750 section 3: error_description and scope are limited to %x20-21 / %x23-5B / %x5D-7E.
@@ -84,7 +87,7 @@ def to_http_error_response(
     error: Any, resource_metadata_url: str, proof: Optional[Mapping[str, Any]] = None
 ) -> Optional[HttpErrorResponse]:
     """Turns an error raised by the middleware into an HTTP auth response: 401
-    with `WWW-Authenticate` challenges for both `Bearer` and `HelixVP` (each
+    with `WWW-Authenticate` challenges for both `Bearer` and `KyaOS` (each
     pointing at the RFC 9728 metadata), 400 for ambiguous credentials or a
     refused KYA-OS session, 403 for scope failures. Returns None for errors
     that are not the caller's fault, so the host can answer 5xx. ``proof`` is
@@ -111,10 +114,11 @@ def to_http_error_response(
     params.append(("resource_metadata", resource_metadata_url))
     return HttpErrorResponse(
         status=status,
-        headers={"WWW-Authenticate": f"{_challenge('Bearer', params)}, {_challenge('HelixVP', params)}"},
+        headers={"WWW-Authenticate": f"{_challenge('Bearer', params)}, {_challenge('KyaOS', params)}"},
         body={
             "error": name or "unauthorized",
             "error_description": message,
+            **(dict(getattr(error, "challenge", None) or {}) if code == "NEEDS_AUTHORIZATION" else {}),
             **({"_meta": {"org.kya-os/response-proof": dict(proof)}} if proof is not None else {}),
         },
     )

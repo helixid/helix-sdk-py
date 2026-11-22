@@ -5,7 +5,8 @@
 #    http://www.apache.org/licenses/LICENSE-2.0
 """
 examples/mcp_order_management against a real ASGI stack (the MCP Python
-SDK's Streamable HTTP transport behind the gate), with a fake HelixID client
+SDK's Streamable HTTP transport behind the gate), with the local verifier over
+the shared helix-core fixtures (a signed chain, an attested card; story F-2)
 and fixed tokens. The same cases as the JS sample's tests. Needs the `mcp`
 extra, so Python 3.10+.
 """
@@ -16,7 +17,6 @@ import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -26,10 +26,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
 
 from starlette.testclient import TestClient  # noqa: E402
 
-from helix_sdk.audit import AuditTrailEntry, MemoryAuditSink, credential_digest, delegation_chain_digests, validate_audit_event  # noqa: E402
-from helix_sdk.vp_transport import encode_helix_vp  # noqa: E402
-from helix_mcp_middleware import AuthorizationServerUnavailableError, McpAuditTrail, MCPMiddlewareOptions, create_mcp_audit_trail  # noqa: E402
+from helix_sdk.audit import AuditTrailEntry, MemoryAuditSink, validate_audit_event  # noqa: E402
+from helix_mcp_middleware import AuthorizationServerUnavailableError, LocalVerifierOptions, McpAuditTrail, MCPMiddlewareOptions, create_mcp_audit_trail  # noqa: E402
 from mcp_order_management.app import create_order_app  # noqa: E402
+from mcp_proof_helpers import fixture_signer, fixture_verifier_options, have_verifier_fixtures, load_environment, proof_meta, valid_chain  # noqa: E402
 
 BASE = "http://127.0.0.1:3700"
 RESOURCE = f"{BASE}/mcp"
@@ -41,24 +41,25 @@ TOKENS = {
 JSON_HEADERS = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
 
 
-def fake_client() -> MagicMock:
-    """Stands in for the HelixID API: any VP whose id starts with "vp:ok" verifies, with read scope."""
-    client = MagicMock()
-    client.verify_vp.side_effect = lambda vp, **kw: (
-        {"valid": True, "agentDid": "did:key:agent", "privilegeScopes": ["orders:read"], "effectiveScopes": ["orders:read"], "vpId": vp["id"], "delegationChain": []}
-        if vp["id"].startswith("vp:ok")
-        else {"valid": False, "error": "bad signature"}
-    )
-    return client
+ENV = load_environment() if have_verifier_fixtures() else None
+SERVICE_DID = ENV["keys"]["service"]["did"] if ENV else "did:web:orders.example"
+AGENT_DID = ENV["keys"]["agent"]["did"] if ENV else "did:web:agent.example"
+
+
+def fixture_verifier() -> LocalVerifierOptions:
+    """The local verifier over the fixture environment: the agent's attested card, its chain's status lists, a fixed clock.
+
+    The fixture's capabilities are ``read:orders`` and ``write:orders`` while the sample's tools need ``orders:read`` and
+    ``orders:admin``, so through the sample a verified fixture agent is identified (L3) but holds none of its scopes.
+    The allowed path through the sample, with credentials in its own scope names, is the F-2 e2e spec's."""
+    cards = {AGENT_DID: ENV["cards"]["attested"]} if ENV else {}
+    return fixture_verifier_options(SERVICE_DID, env=ENV, cards=cards)
 
 
 def validate(token: str) -> Dict[str, Any]:
     if token not in TOKENS:
         raise ValueError("unknown token")
     return TOKENS[token]
-
-
-SERVICE_DID = "did:web:orders.example"
 
 
 class App:
@@ -70,7 +71,7 @@ class App:
         self.sink = MemoryAuditSink()
         self.errors: List[BaseException] = []
         self.trail: Optional[McpAuditTrail] = None
-        options = {"client": fake_client(), "service_did": SERVICE_DID, "validate_oauth_token": validate, **auth}
+        options = {"verifier": fixture_verifier(), "service_did": SERVICE_DID, "validate_oauth_token": validate, **auth}
         if "audit_sink" not in auth:
             self.trail = create_mcp_audit_trail(reporter or self.sink, SERVICE_DID, source_id="orders-test", include_tool_names=True)
             options["audit_sink"] = self.trail.tool_audit_sink()
@@ -111,7 +112,11 @@ def text(res: Any) -> str:
     return res.json()["result"]["content"][0]["text"]
 
 
-VP_OK = encode_helix_vp({"id": "vp:ok:1"})
+needs_fixtures = pytest.mark.skipif(ENV is None, reason="helix-core fixtures/verifier not found")
+
+
+def agent_meta(name: str, args: Dict[str, Any], chain: Any = None) -> Dict[str, Any]:
+    return proof_meta(fixture_signer(ENV, "agent"), SERVICE_DID, name, args, valid_chain() if chain is None else chain)
 
 
 def test_serves_rfc9728_metadata(app: App) -> None:
@@ -138,10 +143,10 @@ def test_no_credentials_is_401_with_both_challenges(app: App) -> None:
     res = app.call("lookup_order", {"orderId": "ORD-1001"})
     assert res.status_code == 401
     challenge = res.headers["www-authenticate"]
-    assert f'Bearer resource_metadata="{METADATA}"' in challenge and "HelixVP resource_metadata=" in challenge
+    assert f'Bearer resource_metadata="{METADATA}"' in challenge and "KyaOS resource_metadata=" in challenge
     # No identified caller, so the gate reports nothing; the call itself is still recorded as denied.
     assert app.event_types == ["session.established", "tool.call.denied"]
-    assert app.audit[1]["reason"] == {"code": "vp_missing"} and app.audit[1]["action"] == {"category": "tool.call", "name": "lookup_order"}
+    assert app.audit[1]["reason"] == {"code": "proof_missing"} and app.audit[1]["action"] == {"category": "tool.call", "name": "lookup_order"}
     assert app.audit[0]["correlationId"] == app.audit[1]["correlationId"]
 
 
@@ -206,44 +211,18 @@ def test_unlisted_tool_is_denied_even_for_an_admin(app: App) -> None:
     assert app.audit[-1]["action"] == {"category": "tool.call", "name": "delete_order"}
 
 
-def test_helix_vp_in_the_authorization_header_and_in_meta(app: App) -> None:
-    via_header = app.call("lookup_order", {"orderId": "ORD-1001"}, {"authorization": f"HelixVP {VP_OK}"})
-    assert via_header.status_code == 200, via_header.text
-    via_meta = app.call("lookup_order", {"orderId": "ORD-1001"}, {}, {"x-helix-vp": VP_OK})
-    assert via_meta.status_code == 200, via_meta.text
-    assert app.event_types == ["session.established", "proof.verified", "authorization.approved", "tool.call.started", "tool.call.completed"] * 2
-    assert all(e["actor"] == {"kind": "pairwise_did", "did": "did:key:agent"} for e in app.audit if e["eventType"] != "session.established")
-    assert app.audit[1]["details"] == {"family": "proof", "phase": "verified", "verificationCode": "VP_VERIFIED"}
-    assert app.audit[2]["authorization"] == {"source": "delegation", "decision": "allowed"}
-
-
-def _agent_vc(vc_id: str) -> Dict[str, Any]:
-    """An agent credential signed the way SPEC section 7.8 reads it (proofValue is base64)."""
-    return {
-        "id": vc_id,
-        "type": ["VerifiableCredential", "HelixAgentCredential"],
-        "issuer": "did:web:issuer.example",
-        "credentialSubject": {"id": "did:key:agent"},
-        "proof": {"type": "Ed25519Signature2020", "proofValue": "AQIDBA=="},
-    }
-
-
-def test_a_helix_vp_with_an_agent_credential_adds_delegation_verified(app: App) -> None:
-    parent = _agent_vc("urn:uuid:parent")
-    leaf = {**_agent_vc("urn:uuid:leaf"), "delegationChain": [parent]}
-    vp = encode_helix_vp({"id": "vp:ok:chain", "verifiableCredential": [leaf]})
-    res = app.call("lookup_order", {"orderId": "ORD-1001"}, {"authorization": f"HelixVP {vp}"})
-    assert res.status_code == 200, res.text
-    assert json.loads(text(res))["id"] == "ORD-1001"
-    assert app.event_types == ["session.established", "proof.verified", "delegation.verified", "authorization.approved", "tool.call.started", "tool.call.completed"]
-    evidence = {"delegationRef": "urn:uuid:leaf", "delegationCredentialDigest": credential_digest(leaf), "delegationChainDigests": delegation_chain_digests([parent, leaf])}
-    authorization = {"source": "delegation", "decision": "allowed", **evidence}
-    assert app.audit[1]["authorization"] == app.audit[2]["authorization"] == app.audit[3]["authorization"] == authorization
-    assert app.audit[2]["details"] == {"family": "delegation", "phase": "verified", "delegationRef": "urn:uuid:leaf"}
-    assert len({e["correlationId"] for e in app.audit}) == 1
-    assert vp not in json.dumps(app.audit) and "ORD-1001" not in json.dumps(app.audit)
-    # A VP that does not decode yields no evidence; the gate answers it.
-    assert app.call("lookup_order", {"orderId": "ORD-1001"}, {"authorization": "HelixVP !!!"}).status_code == 401
+@needs_fixtures
+def test_a_request_proof_with_its_chain_is_verified_in_process_and_the_scope_is_checked(app: App) -> None:
+    # The fixture agent holds read:orders and write:orders; the sample's tools need orders:read / orders:admin.
+    res = app.call("lookup_order", {"orderId": "ORD-1001"}, {}, agent_meta("lookup_order", {"orderId": "ORD-1001"}))
+    assert res.status_code == 403, res.text
+    assert 'scope="orders:read"' in res.headers["www-authenticate"]
+    # Story F-2 with A-1: the verified proof at its level, attributed to the agent, then the decision.
+    assert app.event_types == ["session.established", "proof.verified", "authorization.denied", "tool.call.denied"]
+    assert app.audit[1]["details"] == {"family": "proof", "phase": "verified", "verificationCode": "KYAOS_PROOF_L3"}
+    assert all(e["actor"] == {"kind": "pairwise_did", "did": AGENT_DID} for e in app.audit[1:])
+    assert app.audit[2]["reason"] == {"code": "insufficient_scope"} and app.audit[2]["authorization"]["source"] == "delegation"
+    assert AGENT_DID not in json.dumps([e.get("details") for e in app.audit])
 
 
 class _FailingAfter:
@@ -313,11 +292,28 @@ def test_a_completion_that_cannot_be_recorded_marks_the_held_answer_degraded() -
     assert instance.errors == []
 
 
-def test_bad_vp_is_401_and_vp_plus_bearer_is_400(app: App) -> None:
-    bad = app.call("lookup_order", {"orderId": "ORD-1001"}, {"authorization": f"HelixVP {encode_helix_vp({'id': 'vp:bad'})}"})
-    assert bad.status_code == 401
-    both = app.call("lookup_order", {"orderId": "ORD-1001"}, {**bearer("reader"), "x-helix-vp": VP_OK})
+@needs_fixtures
+def test_bad_proofs_are_401_with_the_reason_and_proof_plus_bearer_is_400(app: App) -> None:
+    meta = agent_meta("lookup_order", {"orderId": "ORD-1001"})
+    tampered = app.call("lookup_order", {"orderId": "ORD-1002"}, {}, meta)
+    assert tampered.status_code == 401 and "request_hash_mismatch" in tampered.json()["error_description"]
+    assert 'error="invalid_token"' in tampered.headers["www-authenticate"]
+    both = app.call("lookup_order", {"orderId": "ORD-1001"}, bearer("reader"), agent_meta("lookup_order", {"orderId": "ORD-1001"}))
     assert both.status_code == 400 and both.json()["error"] == "invalid_request"
+    # The retired VP carriers are not read: no credential at all.
+    retired = app.call("lookup_order", {"orderId": "ORD-1001"}, {"authorization": "HelixVP eyJ2cCI6MX0", "x-helix-vp": "eyJ2cCI6MX0"}, {"x-helix-vp": "eyJ2cCI6MX0"})
+    assert retired.status_code == 401 and retired.json()["error"] == "unauthorized"
+
+
+@needs_fixtures
+def test_a_proof_for_the_sample_scopes_is_allowed() -> None:
+    # The same chain, with the sample's own scope names as the catalog, verified at a service that offers them:
+    # the attested ∩ delegated scopes are read:orders / write:orders, so a tool map in those names lets it through.
+    from helix_mcp_middleware import helixid_mcp_middleware
+
+    gate = helixid_mcp_middleware(MCPMiddlewareOptions(verifier=fixture_verifier(), tool_scopes={"lookup_order": ["read:orders"]}))
+    call = {"name": "lookup_order", "input": {"orderId": "ORD-1001"}, "_meta": agent_meta("lookup_order", {"orderId": "ORD-1001"})}
+    assert gate(call) is call
 
 
 def test_malformed_body_wrong_method_unknown_path(app: App) -> None:
@@ -343,9 +339,9 @@ def test_unreachable_authorization_server_is_503_not_401() -> None:
 
 
 def test_a_server_side_fault_is_500() -> None:
-    instance = App(client=None)
+    instance = App(verifier=None)  # a proof with no verifier configured is the server's fault, not the caller's
     with instance.http:
-        res = instance.call("lookup_order", {"orderId": "ORD-1001"}, {"authorization": f"HelixVP {VP_OK}"})
+        res = instance.call("lookup_order", {"orderId": "ORD-1001"}, {}, {"org.kya-os/request-proof": {"prf": "org.kya-os/proof.v1"}})
     assert res.status_code == 500 and "www-authenticate" not in res.headers
     assert len(instance.errors) == 1
     assert instance.event_types == ["session.established", "tool.call.failed"]
