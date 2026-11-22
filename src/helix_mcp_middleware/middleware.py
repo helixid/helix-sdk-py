@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from contextvars import ContextVar
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -61,6 +61,29 @@ _CREDENTIAL_FAULT_CODES = {
 _CALLER_FACING_CODES = {"INSUFFICIENT_SCOPE"}
 
 
+@dataclass(frozen=True)
+class AuthorizedCaller:
+    """Who a tool call came from, once the gate has identified and authorized
+    them: what ``middleware.authorize(tool_call)`` returns (the KYA-OS proof's
+    ``clientDid`` comes from ``agent_did``). Mirrors helix-sdk-js's AuthorizedCaller."""
+
+    auth_method: str
+    scopes: List[str] = field(default_factory=list)
+    agent_did: Optional[str] = None
+    vp_id: Optional[str] = None
+    oauth_subject: Optional[str] = None
+
+
+def _caller_of(caller: Dict[str, Any]) -> AuthorizedCaller:
+    return AuthorizedCaller(
+        auth_method=caller["authMethod"],
+        scopes=list(caller["scopes"]),
+        agent_did=caller.get("agentDid"),
+        vp_id=caller.get("vpId"),
+        oauth_subject=caller.get("oauthSubject"),
+    )
+
+
 def _is_credential_fault(err: BaseException) -> bool:
     code = getattr(err, "code", None)
     return isinstance(code, str) and (code.startswith(_CREDENTIAL_FAULT_PREFIXES) or code in _CREDENTIAL_FAULT_CODES)
@@ -90,6 +113,11 @@ def _as_auth_result(value: Any) -> Optional[AuthResult]:
 
 
 def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCall], MCPToolCall]:
+    """The gate: call it with a tool call; it returns the call unchanged once
+    the caller is identified and allowed to run the tool, and raises
+    otherwise. ``middleware.authorize(tool_call)`` does the same and returns
+    the AuthorizedCaller instead, for hosts that need to know who called (the
+    KYA-OS proof's ``clientDid``, say)."""
     if options.oauth is not None and options.validate_oauth_token is not None:
         raise ValueError("Provide either `oauth` or `validate_oauth_token`, not both")
     for name in ("validate_oauth_token", "audit_sink"):
@@ -127,7 +155,7 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
             if options.on_audit_error is not None:
                 options.on_audit_error(exc)
 
-    def middleware(tool_call: MCPToolCall) -> MCPToolCall:
+    def authorize(tool_call: MCPToolCall) -> AuthorizedCaller:
         # Credentials come from Authorization / X-Helix-VP / _meta only; tool
         # arguments are never consulted. Ambiguous credentials raise.
         credential = extract_credential(tool_call.get("headers"), tool_call.get("_meta"))
@@ -200,8 +228,13 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
             raise ToolScopeError(missing, required)
 
         audit(caller, tool_name, None)
+        return _caller_of(caller)
+
+    def middleware(tool_call: MCPToolCall) -> MCPToolCall:
+        authorize(tool_call)
         return tool_call
 
+    middleware.authorize = authorize  # type: ignore[attr-defined]
     return middleware
 
 
@@ -231,7 +264,8 @@ def _on_loop(callback: Callable[..., Any]) -> Callable[..., Any]:
 def async_helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCall], Awaitable[MCPToolCall]]:
     """The same gate for async MCP servers: runs the (blocking, network-bound)
     check in a worker thread so the event loop stays free. `validate_oauth_token`,
-    `audit_sink` and `on_audit_error` may be sync or async here."""
+    `audit_sink` and `on_audit_error` may be sync or async here.
+    ``await middleware.authorize(tool_call)`` returns the AuthorizedCaller."""
     if options.oauth is not None and options.validate_oauth_token is not None:
         raise ValueError("Provide either `oauth` or `validate_oauth_token`, not both")
     bridged = replace(
@@ -242,11 +276,17 @@ def async_helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCP
     )
     gate = helixid_mcp_middleware(bridged)
 
-    async def middleware(tool_call: MCPToolCall) -> MCPToolCall:
+    async def authorize(tool_call: MCPToolCall) -> AuthorizedCaller:
         token = _LOOP.set(asyncio.get_running_loop())
         try:
-            return await asyncio.to_thread(gate, tool_call)  # to_thread copies the context, so the bridge sees the loop
+            # to_thread copies the context, so the bridge sees the loop
+            return await asyncio.to_thread(gate.authorize, tool_call)  # type: ignore[attr-defined, no-any-return]
         finally:
             _LOOP.reset(token)
 
+    async def middleware(tool_call: MCPToolCall) -> MCPToolCall:
+        await authorize(tool_call)
+        return tool_call
+
+    middleware.authorize = authorize  # type: ignore[attr-defined]
     return middleware
