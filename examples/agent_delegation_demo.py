@@ -104,16 +104,11 @@ def main() -> int:
     print(f"  delegated scopes: {', '.join(subject.get('privilegeScopes') or [])}")
     print(f"  delegationDepth: {subject.get('delegationDepth')}\n")
 
-    print("[Step 4] Sub-agent presents the delegated credential")
-    # The sub-agent now holds two active credentials -- its own onboarding VC
-    # and this delegated one -- and the VP carries both.
-    vp = client.sign_vp(sub_agent["agentDid"], "https://api.example.invalid")
-    result = client.verify_vp(vp)
-    print(f"  valid: {result.get('valid')}")
-    print(f"  effective scopes: {', '.join(result.get('effectiveScopes') or [])}")
-    print(f"  delegation chain length: {len(result.get('delegationChain') or [])}\n")
+    # The Helix VP is gone (KYA-OS story C-C): a custodial sub-agent presents its
+    # authority with request proofs signed through story F-3's custodial signer,
+    # which this demo picks up when F-3 merges.
 
-    print("[Step 5] Sub-agent attempts to delegate further (should be blocked -- it has no delegation authority)")
+    print("[Step 4] Sub-agent attempts to delegate further (should be blocked -- it has no delegation authority)")
     try:
         # No vc_id passed: the server resolves the sub-agent's own delegated
         # credential and finds it has no delegation budget left.

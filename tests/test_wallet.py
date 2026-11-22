@@ -4,7 +4,7 @@
 # You may obtain a copy of the License at
 #    http://www.apache.org/licenses/LICENSE-2.0
 """
-AgentWallet / VPBuilder tests.
+AgentWallet tests.
 
 Split out of the old test_delegation_flow_mocked.py: that file's
 TestDelegateFlow class tested the wallet-based delegate() function, which
@@ -12,7 +12,8 @@ has been removed (agent self-custody is retired, so nothing produces a
 wallet holding a real agent key to delegate with). AgentWallet itself
 remains -- for other actors' key storage (e.g. an issuer's own key
 material), not for agent onboarding -- so its encrypted persistence and
-local-signing behavior (used by VPBuilder) still need coverage.
+local-signing behavior still need coverage. (VPBuilder is gone with the
+Helix VP, KYA-OS story C-C.)
 """
 
 from __future__ import annotations
@@ -27,7 +28,6 @@ import pytest
 from helix_sdk import (
     AgentWallet,
     HelixClient,
-    VPBuilder,
     generate_key_pair,
     public_key_to_multibase,
     verify_signature,
@@ -77,7 +77,7 @@ def _build_grant_vc(agent_did: str, issuer_did: str, user_did: str, scopes: List
 def _decode_proof_value(proof_value: str) -> str:
     from helix_sdk.vp_crypto import base58btc_decode
 
-    # VPBuilder writes the signature as plain base58btc, with no multibase "z"
+    # create_ed25519_proof writes the signature as plain base58btc, with no multibase "z"
     # prefix. Do not strip a leading "z": about 1 signature in 280 happens to
     # start with one, and dropping it corrupts the value (this test used to
     # fail at that rate).
@@ -90,11 +90,13 @@ def wallet_dir():
         yield d
 
 
-class TestVPBuilderAgainstWalletCredentials:
-    def test_build_and_verify_signed_vp_round_trip(self, wallet_dir: str) -> None:
-        """No server needed for this one: VPBuilder.sign() is local, and
-        we verify the resulting proof with the same local primitives a
+class TestLocalSigningWithWalletCredentials:
+    def test_sign_and_verify_a_linked_data_proof_round_trip(self, wallet_dir: str) -> None:
+        """No server needed for this one: signing with the wallet's key is local,
+        and we verify the resulting proof with the same local primitives a
         verifier's DID-resolution step would end up using."""
+        from helix_sdk.proof import create_ed25519_proof
+
         client = HelixClient()  # SDK-only mode
         key_pair = generate_key_pair()
         did = f"did:key:{public_key_to_multibase(key_pair.public_key)}"
@@ -107,15 +109,13 @@ class TestVPBuilderAgainstWalletCredentials:
 
         wallet.wallet_credentials.append(WalletCredential.from_vc(vc["id"], vc))
 
-        vp = VPBuilder(
-            credentials=wallet.credentials, holder_did=did, target_service="https://svc.example.invalid"
-        ).sign(wallet.get_private_key_hex(), f"{did}#key-1")
+        payload = {"holder": did, "verifiableCredential": wallet.credentials}
+        proof = create_ed25519_proof(payload, wallet.get_private_key_hex(), f"{did}#key-1")
 
-        payload = {k: v for k, v in vp.items() if k != "proof"}
         payload_hash = hash_canonical_payload(payload)
         assert verify_signature(
             payload_hash,
-            _decode_proof_value(vp["proof"]["proofValue"]),
+            _decode_proof_value(proof["proofValue"]),
             key_pair.public_key,
         )
 

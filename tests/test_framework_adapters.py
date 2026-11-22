@@ -11,26 +11,58 @@ frameworks, the actual installed packages, so a real interface drift
 (e.g. a BaseTool signature change) would fail these tests instead of
 silently passing against a stale assumption.
 
-Agent self-custody has been retired: signing and scope lookups are
-server-side calls now (client.sign_vp() / client.list_vcs()), not reads
-from a local wallet file -- these tests use a fake HelixClient instead of
-a real AgentWallet fixture.
+KYA-OS story C-C: a wrapped tool signs each MCP request it sends with a
+request proof by the agent's own Signer (``sign_current_request``); the
+Helix VP and its X-Helix-VP header are gone. Scope lookups are server-side
+(client.list_vcs()), so the tool filters use a fake HelixClient.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, List
 from unittest.mock import MagicMock
 
 import pytest
+
+from helix_sdk.agent_key import generate_agent_key, to_did_key
+from helix_sdk.crypto.jws import EnvSigner
+from helix_sdk.verifier import (
+    DELEGATION_CHAIN_META_KEY,
+    REQUEST_PROOF_META_KEY,
+    MemoryNonceStore,
+    RequestProofOptions,
+    RequestProofSeams,
+    did_key_document,
+    ed25519_keys_of,
+    verify_request_proof,
+)
+
+SERVICE = "did:web:orders.example.com"
+HOP = {"proof": {"type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022", "proofPurpose": "assertionMethod"}}
+
+
+@pytest.fixture()
+def agent_signer():
+    key = generate_agent_key()
+    did = to_did_key(key.public_key_hex)
+    return EnvSigner(did, kid=did.split(":")[-1], env_var="AGENT_KEY", env={"AGENT_KEY": key.private_key_hex}), key.private_key_hex
+
+
+def verifies(request: Dict[str, Any]) -> bool:
+    seams = RequestProofSeams(
+        resolve_did=did_key_document,
+        resolve_did_keys=lambda did: ed25519_keys_of(did_key_document(did) or {}),
+        nonce_store=MemoryNonceStore(),
+        clock=lambda: int(__import__("time").time() * 1000),
+    )
+    proof = request["params"]["_meta"][REQUEST_PROOF_META_KEY]
+    return verify_request_proof(proof, request, seams, RequestProofOptions(expected_audience=SERVICE)).ok
 
 
 @pytest.fixture()
 def fake_client_and_did():
     did = "did:key:zTestAgent"
-    fake_signed_vp = {"id": "vp:helix:test-1", "holder": did, "proof": {}}
     client = MagicMock()
-    client.sign_vp.return_value = fake_signed_vp
     client.list_vcs.return_value = [{"vcId": "vc:1", "subjectDid": did, "scopes": ["read:orders"]}]
     return client, did
 
@@ -98,19 +130,19 @@ class TestMCP:
 
 
 class TestLangChain:
-    def test_tool_wrapper_exposes_vp_header_and_delegates(self, fake_client_and_did) -> None:
+    def test_tool_wrapper_signs_each_request_and_delegates(self, agent_signer) -> None:
         pytest.importorskip("langchain_core", reason="langchain-core requires Python >= 3.10")
         from langchain_core.tools import BaseTool
         from pydantic import BaseModel, Field
-        from helix_langchain import helix_id_tool_wrapper, current_helix_vp_headers
-        from helix_sdk import decode_helix_vp
+        from helix_langchain import helix_id_tool_wrapper, sign_current_request
 
-        client, did = fake_client_and_did
+        signer, private_key_hex = agent_signer
 
         class Args(BaseModel):
             order_id: str = Field(description="order id")
 
         captured: Dict[str, Any] = {}
+        sent: List[Dict[str, Any]] = []
 
         class RealTool(BaseTool):
             name: str = "get_orders"
@@ -119,16 +151,20 @@ class TestLangChain:
 
             def _run(self, *args: Any, **kwargs: Any) -> Any:
                 captured.update(kwargs)
-                captured["headers"] = current_helix_vp_headers()
+                for _ in range(2):
+                    sent.append(sign_current_request({"name": "lookup_order", "arguments": {"orderId": kwargs["order_id"]}}))
                 return "ok"
 
-        wrapped = helix_id_tool_wrapper(RealTool(), client, did, target_service="https://svc.example.invalid")
-        result = wrapped.run({"order_id": "123"})
-        assert result == "ok"
-        assert captured["order_id"] == "123"
-        assert "_helixVP" not in captured
-        assert decode_helix_vp(captured["headers"]["X-Helix-VP"])["holder"] == did
-        assert current_helix_vp_headers() == {}
+        wrapped = helix_id_tool_wrapper(RealTool(), signer=signer, audience=SERVICE, chain=lambda: [HOP])
+        assert wrapped.run({"order_id": "123"}) == "ok"
+        assert captured == {"order_id": "123"}
+        assert sent[0]["params"]["arguments"] == {"orderId": "123"} and sent[0]["params"]["_meta"][DELEGATION_CHAIN_META_KEY] == [HOP]
+        proofs = [request["params"]["_meta"][REQUEST_PROOF_META_KEY] for request in sent]
+        assert proofs[0]["nonce"] != proofs[1]["nonce"] and proofs[0]["did"] == signer.did
+        assert all(verifies(request) for request in sent)
+        assert private_key_hex not in str(sent)  # rule 7: no request carries the key
+        with pytest.raises(RuntimeError, match="not inside a Helix-wrapped tool call"):
+            sign_current_request({"name": "lookup_order"})
 
     def test_filter_tools_by_scope(self, fake_client_and_did) -> None:
         pytest.importorskip("langchain_core", reason="langchain-core requires Python >= 3.10")
@@ -151,14 +187,13 @@ class TestLangChain:
 
 
 class TestCrewAI:
-    def test_crewai_tool_wrapper_exposes_vp_header_and_delegates(self, fake_client_and_did) -> None:
+    def test_crewai_tool_wrapper_signs_each_request_and_delegates(self, agent_signer) -> None:
         pytest.importorskip("crewai", reason="crewai requires Python >= 3.10")
         from crewai.tools import BaseTool
         from pydantic import BaseModel, Field
-        from helix_crewai import helix_id_crewai_tool, current_helix_vp_headers
-        from helix_sdk import decode_helix_vp
+        from helix_crewai import helix_id_crewai_tool, sign_current_request
 
-        client, did = fake_client_and_did
+        signer, _ = agent_signer
 
         class Args(BaseModel):
             order_id: str = Field(description="order id")
@@ -172,16 +207,16 @@ class TestCrewAI:
 
             def _run(self, *args: Any, **kwargs: Any) -> Any:
                 captured.update(kwargs)
-                captured["headers"] = current_helix_vp_headers()
+                captured["request"] = sign_current_request({"name": "lookup_order", "arguments": {"orderId": kwargs["order_id"]}})
                 return "ok"
 
-        wrapped = helix_id_crewai_tool(RealTool(), client, did, target_service="https://svc.example.invalid")
-        result = wrapped.run(order_id="123")
-        assert result == "ok"
+        wrapped = helix_id_crewai_tool(RealTool(), signer=signer, audience=SERVICE, chain=[HOP])
+        assert wrapped.run(order_id="123") == "ok"
         assert captured["order_id"] == "123"
-        assert "_helixVP" not in captured
-        assert decode_helix_vp(captured["headers"]["X-Helix-VP"])["holder"] == did
-        assert current_helix_vp_headers() == {}
+        assert captured["request"]["params"]["_meta"][DELEGATION_CHAIN_META_KEY] == [HOP]
+        assert verifies(captured["request"])
+        with pytest.raises(RuntimeError):
+            sign_current_request({"name": "lookup_order"})
 
     def test_filter_crewai_tools_by_scope(self, fake_client_and_did) -> None:
         pytest.importorskip("crewai", reason="crewai requires Python >= 3.10")

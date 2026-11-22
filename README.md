@@ -2,22 +2,24 @@
 
 Python SDK for [HelixID](https://github.com/helixid/helixid) -- decentralized
 agent identity via DID/VC standards (did:hedera, did:key, did:web), delegation,
-and Verifiable Presentation verification.
+and KYA-OS request proofs verified in-process.
 
 This is the Python counterpart to
 [`helix-sdk-js`](https://github.com/helixid/helix-sdk-js), following the same
 **SDK-API-only** architecture: every
 SDK, in every language, depends only on the HelixID API -- never on a shared
 "core" package -- except for private-key operations that must stay local:
-keygen, sign, canonical-hash and `VPBuilder.sign()`, which issuers and Service
-Providers still use to sign with their own keys. Verification, delegation-VC
-construction, DID resolution, and status checks are all API calls made through
-`HelixClient`.
+keygen, sign and canonical-hash, which issuers and Service Providers use to sign
+with their own keys. Delegation-VC construction and status checks are API calls
+made through `HelixClient`.
 
-**Agents hold no keys.** Agent self-custody has been retired: the server
-generates an agent's keypair during onboarding and holds the private key, so
-onboarding, presenting and delegating are all API calls
-(`onboard_agent()`, `sign_vp()`, `delegate_authority()`).
+**Every call carries a request proof (KYA-OS story C-C).** An agent signs each
+MCP request with its own Signer (`kyaos.with_request_proof()`): an
+`org.kya-os/proof.v1` bound to that request's body and the service's DID, with
+its delegation chain beside it in `params._meta`. A service verifies it
+in-process (`helix_sdk.verifier`, `helix_mcp_middleware`). The Helix VP
+(`sign_vp()`, `verify_vp()`, `VPBuilder`, `X-Helix-VP`) is gone, with no
+backward compatibility.
 
 ## Documentation
 
@@ -54,8 +56,8 @@ pip install -e .
 
 ## Cross-language parity
 
-The local-signing primitives (`keys.py`, `vp_crypto.py`, `proof.py`,
-`vp_builder.py`) are verified **byte-for-byte** against the same
+The local-signing primitives (`keys.py`, `vp_crypto.py`, `proof.py`) are
+verified **byte-for-byte** against the same
 `fixtures/golden-vectors/*.json` fixtures that `helix-sdk-js` and
 `helix-core` assert against -- same private key, same payload, same
 signature, same base58btc-encoded proof value, in every language. See
@@ -74,6 +76,13 @@ what its seams answer (`resolve_did`, `resolve_did_keys`, `fetch_status_list`, `
 same results, which `tests/test_verifier.py` proves over the fixture set helix-core generates
 (`fixtures/verifier/*.json`, read from the sibling checkout or `HELIX_CORE_FIXTURES_DIR`).
 
+`helix_sdk.verifier.verify_request_proof(proof, request, seams, options)` checks the request proof alone in the exact
+SPEC-ENTITY-CARD section 11.2 order (story C-C), stopping at the first broken binding: schema, `kid` of `did`, the key,
+its RFC 7638 thumbprint among the DID's keys, `audience`, `requestHash`, the window (+/-5 s, at most 60 s), the nonce,
+the detached JWS, the `cnf` fusion (`L3` with a token `cnf`, `L3-minus` without). `verify()` runs it first; with
+`require_proof=False` a chain without a proof verifies at L2 at most, and the result names `agent_did` and
+`proof_floor`. `tests/test_request_proof_fixtures.py` runs helix-core's `fixtures/kya-os-helix/request-proof.json`.
+
 `python -m helix_sdk.conformance [vectors_dir]` runs the KYA-OS vector categories `signed-proof`, `delegation-chain`,
 `status-list`, `did-key`, `did-web`, `card-proof` and `entity-card` through `helix_sdk.conformance.HelixConformanceAdapter`.
 
@@ -88,9 +97,13 @@ same results, which `tests/test_verifier.py` proves over the fixture set helix-c
   `_meta["org.kya-os/delegation-chain"]`), which the gate verifies in-process
   with `helix_sdk.verifier` (`verifier=LocalVerifierOptions(...)` or
   `create_local_verifier()`, story F-2; the Helix API is never asked), or an
-  OAuth 2.1 bearer token. The Helix VP (`HelixVP`, `X-Helix-VP`,
-  `_meta["x-helix-vp"]`) is no longer read. `tool_scopes` maps each tool to the scopes it
-  needs and denies unlisted tools; every decision goes to `audit_sink`
+  OAuth 2.1 bearer token. A bearer token sent with a proof is the proof's
+  sender constraint (`cnf` fusion, L3). The Helix VP is no longer read.
+  `tool_scopes` maps each tool to the scopes it needs and denies unlisted
+  tools; then `minimum_level` (default `L3`), `tools[name]["minimum_level"]`
+  and `l3_minus_satisfies_l3` set the Card level each tool demands (story
+  C-C; a call below it raises `LevelError`, 401 `insufficient_user_authentication`
+  with `derivedLevel` / `requiredLevel`); every decision goes to `audit_sink`
   (`create_helix_audit_sink()` writes to the HelixID audit log).
   `oauth=` takes one trusted issuer or a list: `OAuthIssuerOptions(issuer,
   audience)` is enough (keys come from the issuer's metadata), or use the
@@ -101,11 +114,12 @@ same results, which `tests/test_verifier.py` proves over the fixture set helix-c
   [`examples/mcp_order_management`](examples/mcp_order_management).
   Install with the `mcp-middleware` extra:
   `pip install helixid-sdk-py[mcp-middleware]`.
-- **`helix_langchain`** -- LangChain integration: a tool wrapper that
-  signs a fresh VP for every tool call and exposes it to the tool via
-  `current_helix_vp_headers()` (an `X-Helix-VP` header for the tool's
-  outbound request; tool input is untouched), plus scope-based tool
-  filtering. Install with `pip install helixid-sdk-py[langchain]`.
+- **`helix_langchain`** -- LangChain integration:
+  `helix_id_tool_wrapper(tool, signer=..., audience=..., chain=...)` runs the
+  tool with the agent's Signer, and inside it `sign_current_request(request)`
+  returns the MCP request with a fresh request proof (and the chain) in
+  `params._meta`. Tool input is untouched. Also scope-based tool filtering.
+  Install with `pip install helixid-sdk-py[langchain]`.
 - **`helix_crewai`** -- CrewAI integration, following the same pattern as
   `helix_langchain`. There is no CrewAI counterpart in `helix-sdk-js` --
   this is Python-only. Install with `pip install helixid-sdk-py[crewai]`.
@@ -115,22 +129,30 @@ Install everything at once with `pip install helixid-sdk-py[all]`.
 ## Quick example
 
 ```python
-from helix_sdk import HelixClient
+from helix_sdk import kyaos
 
-client = HelixClient(
-    "https://your-helix-api.example.com",
-    admin_api_key="...",  # signing is admin-gated in OSS
+# The agent: its own key, read from HELIX_SIGNING_KEY at each signature.
+signer = kyaos.EnvSigner("did:web:agent.example.com")
+request = kyaos.with_request_proof(
+    {"name": "lookup_order", "arguments": {"orderId": "ORD-1001"}},
+    signer,
+    audience="did:web:orders.example.com",  # the service's DID, from its Entity Card
+    chain=hops,                              # the delegation chain, root to leaf
 )
+# send request["params"] as the MCP tools/call params
 
-# Signing is an API call: the caller never has the agent's private key.
-vp = client.sign_vp(agent_did, "https://api.example.com/v1/tools/orders")
+# The service: helix_mcp_middleware verifies it in-process.
+from helix_mcp_middleware import LocalVerifierOptions, MCPMiddlewareOptions, helixid_mcp_middleware
 
-result = client.verify_vp(vp)
-print(result["valid"], result["effectiveScopes"])
+gate = helixid_mcp_middleware(MCPMiddlewareOptions(
+    verifier=LocalVerifierOptions(service_did="did:web:orders.example.com"),
+    tool_scopes={"lookup_order": ["orders:read"]},
+    tools={"lookup_order": {"minimum_level": "L2"}},  # default L3
+))
+caller = gate.authorize({"name": name, "input": args, "_meta": params["_meta"], "request": rpc_request})
 ```
 
-See `examples/verify_vp_demo.py` for this flow end to end, including scope
-checks and a revoked-credential rejection.
+`examples/request_proof_demo.py` runs the sign / verify / replay / tamper cycle offline.
 
 ## KYA-OS session, replay store and response proof (`helix_mcp_middleware`, story L2-A)
 
@@ -179,16 +201,17 @@ process only.
 
 See `examples/`:
 
-- `verify_vp_demo.py` -- onboards an agent with `onboard_agent()`, signs a VP
-  through `sign_vp()`, verifies it, exercises `check_scope()`/`require_scope()`,
-  then revokes the VC and shows the next verification attempt fail with
-  `VC_REVOKED`.
+- `request_proof_demo.py` -- an agent signs one MCP call with
+  `kyaos.with_request_proof()` and a service verifies it in-process in the
+  section 11.2 order; a replay, another body and another service are refused.
+  Runs offline.
 - `agent_delegation_demo.py` -- onboards a delegator and a sub-agent, delegates
-  a scope subset with `delegate_authority()`, has the sub-agent present the
-  delegated credential, and shows a further delegation being refused because
-  the sub-agent has no delegation authority of its own.
+  a scope subset with `delegate_authority()`, and shows a further delegation
+  being refused because the sub-agent has no delegation authority of its own.
+  (Presenting the delegated authority as a request proof waits for story F-3's
+  custodial signer.)
 
-Both require a running `helix-api` instance:
+The delegation demo requires a running `helix-api` instance:
 
 ```bash
 HELIX_API_URL=http://127.0.0.1:3579 \
@@ -225,7 +248,7 @@ real follow-up work, not something this tooling change did on its own.
 
 - `tests/test_golden_vectors.py` -- cross-language crypto parity (no network).
 - `tests/test_wallet.py` -- `AgentWallet` encrypted persistence, credential
-  storage/queries, and `VPBuilder` local-signing round trip. (`delegate()`
+  storage/queries, and a local-signing round trip. (`delegate()`
   and its mocked-HTTP tests were removed along with the rest of agent
   self-custody.)
 - `tests/test_mcp_middleware.py` -- the middleware's Phase 1 cases (credentials,
@@ -240,8 +263,8 @@ real follow-up work, not something this tooling change did on its own.
 
 There is currently no automated **live** integration test against a real
 `helix-api` instance in this repo's CI (see Known gaps) -- if you have a
-running instance, you can exercise the real network path with the two
-example scripts above.
+running instance, you can exercise the real network path with the
+delegation example above.
 
 ## Known gaps
 
@@ -270,9 +293,8 @@ example scripts above.
   widget has no obvious Python equivalent and hasn't been attempted).
 - **`HelixIDCallbackHandler` in `helix_langchain` is a no-op.** LangChain
   Python's `on_tool_start` callback is a notification hook, not an
-  interceptor, and VPs no longer travel in tool input anyway. VP signing
-  happens in `helix_id_tool_wrapper()`, which hands the VP to the tool
-  through `current_helix_vp_headers()`; the callback handler is kept only
+  interceptor. Request signing happens in `helix_id_tool_wrapper()`, which
+  hands the tool `sign_current_request()`; the callback handler is kept only
   for observability use. (The JS SDK has dropped its callback form,
   `HelixIDMiddleware`, entirely.)
 - **Version numbering does not yet track `helix-sdk-js`'s version.** This SDK's version should track the JS

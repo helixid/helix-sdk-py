@@ -4,28 +4,26 @@
 # You may obtain a copy of the License at
 #    http://www.apache.org/licenses/LICENSE-2.0
 """
-helix_crewai.middleware -- tool-wrapping half of the CrewAI integration.
+helix_crewai.middleware -- tool-wrapping half of the CrewAI integration
+(KYA-OS story C-C).
 
-Verified directly against the installed `crewai` package's actual
-`crewai.tools.BaseTool` interface (see tests/test_langchain_crewai.py),
-not assumed by analogy. CrewAI's `BaseTool._run(*args, **kwargs)` has the
-same shape as LangChain Python's, so `helix_id_crewai_tool()` mirrors
-`helix_langchain.middleware.helix_id_tool_wrapper()` almost exactly.
-
-Agent self-custody has been retired: signing is a server-side call
-(client.sign_vp()) now, not a local wallet load + VPBuilder.sign().
+Verified against the installed `crewai` package's `crewai.tools.BaseTool`
+interface (see tests/test_framework_adapters.py). CrewAI's
+`BaseTool._run(*args, **kwargs)` has the same shape as LangChain Python's, so
+`helix_id_crewai_tool()` mirrors `helix_langchain.helix_id_tool_wrapper()`:
+inside a wrapped tool, `sign_current_request(request)` signs the MCP request
+the tool sends with a fresh request proof by the agent's own Signer. The Helix
+VP and its X-Helix-VP header are gone.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional, TypeVar
+from typing import Any, Optional, TypeVar
 
 from pydantic import PrivateAttr
 
-from helix_sdk.tool_vp import build_signed_vp, helix_vp_context
-
-if TYPE_CHECKING:
-    from helix_sdk import HelixClient
+from helix_sdk.crypto.jws import Signer
+from helix_sdk.tool_signing import ChainSource, request_signer, signing_context
 
 try:
     from crewai.tools import BaseTool
@@ -40,34 +38,25 @@ T = TypeVar("T", bound=BaseTool)
 
 def helix_id_crewai_tool(
     tool: T,
-    client: "HelixClient",
-    agent_did: str,
-    target_service: str,
-    user_did: Optional[str] = None,
+    *,
+    signer: Signer,
+    audience: str,
+    chain: ChainSource = None,
+    cnf_jkt: Optional[str] = None,
 ) -> BaseTool:
-    """Wraps `tool` so every invocation signs a fresh VP, then delegates to
-    the original tool's `_run` with its arguments unchanged. The tool reads
-    the VP with `current_helix_vp_headers()` and sends it as the X-Helix-VP
-    header."""
+    """Wraps `tool` so the requests it sends while running can be signed with
+    `sign_current_request(request)`: a fresh request proof per request, by the
+    agent's own `signer`, for the service `audience`, with `chain` attached
+    and `cnf_jkt` carried. The tool input is passed through unchanged."""
+    sign = request_signer(signer, audience, chain, cnf_jkt)
 
     class _HelixIDWrappedCrewAITool(BaseTool):
         _wrapped: Any = PrivateAttr()
-        _client: Any = PrivateAttr()
-        _agent_did: str = PrivateAttr()
-        _target_service: str = PrivateAttr()
-        _user_did: Optional[str] = PrivateAttr()
 
         def _run(self, *args: Any, **kwargs: Any) -> Any:
-            vp = build_signed_vp(self._client, self._agent_did, self._target_service, self._user_did)
-            with helix_vp_context(vp):
+            with signing_context(sign):
                 return self._wrapped._run(*args, **kwargs)
 
-    wrapped = _HelixIDWrappedCrewAITool(
-        name=tool.name, description=tool.description, args_schema=tool.args_schema
-    )
+    wrapped = _HelixIDWrappedCrewAITool(name=tool.name, description=tool.description, args_schema=tool.args_schema)
     object.__setattr__(wrapped, "_wrapped", tool)
-    object.__setattr__(wrapped, "_client", client)
-    object.__setattr__(wrapped, "_agent_did", agent_did)
-    object.__setattr__(wrapped, "_target_service", target_service)
-    object.__setattr__(wrapped, "_user_did", user_did)
     return wrapped

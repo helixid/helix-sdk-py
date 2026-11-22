@@ -7,9 +7,10 @@
 Canonical JSON, SHA-256 hashing, and Ed25519 sign/verify over hash bytes,
 ported from helix-sdk-js's src/core/vp-crypto.ts.
 
-toCanonicalJson/hashCanonicalPayload/signBytes are three of the four
-local-signing carveouts from the SDK-API-only design (the fourth is
-VPBuilder.sign() itself, in vp_builder.py, which calls these).
+toCanonicalJson/hashCanonicalPayload/signBytes are local-signing
+carveouts from the SDK-API-only design, used by linked-data proofs, JWS
+keys and DID resolution. (The module name is historical: the Helix VP and
+VPBuilder are gone, KYA-OS story C-C.)
 
 Verified byte-for-byte against fixtures/golden-vectors/canonical-json.json
 and signing.json -- see tests/test_golden_vectors.py. json.dumps with
