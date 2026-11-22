@@ -204,6 +204,10 @@ class HelixCustodyClient:
         return f"/v1/{kind}s/{quote(did, safe='')}"
 
     def create_agent(self, **input: Any) -> Dict[str, Any]:
+        """``POST /v1/agents``: name, scopes, keyCustody, didHosting, did, ownerDid,
+        expiry, requestedDomains (bare hosts or http(s) URLs, published as
+        ``#domain-N`` LinkedDomains entries) and maxDelegationDepth (0 to 5,
+        default 0, written on the identity credential), passed as given."""
         return self.request("POST", "/v1/agents", input)
 
     def create_service(self, **input: Any) -> Dict[str, Any]:

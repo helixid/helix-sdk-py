@@ -182,6 +182,13 @@ def test_client_refuses_to_send_private_material() -> None:
     assert api.calls == []
 
 
+def test_create_agent_sends_requested_domains_and_max_delegation_depth() -> None:
+    api = FakeApi({"POST /v1/agents": lambda body: (201, {"did": DID, **body})})
+    client = HelixCustodyClient("https://helix.example", admin_api_key="admin", http=api)
+    client.create_agent(name="Router", keyCustody="helix", requestedDomains=["orders.example"], maxDelegationDepth=2)
+    assert json.loads(api.calls[0]["body"]) == {"name": "Router", "keyCustody": "helix", "requestedDomains": ["orders.example"], "maxDelegationDepth": 2}
+
+
 def test_client_reaches_every_endpoint() -> None:
     seen: List[str] = []
 
