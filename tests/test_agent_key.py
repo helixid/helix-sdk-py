@@ -175,6 +175,57 @@ class TestPublicKeyJwk:
         assert_no_private_material(None)
 
 
+class TestParityWithHelixSdkJs:
+    """Names and refusals that must match helix-sdk-js's src/core/agent-key.ts and index.ts."""
+
+    key = generate_agent_key()
+
+    @pytest.mark.parametrize("not_an_object", [None, [1] * 32, (1,) * 32, []], ids=["none", "list32", "tuple32", "empty"])
+    def test_a_jwk_that_is_not_a_json_object_is_refused_as_js_does(self, not_an_object: Any) -> None:
+        with pytest.raises(ValueError, match="publicKeyJwk must be a JSON object"):
+            public_key_jwk_bytes(not_an_object)
+
+    @pytest.mark.parametrize("not_bytes", [5, 1.5, object()], ids=["int", "float", "object"])
+    def test_other_values_are_refused_as_not_a_32_byte_key(self, not_bytes: Any) -> None:
+        with pytest.raises(ValueError, match="32 bytes"):
+            to_public_key_jwk(not_bytes)
+
+    def test_bytearray_is_read_as_key_bytes(self) -> None:
+        raw = bytearray.fromhex(self.key.public_key_hex)
+        assert to_public_key_jwk(raw) == to_public_key_jwk(self.key.public_key_hex)
+
+    def test_every_name_js_exports_is_exported_from_helix_sdk(self) -> None:
+        import helix_sdk
+
+        js_to_python = {
+            "generateAgentKey": "generate_agent_key",
+            "agentPublicKey": "agent_public_key",
+            "toPublicKeyJwk": "to_public_key_jwk",
+            "toDidKey": "to_did_key",
+            "publicKeyFromDidKey": "public_key_from_did_key",
+            "publicKeyJwkBytes": "public_key_jwk_bytes",
+            "assertNoPrivateMaterial": "assert_no_private_material",
+            "encodeBase58btc": "encode_base58btc",
+            "decodeBase58btc": "decode_base58btc",
+            "DEFAULT_AGENT_KEY_ID": "DEFAULT_AGENT_KEY_ID",
+            "AgentKey": "AgentKey",
+            "AgentPublicKeyJwk": "AgentPublicKeyJwk",
+        }
+        for js_name, python_name in js_to_python.items():
+            assert python_name in helix_sdk.__all__, js_name
+            assert getattr(helix_sdk, python_name) is not None, js_name
+        assert helix_sdk.DEFAULT_AGENT_KEY_ID == "key-1"
+        # agentKeyRegistration / HelixClient.registerAgentKey went with POST /v1/agents/{did}/keys (story F-3).
+        assert not hasattr(helix_sdk, "agent_key_registration") and not hasattr(HelixClient, "register_agent_key")
+
+    def test_typed_dict_describes_the_jwk(self) -> None:
+        from helix_sdk import AgentPublicKeyJwk
+
+        assert set(AgentPublicKeyJwk.__annotations__) == {"kty", "crv", "x", "kid"}
+        assert AgentPublicKeyJwk.__required_keys__ == frozenset({"kty", "crv", "x"})
+        assert set(to_public_key_jwk(self.key.public_key_hex)) == AgentPublicKeyJwk.__required_keys__
+
+
 class TestBase58btc:
     def test_leading_zeros_and_round_trips(self) -> None:
         assert encode_base58btc(b"") == ""
