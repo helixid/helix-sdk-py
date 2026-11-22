@@ -376,6 +376,17 @@ class ResponseProofError(HelixError):
         self.reason = reason
 
 
+class NeedsAuthorizationError(HelixError):
+    """A KYA-OS ``needs_authorization`` challenge that cannot be acted on
+    (story L3-E): the proof verified but is not a challenge's, or the
+    challenge is malformed, its authorizationUrl is not http(s), or it has
+    expired. ``reason`` is one of helix_sdk.needs_authorization.ChallengeReasons."""
+
+    def __init__(self, reason: str, message: str = "needs_authorization challenge is invalid") -> None:
+        super().__init__(codes.NEEDS_AUTHORIZATION_INVALID, message, 400, {"reason": reason})
+        self.reason = reason
+
+
 class JWTExpiredError(HelixError):
     def __init__(self, message: str = "JWT has expired") -> None:
         super().__init__(codes.JWT_EXPIRED, message, 401)

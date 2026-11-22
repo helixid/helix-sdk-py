@@ -72,6 +72,9 @@ _MAPPED: Dict[str, Tuple[int, str]] = {
     _errors.TOOL_NOT_PERMITTED: (403, "insufficient_scope"),
     # KYA-OS session layer (story L2-A): a session id that is unknown, expired, malformed or another agent's.
     "KYAOS_REJECTED": (400, "invalid_request"),
+    # KYA-OS story L3-E: the challenge (hosts without the signing runtime answer it here, unsigned) and a refused retry.
+    "NEEDS_AUTHORIZATION": (403, "needs_authorization"),
+    "RESUME_REFUSED": (403, "insufficient_scope"),
 }
 
 # RFC 6750 section 3: error_description and scope are limited to %x20-21 / %x23-5B / %x5D-7E.
@@ -118,6 +121,7 @@ def to_http_error_response(
             "error": name or "unauthorized",
             "error_description": message,
             **{key: value for key, value in (("derivedLevel", getattr(error, "derived_level", None)), ("requiredLevel", getattr(error, "required_level", None))) if isinstance(value, str)},
+            **(dict(getattr(error, "challenge", None) or {}) if code == "NEEDS_AUTHORIZATION" else {}),
             **({"_meta": {"org.kya-os/response-proof": dict(proof)}} if proof is not None else {}),
         },
     )

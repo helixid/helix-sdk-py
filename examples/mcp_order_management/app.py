@@ -20,7 +20,12 @@ make it an authenticated one); every other tool call is started before the
 transport sees it (session lookup, authorization, control arguments stripped)
 and its JSON-RPC result is finished on the way out, where it is hashed and the
 proof signed into `_meta["org.kya-os/response-proof"]`. A refusal carries its
-`denied` proof in the 400/401/403 body."""
+`denied` proof in the 400/401/403 body.
+
+With `auth.needs_authorization` set (story L3-E), a caller whose delegation
+does not cover the tool gets the signed `needs_authorization` challenge as the
+call's result, and a retry carrying `_kyaos_resume` and `_kyaos_delegation` is
+verified through that layer before the tool runs."""
 
 from __future__ import annotations
 
@@ -39,8 +44,10 @@ from starlette.responses import JSONResponse
 from helix_mcp_middleware import (
     AuthorizationServerUnavailableError,
     KyaOsDenied,
+    KyaOsNeedsAuthorization,
     KyaOsRuntime,
     MCPMiddlewareOptions,
+    WellKnownMcp,
     async_helixid_mcp_middleware,
     build_protected_resource_metadata,
     protected_resource_metadata_url,
@@ -128,12 +135,15 @@ def create_order_app(
     store: Optional[OrderStore] = None,
     on_server_error: Optional[Callable[[BaseException], None]] = None,
     kyaos: Optional[KyaOsRuntime] = None,
+    well_known: Optional[WellKnownMcp] = None,
 ) -> Any:
     """An ASGI app. `resource` is this server's MCP endpoint URL (MCP is
     served at its path); `auth` is everything except the scopes, which this
     sample fixes in TOOL_SCOPES. `kyaos` turns on the KYA-OS layer (story
     L2-A): the handshake tool, sessions, the replay store and a server-signed
-    proof on every tool call outcome."""
+    proof on every tool call outcome. `well_known` serves the KYA-OS discovery
+    document at `/.well-known/mcp` (story L1-D, from create_well_known_mcp());
+    a disabled one answers 404."""
     url = urlsplit(resource)
     if url.scheme not in ("http", "https") or not url.hostname:
         raise ValueError(f"resource must be an http(s) URL, got {resource!r}")
@@ -183,6 +193,8 @@ def create_order_app(
         async def respond(status: int, body: Any, headers: Optional[dict] = None) -> None:
             await JSONResponse(body, status_code=status, headers=headers)(scope, receive, send)
 
+        if well_known is not None and await well_known.handle(scope, receive, send):
+            return
         path, method = scope["path"], scope["method"]
         if path == metadata_path and method == "GET":
             await respond(200, metadata)
@@ -284,6 +296,11 @@ def create_order_app(
                 return
             if isinstance(started, KyaOsDenied):
                 await refuse(started.error, started.proof)
+                return
+            if isinstance(started, KyaOsNeedsAuthorization):
+                # KYA-OS story L3-E: the signed challenge is the call's result (a tool error result with the
+                # proof in _meta), answered here since the tool itself never runs.
+                await respond(200, {"jsonrpc": "2.0", "id": message.get("id"), "result": started.result})
                 return
             # Control arguments (`_kyaos*`) never reach the tool.
             message["params"] = {**params, "arguments": started.arguments}

@@ -8,10 +8,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Union
 
 from .oauth import OAuthIssuerOptions
 from .verify_locally import LocalVerifier, MiddlewareVerifierOptions
+
+if TYPE_CHECKING:  # pragma: no cover - a type only; the module imports the gate's errors
+    from .needs_authorization import NeedsAuthorization
 
 MCPToolCall = Dict[str, Any]
 """A dict with at least 'name' and 'input' keys, matching the JS
@@ -63,3 +66,8 @@ class MCPMiddlewareOptions:
     """Story C-C: per-tool settings, ``{"lookup_order": {"minimum_level": "L2"}}``."""
     l3_minus_satisfies_l3: Optional[bool] = None
     """Story C-C: whether L3-minus (a proof with no token ``cnf`` to fuse) meets an ``L3`` minimum; default True."""
+    needs_authorization: Optional["NeedsAuthorization"] = None
+    """KYA-OS story L3-E: answers a call whose delegation is missing or does
+    not cover the tool's scopes with a signed `needs_authorization` challenge
+    (instead of the plain 403), and verifies the retry that carries the resume
+    token and the new delegation credential. See create_needs_authorization."""

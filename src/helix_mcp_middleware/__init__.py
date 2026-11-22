@@ -32,6 +32,13 @@ HelixID, mirroring helix-sdk-js's mcp-middleware package.
   a replay store (MemoryNonceStore, RedisNonceStore, DynamoNonceStore) and a
   server-signed detached proof on every tool call outcome at
   `_meta["org.kya-os/response-proof"]`; describe_kyaos() for /.well-known/mcp.
+- create_needs_authorization() (KYA-OS story L3-E): a caller whose delegation
+  does not cover a tool gets a signed `needs_authorization` challenge with a
+  single-use resume token (MemoryResumeTokenStore, RedisResumeTokenStore); the
+  retry's DelegationCredential goes to an injected RetryAuthorizer.
+- create_well_known_mcp() (KYA-OS story L1-D): the /.well-known/mcp discovery
+  document, built from config and the KYA-OS description, validated against
+  the vendored well-known-mcpi.json schema at startup, served over ASGI.
 """
 
 from __future__ import annotations
@@ -156,8 +163,53 @@ __all__ = [
     "AuthorizedCaller",
 ]
 
+# KYA-OS signed needs_authorization and resume (story L3-E).
+from .needs_authorization import *  # noqa: E402,F401,F403
+from .needs_authorization import __all__ as _needs_authorization_all  # noqa: E402
+from .resume_token_store import *  # noqa: E402,F401,F403
+from .resume_token_store import __all__ as _resume_token_store_all  # noqa: E402
+from .resume_token_store_env import *  # noqa: E402,F401,F403
+from .resume_token_store_env import __all__ as _resume_token_store_env_all  # noqa: E402
+
+__all__ += _needs_authorization_all + _resume_token_store_all + _resume_token_store_env_all
+
 # KYA-OS session, replay store and server response proof (story L2-A).
 from .kyaos import *  # noqa: E402,F401,F403
 from .kyaos import __all__ as _kyaos_all  # noqa: E402
 
 __all__ += _kyaos_all
+
+# The /.well-known/mcp discovery document (story L1-D).
+from .well_known import (  # noqa: E402
+    DEFAULT_PROOF_ALGORITHMS,
+    DEFAULT_SUPPORTED_DID_METHODS,
+    DEFAULT_WELL_KNOWN_VERSION,
+    WELL_KNOWN_MCP_INVALID,
+    WELL_KNOWN_MCP_PATH,
+    WellKnownMcp,
+    WellKnownMcpConfig,
+    WellKnownMcpError,
+    WellKnownMcpResponse,
+    WellKnownMcpValidation,
+    assert_well_known_mcp,
+    build_well_known_mcp,
+    create_well_known_mcp,
+    validate_well_known_mcp,
+)
+
+__all__ += [
+    "WELL_KNOWN_MCP_PATH",
+    "WELL_KNOWN_MCP_INVALID",
+    "DEFAULT_WELL_KNOWN_VERSION",
+    "DEFAULT_SUPPORTED_DID_METHODS",
+    "DEFAULT_PROOF_ALGORITHMS",
+    "WellKnownMcp",
+    "WellKnownMcpConfig",
+    "WellKnownMcpError",
+    "WellKnownMcpResponse",
+    "WellKnownMcpValidation",
+    "build_well_known_mcp",
+    "create_well_known_mcp",
+    "validate_well_known_mcp",
+    "assert_well_known_mcp",
+]
