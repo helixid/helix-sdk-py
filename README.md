@@ -151,10 +151,17 @@ by `helix-sdk-js`'s `cli` package -- the CLI has a single canonical
 implementation rather than one per SDK language.
 
 The one exception is custody (KYA-OS story F-3): `helix-custody init`,
-`helix-custody activate` and `helix-custody take` (or
-`python -m helix_sdk.custody`) do what `helix init`, `helix activate` and
-`helix custody take` do, for Python-only hosts. The same steps are functions:
-`helix_init`, `activate_agent`, `change_to_self_custody`.
+`helix-custody activate` and `helix-custody custody take` (`take` alone also
+works; or `python -m helix_sdk.custody`) do and print what `helix init`,
+`helix activate` and `helix custody take` do, with the same options, for
+Python-only hosts. `--json` prints the result as JSON instead. They exit 0
+when the command ran, an agent still waiting for its documents included, and
+1 with the error on stderr. The same steps are functions: `helix_init`,
+`activate_agent`, `change_to_self_custody`.
+
+With own hosting you do not have to run `activate`: Helix re-checks an agent
+waiting for its documents in the background and activates it once they are
+live.
 
 A self-custody agent's key is generated on its host and never sent. A
 custodial agent signs through `HelixCustodialSigner`, which calls the Helix

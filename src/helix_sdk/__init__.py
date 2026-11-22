@@ -66,15 +66,23 @@ from .did_resolver import ResolvedKey, did_key_document, resolve_did, resolve_di
 # KYA-OS story F-3: custody preference. helix_init (self-custody onboarding),
 # HelixCustodialSigner (custodial agents sign through the API), the custody
 # API client; the agent runtime takes any Signer (VPBuilder.sign_with).
+from . import custody  # noqa: F401  (helix-sdk-js exports it as the `custody` namespace)
 from .custody import (
     CustodyApiError,
+    CustodyLabel,
+    DidHostingMode,
+    EnvSigner,
     HelixCustodialSigner,
     HelixCustodyClient,
     HelixInitResult,
+    KeyCustodyMode,
+    Signer,
     activate_agent,
     change_to_self_custody,
     check_own_hosting,
     helix_init,
+    rotation_proof,
+    verification_method_of,
 )
 
 # Errors
@@ -175,12 +183,20 @@ __all__ = [
     "HelixError",
     "map_api_error",
     "codes",
+    "custody",
     "CustodyApiError",
+    "CustodyLabel",
+    "DidHostingMode",
+    "EnvSigner",
     "HelixCustodialSigner",
     "HelixCustodyClient",
     "HelixInitResult",
+    "KeyCustodyMode",
+    "Signer",
     "activate_agent",
     "change_to_self_custody",
     "check_own_hosting",
     "helix_init",
+    "rotation_proof",
+    "verification_method_of",
 ]

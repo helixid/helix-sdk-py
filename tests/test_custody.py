@@ -30,6 +30,7 @@ from helix_sdk.custody import (
     enrollment_proof_message,
     helix_init,
     kid_fragment,
+    INIT_FILES,
     main,
     rotation_proof,
     rotation_proof_message,
@@ -459,25 +460,151 @@ def test_change_to_self_custody_sends_only_the_public_key_and_a_proof(tmp_path: 
 # ------------------------------------------------------------- command line
 
 
-def test_command_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+def _run(*args: str) -> Tuple[int, str, str]:
+    import io
+
+    out, err = io.StringIO(), io.StringIO()
+    code = main(list(args), out=out, err=err)
+    return code, out.getvalue(), err.getvalue()
+
+
+def _seed_from(env_file: Path) -> str:
+    import re
+
+    found = re.search(r"HELIX_SIGNING_KEY=([0-9a-f]{64})", env_file.read_text(encoding="utf-8"))
+    assert found is not None
+    return found.group(1)
+
+
+def test_cli_init_on_helix_hosting_reports_like_the_js_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import helix_sdk.custody as custody_module
 
     api = init_api(DID, "helix", "https://helix.example/acme/bot-1", "active")
     monkeypatch.setattr(custody_module, "_requests_call", api)
-    assert main(["init", "--token", "enroll:t", "--out", str(tmp_path / "a"), "--api-url", "https://helix.example"]) == 0
-    assert json.loads(capsys.readouterr().out)["status"] == "active"
+    code, out, _ = _run("init", "--token", "enroll:t", "--out", str(tmp_path / "a"), "--api-url", "https://helix.example")
+    assert code == 0
+    seed = _seed_from(tmp_path / "a" / "signing-key.env")
+    for call in api.calls:
+        assert seed not in (call["body"] or "")
+    assert out.startswith(f"\u2713 Agent enrolled and active: {DID}\n")
+    assert f"Key:        {DID}#key-1 (custody: self, generated here; only the public key was sent)" in out
+    assert "Credential: vc:1" in out
+    assert "(private key, mode 0600: keep it on this host)" in out
+    assert "Publish the two documents" not in out
+
+    code, out, _ = _run("init", "--token", "enroll:t", "--out", str(tmp_path / "j"), "--api-url", "https://helix.example", "--json")
+    assert code == 0
+    assert json.loads(out) == {
+        "did": DID,
+        "kid": f"{DID}#key-1",
+        "label": "custody: self",
+        "didHosting": "helix",
+        "status": "active",
+        "files": {name: str(tmp_path / "j" / file) for name, file in INIT_FILES.items()},
+        "didDocumentUrl": "https://helix.example/acme/bot-1/did.json",
+        "cardUrl": "https://helix.example/acme/bot-1/card.json",
+        "resolution": None,
+        "vcId": "vc:1",
+    }
+
+
+def test_cli_own_hosting_pending_then_activate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import helix_sdk.custody as custody_module
 
     did = "did:web:owner.example:agents:bot"
     own = init_api(did, "own", "https://owner.example/agents/bot", "pending_resolution")
     monkeypatch.setattr(custody_module, "_requests_call", own)
-    assert main(["init", "--token", "enroll:t", "--out", str(tmp_path / "b"), "--api-url", "https://h", "--no-activate"]) == 2
-    capsys.readouterr()
     monkeypatch.setattr(custody_module, "resolve_entity_card", lambda did, fetch_json=None: (_ for _ in ()).throw(RuntimeError("not published")))
-    assert main(["activate", "--token", "enroll:t", "--out", str(tmp_path / "b"), "--api-url", "https://h"]) == 2
-    assert "not published" in capsys.readouterr().out
+    code, out, _ = _run("init", "--token", "enroll:t", "--out", str(tmp_path / "b"), "--api-url", "https://h", "--did", did)
+    assert code == 0
+    assert out.startswith(f"\u26a0 Agent enrolled, waiting for its documents on your domain: {did}")
+    assert "Publish the two documents, then activate:" in out
+    assert f"{tmp_path / 'b' / 'did.json'}  ->  https://owner.example/agents/bot/did.json" in out
+    assert "(not resolving yet: not published)" in out
+    assert f"helix-custody activate --token <token> --out {tmp_path / 'b'}" in out
 
-    take = FakeApi({f"POST /v1/agents/{DID}/custody": lambda body: {"did": DID, "label": "custody: self", "kid": f"{DID}#{body['kid']}", "documents": {}}})
+    code, out, _ = _run("activate", "--token", "enroll:t", "--out", str(tmp_path / "b"), "--api-url", "https://h")
+    assert (code, out) == (0, "\u26a0 Not active yet: not published\n")
+    assert not any(call["url"].endswith("/activate") for call in own.calls)
+
+    documents = json.loads((tmp_path / "b" / "did.json").read_text(encoding="utf-8"))
+    card = json.loads((tmp_path / "b" / "card.json").read_text(encoding="utf-8"))
+    monkeypatch.setattr(custody_module, "resolve_entity_card", lambda did, fetch_json=None: type("R", (), {"did_document": documents, "card": card})())
+    code, out, _ = _run("activate", "--token", "enroll:t", "--out", str(tmp_path / "b"), "--api-url", "https://h")
+    assert (code, out) == (0, f"\u2713 Agent active: {did}\n")
+    code, out, _ = _run("activate", "--token", "enroll:t", "--out", str(tmp_path / "b"), "--api-url", "https://h", "--json")
+    assert json.loads(out)["status"] == "active"
+
+    monkeypatch.setattr(custody_module, "resolve_entity_card", lambda did, fetch_json=None: (_ for _ in ()).throw(RuntimeError("x")))
+    code, out, _ = _run("init", "--token", "enroll:t", "--out", str(tmp_path / "n"), "--api-url", "https://h", "--no-activate", "--kid", "key-1", "--env-var", "HELIX_SIGNING_KEY")
+    assert code == 0 and "not resolving yet" not in out
+    code, out, _ = _run("activate", "--token", "enroll:t", "--out", str(tmp_path / "n"), "--api-url", "https://h")
+    assert out == "\u26a0 Not active yet: x\n"
+
+
+def test_cli_activate_with_no_reason_and_failures_exit_1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import helix_sdk.custody as custody_module
+
+    pending = custody_module.HelixInitResult(did=DID, kid=f"{DID}#key-1", did_hosting="own", status="pending_resolution", label="custody: self", public_key_jwk={}, env_var="V", files={}, did_document_url="", card_url="")
+    monkeypatch.setattr(custody_module, "activate_agent", lambda *a, **k: pending)
+    assert _run("activate", "--token", "t", "--out", str(tmp_path), "--api-url", "https://h")[1] == "\u26a0 Not active yet: the documents do not resolve from your domain\n"
+    monkeypatch.setattr(custody_module, "_requests_call", FakeApi({}))
+    code, out, err = _run("init", "--token", "enroll:t", "--out", str(tmp_path / "e"), "--api-url", "https://h")
+    assert (code, out) == (1, "")
+    assert err.strip() == "/v1/agents/enroll/challenge"
+
+
+def test_cli_custody_take_reports_like_the_js_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import helix_sdk.custody as custody_module
+
+    def change(body: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "did": DID,
+            "label": "custody: self",
+            "kid": f"{DID}#{body['kid']}",
+            "previousKid": f"{DID}#key-1",
+            "previousKeyShredded": True,
+            "retiresAt": "2026-11-23T00:00:00.000Z",
+            "hopReissue": {"reissued": 0, "pending": True},
+            "publishRequired": True,
+            "documents": {"didDocument": {"id": DID}, "card": {"id": DID}, "didDocumentUrl": "u", "cardUrl": "c"},
+        }
+
+    take = FakeApi({f"POST /v1/agents/{DID}/custody": change})
     monkeypatch.setattr(custody_module, "_requests_call", take)
-    assert main(["take", "--did", DID, "--out", str(tmp_path / "c"), "--api-url", "https://h", "--admin-key", "admin", "--overlap", "0"]) == 0
-    assert json.loads(capsys.readouterr().out)["label"] == "custody: self"
+    code, out, _ = _run("custody", "take", "--did", DID, "--out", str(tmp_path / "c"), "--api-url", "https://h", "--admin-key", "admin", "--overlap", "60")
+    assert code == 0
+    seed = _seed_from(tmp_path / "c" / "signing-key.env")
+    assert seed not in take.calls[0]["body"]
+    assert sorted(json.loads(take.calls[0]["body"])) == ["keyCustody", "kid", "overlapSeconds", "proof", "publicKeyJwk"]
     assert take.calls[0]["headers"]["x-admin-api-key"] == "admin"
+    lines = out.splitlines()
+    assert lines[0] == f"\u2713 {DID} is now custody: self"
+    assert lines[1].startswith(f"New key:      {DID}#key-") and lines[1].endswith(f"(generated here; private key in {tmp_path / 'c' / 'signing-key.env'})")
+    assert lines[2] == f"Previous key: {DID}#key-1, in the DID document until 2026-11-23T00:00:00.000Z, shredded in Helix"
+    assert lines[3] == "Hops:         not reissued (story C-E)"
+    assert lines[4] == f"Publish the updated did.json and card.json from {tmp_path / 'c'} on your domain."
+
+    quiet = FakeApi({f"POST /v1/services/{DID}/custody": lambda body: {"did": DID, "label": "custody: self", "kid": f"{DID}#{body['kid']}", "previousKid": f"{DID}#key-1", "retiresAt": "r", "hopReissue": {"reissued": 1, "pending": False}, "documents": {}}})
+    monkeypatch.setattr(custody_module, "_requests_call", quiet)
+    code, out, _ = _run("take", "--did", DID, "--out", str(tmp_path / "s"), "--api-url", "https://h", "--api-key", "acc", "--subject", "service")
+    assert code == 0
+    assert "shredded" not in out and "not reissued" not in out and "Publish the updated" not in out
+    assert quiet.calls[0]["headers"]["authorization"] == "Bearer acc"
+    code, out, _ = _run("take", "--did", DID, "--out", str(tmp_path / "s2"), "--api-url", "https://h", "--subject", "service", "--json")
+    assert json.loads(out)["label"] == "custody: self"
+
+
+def test_parity_helpers_and_exports() -> None:
+    import helix_sdk
+    import helix_sdk.custody as custody_module
+
+    signer = EnvSigner(DID, kid="#signing", env={"HELIX_SIGNING_KEY": SEED_HEX})
+    assert custody_module.verification_method_of(signer) == f"{DID}#signing"
+    assert custody_module.verification_method_of(type("S", (), {"did": DID, "kid": "#k"})()) == f"{DID}#k"
+    assert [custody_module._base36(n) for n in (0, 35, 36, 1795347962687)] == ["0", "z", "10", "mwrrtlxb"]
+    for name in ("custody", "EnvSigner", "Signer", "HelixCustodialSigner", "HelixCustodyClient", "helix_init", "activate_agent", "check_own_hosting", "change_to_self_custody", "rotation_proof", "verification_method_of", "KeyCustodyMode", "DidHostingMode", "CustodyLabel"):
+        assert name in helix_sdk.__all__ and hasattr(helix_sdk, name), name
+    assert {"enrollmentToken", "documents", "publishRequired", "vcId"} <= set(custody_module.OnboardingResult.__annotations__)
+    assert custody_module.OnboardingResult.__total__ is False and custody_module.CustodyView.__total__ is True
+    assert set(custody_module.CustodyView.__annotations__) == {"did", "subjectType", "name", "keyCustody", "didHosting", "label", "conformant", "status", "kid", "credentialVcId", "keys"}

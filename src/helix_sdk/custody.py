@@ -25,7 +25,10 @@ Every request body passes :func:`assert_no_private_material` before it is
 sent (self-custody invariant). The proof messages are the bytes helix-core
 checks (``fixtures/kya-os-helix/custody.json``).
 
-Command line: ``helix-custody init|activate|take`` (or ``python -m helix_sdk.custody``).
+Command line: ``helix-custody init|activate|custody take`` (``take`` alone
+also works; or ``python -m helix_sdk.custody``), the same commands and report
+as helix-sdk-js's ``helix init|activate|custody take``; ``--json`` prints the
+result as JSON instead.
 """
 
 from __future__ import annotations
@@ -39,13 +42,13 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Sequence, TextIO, Tuple, TypedDict
 from urllib.parse import quote
 
 import nacl.signing
 
 from .agent_key import AgentKey, assert_no_private_material, generate_agent_key, to_public_key_jwk
-from .crypto.jws import DEFAULT_SIGNING_KEY_ENV_VAR, EnvSigner, Signer
+from .crypto.jws import DEFAULT_KID_FRAGMENT, DEFAULT_SIGNING_KEY_ENV_VAR, EnvSigner, Signer
 from .entity_card import FetchJson, resolve_entity_card, same_did
 from .keys import _normalize_ed25519_private_key
 
@@ -61,16 +64,120 @@ INIT_FILES = {
     "summary": "helix-agent.json",
 }
 
+# ------------------------------------------------------------------- types
+# The shapes the custody endpoints answer with, as helix-sdk-js types them
+# (core/custody/client.ts). The client returns plain dicts of these shapes.
+
+KeyCustodyMode = Literal["self", "helix"]
+DidHostingMode = Literal["own", "helix"]
+CustodySubjectKind = Literal["agent", "service", "owner"]
+CustodyLabel = Literal["custody: self", "custody: helix"]
+CustodyStatus = Literal["pending_key", "pending_resolution", "active"]
+
+
+class CustodyKeyView(TypedDict):
+    kid: str
+    location: KeyCustodyMode
+    status: Literal["active", "retiring", "revoked"]
+    createdAt: str
+    retiresAt: Optional[str]
+    revokedAt: Optional[str]
+
+
+class CustodyView(TypedDict):
+    did: str
+    subjectType: CustodySubjectKind
+    name: Optional[str]
+    keyCustody: KeyCustodyMode
+    didHosting: DidHostingMode
+    label: CustodyLabel
+    conformant: bool
+    status: CustodyStatus
+    kid: Optional[str]
+    credentialVcId: Optional[str]
+    keys: List[CustodyKeyView]
+
+
+class PublishedDocuments(TypedDict):
+    didDocument: Dict[str, Any]
+    card: Dict[str, Any]
+    didDocumentUrl: str
+    cardUrl: str
+
+
+class OnboardingResult(CustodyView, total=False):
+    enrollmentToken: str
+    enrollmentExpiresAt: str
+    documents: PublishedDocuments
+    publishRequired: bool
+    vcId: str
+
+
+class EnrollmentChallenge(TypedDict):
+    did: str
+    kid: str
+    nonce: str
+    keyCustody: Literal["self"]
+    didHosting: DidHostingMode
+    name: Optional[str]
+    didDocumentUrl: str
+    cardUrl: str
+
+
+class SignResponse(TypedDict):
+    did: str
+    kid: str
+    alg: Literal["EdDSA"]
+    signature: str
+
+
+class HopReissue(TypedDict, total=False):
+    reissued: int
+    pending: bool
+    note: str
+
+
+class ChangeCustodyResult(CustodyView, total=False):
+    previousKid: str
+    previousKeyShredded: bool
+    retiresAt: str
+    hopReissue: HopReissue
+    documents: PublishedDocuments
+    publishRequired: bool
+    vcId: str
+
+
+class ResolutionCheck(TypedDict, total=False):
+    ok: bool
+    reason: str
+
+
 __all__ = [
     "ENROLLMENT_PROOF_PREFIX",
     "ROTATION_PROOF_PREFIX",
     "CUSTODY_LABEL_HELIX",
     "CUSTODY_LABEL_SELF",
+    "DEFAULT_KID_FRAGMENT",
+    "DEFAULT_SIGNING_KEY_ENV_VAR",
+    "INIT_FILES",
+    "ChangeCustodyResult",
     "CustodyApiError",
+    "CustodyKeyView",
+    "CustodyLabel",
+    "CustodyStatus",
+    "CustodySubjectKind",
+    "CustodyView",
+    "DidHostingMode",
+    "EnrollmentChallenge",
     "EnvSigner",
     "HelixCustodialSigner",
     "HelixCustodyClient",
     "HelixInitResult",
+    "KeyCustodyMode",
+    "OnboardingResult",
+    "PublishedDocuments",
+    "ResolutionCheck",
+    "SignResponse",
     "Signer",
     "activate_agent",
     "base64url_decode",
@@ -83,6 +190,7 @@ __all__ = [
     "main",
     "rotation_proof",
     "rotation_proof_message",
+    "verification_method_of",
 ]
 
 
@@ -118,13 +226,28 @@ def rotation_proof_message(did: str, kid: str, issued_at: str) -> bytes:
     return _message([ROTATION_PROOF_PREFIX, did, kid, issued_at])
 
 
-def kid_fragment(did: str, kid: str = "key-1") -> str:
+def kid_fragment(did: str, kid: str = DEFAULT_KID_FRAGMENT) -> str:
     """``kid`` as a fragment: ``key-1``, ``#key-1`` or ``<did>#key-1`` (which must be this DID's)."""
     fragment = kid[len(did) + 1:] if kid.startswith(f"{did}#") else kid
     fragment = fragment[1:] if fragment.startswith("#") else fragment
     if not fragment or "#" in fragment:
         raise ValueError(f"kid {kid} is not a verification-method fragment of {did}")
     return fragment
+
+
+def verification_method_of(signer: Any) -> str:
+    """``<did>#<kid>``, what a proof's verificationMethod or a JWS header names."""
+    return f"{signer.did}#{str(signer.kid).lstrip('#')}"
+
+
+def _base36(value: int) -> str:
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    out = ""
+    while True:
+        value, remainder = divmod(value, 36)
+        out = digits[remainder] + out
+        if value == 0:
+            return out
 
 
 def _now_iso() -> str:
@@ -203,41 +326,41 @@ class HelixCustodyClient:
             raise ValueError("kind must be agent, service or owner")
         return f"/v1/{kind}s/{quote(did, safe='')}"
 
-    def create_agent(self, **input: Any) -> Dict[str, Any]:
+    def create_agent(self, **input: Any) -> OnboardingResult:
         """``POST /v1/agents``: name, scopes, keyCustody, didHosting, did, ownerDid,
         expiry, requestedDomains (bare hosts or http(s) URLs, published as
         ``#domain-N`` LinkedDomains entries) and maxDelegationDepth (0 to 5,
         default 0, written on the identity credential), passed as given."""
         return self.request("POST", "/v1/agents", input)
 
-    def create_service(self, **input: Any) -> Dict[str, Any]:
+    def create_service(self, **input: Any) -> OnboardingResult:
         return self.request("POST", "/v1/services", input)
 
-    def create_owner(self, **input: Any) -> Dict[str, Any]:
+    def create_owner(self, **input: Any) -> OnboardingResult:
         return self.request("POST", "/v1/owners", input)
 
-    def enrollment_challenge(self, enrollment_token: str) -> Dict[str, Any]:
+    def enrollment_challenge(self, enrollment_token: str) -> EnrollmentChallenge:
         return self.request("POST", "/v1/agents/enroll/challenge", {"enrollmentToken": enrollment_token})
 
-    def enroll(self, enrollment_token: str, public_key_jwk: Mapping[str, Any], signature: str, kid: Optional[str] = None) -> Dict[str, Any]:
+    def enroll(self, enrollment_token: str, public_key_jwk: Mapping[str, Any], signature: str, kid: Optional[str] = None) -> OnboardingResult:
         body: Dict[str, Any] = {"enrollmentToken": enrollment_token, "publicKeyJwk": dict(public_key_jwk), "signature": signature}
         if kid is not None:
             body["kid"] = kid
         return self.request("POST", "/v1/agents/enroll", body)
 
-    def activate(self, did: str, enrollment_token: Optional[str] = None, kind: str = "agent") -> Dict[str, Any]:
+    def activate(self, did: str, enrollment_token: Optional[str] = None, kind: str = "agent") -> OnboardingResult:
         return self.request("POST", f"{self._subject(did, kind)}/activate", {"enrollmentToken": enrollment_token} if enrollment_token else {})
 
-    def sign(self, did: str, payload: bytes, kid: Optional[str] = None, kind: str = "agent") -> Dict[str, Any]:
+    def sign(self, did: str, payload: bytes, kid: Optional[str] = None, kind: str = "agent") -> SignResponse:
         body: Dict[str, Any] = {"payload": base64url_encode(payload)}
         if kid is not None:
             body["kid"] = kid
         return self.request("POST", f"{self._subject(did, kind)}/sign", body)
 
-    def get_custody(self, did: str, kind: str = "agent") -> Dict[str, Any]:
+    def get_custody(self, did: str, kind: str = "agent") -> CustodyView:
         return self.request("GET", f"{self._subject(did, kind)}/custody")
 
-    def change_custody(self, did: str, kind: str = "agent", **input: Any) -> Dict[str, Any]:
+    def change_custody(self, did: str, kind: str = "agent", **input: Any) -> ChangeCustodyResult:
         return self.request("POST", f"{self._subject(did, kind)}/custody", input)
 
     def finalize_rotation(self, did: str, force: bool = False, kind: str = "agent") -> Dict[str, Any]:
@@ -263,7 +386,7 @@ class HelixCustodialSigner(Signer):
         self,
         did: str,
         api_url: Optional[str] = None,
-        kid: str = "key-1",
+        kid: str = DEFAULT_KID_FRAGMENT,
         subject: str = "agent",
         admin_api_key: Optional[str] = None,
         api_key: Optional[str] = None,
@@ -482,7 +605,7 @@ def change_to_self_custody(
 ) -> Dict[str, Any]:
     """A custody change from ``helix`` to ``self`` (a rotation): the new key is
     generated here; only its public half and a proof of possession go out."""
-    fragment = kid_fragment(did, kid or f"key-{int(time.time() * 1000):x}")
+    fragment = kid_fragment(did, kid or f"key-{_base36(int(time.time() * 1000))}")
     full_kid = f"{did}#{fragment}"
     key = (generate_key or generate_agent_key)()
     seed = bytes(_normalize_ed25519_private_key(key.private_key_hex))
@@ -520,59 +643,141 @@ def change_to_self_custody(
 # ------------------------------------------------------------- command line
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    """``helix-custody init|activate|take``."""
+def _report(result: HelixInitResult, out: TextIO) -> None:
+    out.write("\n")
+    out.write(f"DID:        {result.did}\n")
+    out.write(f"Key:        {result.kid} ({result.label}, generated here; only the public key was sent)\n")
+    out.write(f"DID hosting: {result.did_hosting}\n")
+    out.write(f"Status:     {result.status}\n")
+    out.write(f"Files:      {result.files['did_document']}\n")
+    out.write(f"            {result.files['card']}\n")
+    out.write(f"            {result.files['signing_key']} (private key, mode 0600: keep it on this host)\n")
+    out.write(f"            {result.files['summary']}\n")
+    if result.vc_id:
+        out.write(f"Credential: {result.vc_id}\n")
+
+
+def _init_json(result: HelixInitResult) -> Dict[str, Any]:
+    return {
+        "did": result.did,
+        "kid": result.kid,
+        "label": result.label,
+        "didHosting": result.did_hosting,
+        "status": result.status,
+        "files": result.files,
+        "didDocumentUrl": result.did_document_url,
+        "cardUrl": result.card_url,
+        "resolution": result.resolution,
+        **({"vcId": result.vc_id} if result.vc_id else {}),
+    }
+
+
+def _print_init(result: HelixInitResult, out_dir: str, out: TextIO) -> None:
+    """What ``helix init`` prints (helix-sdk-js cli/src/commands/init.ts)."""
+    if result.status == "active":
+        out.write(f"\u2713 Agent enrolled and active: {result.did}\n")
+    else:
+        out.write(f"\u26a0 Agent enrolled, waiting for its documents on your domain: {result.did}\n")
+    _report(result, out)
+    if result.status == "pending_resolution":
+        out.write("\nPublish the two documents, then activate:\n")
+        out.write(f"  {result.files['did_document']}  ->  {result.did_document_url}\n")
+        out.write(f"  {result.files['card']}  ->  {result.card_url}\n")
+        if result.resolution and not result.resolution.get("ok"):
+            out.write(f"  (not resolving yet: {result.resolution.get('reason')})\n")
+        out.write(f"  helix-custody activate --token <token> --out {out_dir}\n")
+
+
+def _print_activate(result: HelixInitResult, out: TextIO) -> None:
+    if result.status == "active":
+        out.write(f"\u2713 Agent active: {result.did}\n")
+    else:
+        reason = (result.resolution or {}).get("reason") or "the documents do not resolve from your domain"
+        out.write(f"\u26a0 Not active yet: {reason}\n")
+
+
+def _print_take(did: str, out_dir: str, changed: Mapping[str, Any], out: TextIO) -> None:
+    result = changed["result"]
+    hops = result.get("hopReissue") or {}
+    out.write(f"\u2713 {did} is now {result.get('label')}\n")
+    out.write(f"New key:      {result.get('kid')} (generated here; private key in {changed['files']['signing_key']})\n")
+    shredded = ", shredded in Helix" if result.get("previousKeyShredded") else ""
+    out.write(f"Previous key: {result.get('previousKid')}, in the DID document until {result.get('retiresAt')}{shredded}\n")
+    if hops.get("pending"):
+        out.write(f"Hops:         not reissued ({hops.get('note') or 'story C-E'})\n")
+    if result.get("publishRequired"):
+        out.write(f"Publish the updated did.json and card.json from {out_dir} on your domain.\n")
+
+
+def _take_arguments(take: argparse.ArgumentParser, default_api: str) -> None:
+    take.add_argument("--did", required=True, help="the DID whose custody changes")
+    take.add_argument("--out", required=True, help="directory for the new signing-key.env")
+    take.add_argument("--api-url", default=default_api, help="Helix API base URL")
+    take.add_argument("--api-key", default=os.environ.get("HELIX_API_KEY"), help="enterprise account API key")
+    take.add_argument("--admin-key", default=os.environ.get("HELIX_ADMIN_API_KEY"), help="admin API key (self-hosted)")
+    take.add_argument("--subject", default="agent", choices=["agent", "service", "owner"])
+    take.add_argument("--overlap", type=int, help="how long both keys stay in the DID document, in seconds")
+    take.add_argument("--json", action="store_true", help="print the result as JSON")
+
+
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="helix-custody", description="HelixID custody commands (KYA-OS story F-3)")
     default_api = os.environ.get("HELIX_API_URL") or os.environ.get("API_BASE_URL") or "http://localhost:3000"
     sub = parser.add_subparsers(dest="command", required=True)
-    init = sub.add_parser("init", help="self-custody onboarding with an enrollment token")
-    init.add_argument("--token", required=True)
-    init.add_argument("--out", required=True)
-    init.add_argument("--api-url", default=default_api)
-    init.add_argument("--did")
-    init.add_argument("--kid")
-    init.add_argument("--no-activate", action="store_true")
-    init.add_argument("--env-var", default=DEFAULT_SIGNING_KEY_ENV_VAR)
-    act = sub.add_parser("activate", help="own hosting: activate once the documents are published")
-    act.add_argument("--token", required=True)
-    act.add_argument("--out", required=True)
-    act.add_argument("--api-url", default=default_api)
-    take = sub.add_parser("take", help="change a custodial subject to self-custody")
-    take.add_argument("--did", required=True)
-    take.add_argument("--out", required=True)
-    take.add_argument("--api-url", default=default_api)
-    take.add_argument("--api-key", default=os.environ.get("HELIX_API_KEY"))
-    take.add_argument("--admin-key", default=os.environ.get("HELIX_ADMIN_API_KEY"))
-    take.add_argument("--subject", default="agent", choices=["agent", "service", "owner"])
-    take.add_argument("--overlap", type=int)
-    args = parser.parse_args(argv)
+    init = sub.add_parser("init", help="self-custody onboarding: generate the agent key here, register only its public half, write did.json and card.json")
+    init.add_argument("--token", required=True, help="enrollment token from the console (POST /v1/agents with keyCustody self)")
+    init.add_argument("--out", required=True, help="directory for did.json, card.json, signing-key.env and helix-agent.json")
+    init.add_argument("--api-url", default=default_api, help="Helix API base URL")
+    init.add_argument("--did", help="own hosting: the did:web you expect the token to be for")
+    init.add_argument("--kid", help="verification-method fragment for the new key (default key-1)")
+    init.add_argument("--no-activate", action="store_true", help="own hosting: do not check resolution or activate yet")
+    init.add_argument("--env-var", default=DEFAULT_SIGNING_KEY_ENV_VAR, help="variable name signing-key.env sets")
+    init.add_argument("--json", action="store_true", help="print the result as JSON")
+    act = sub.add_parser("activate", help="own hosting: check the published documents resolve from your domain, then activate the agent")
+    act.add_argument("--token", required=True, help="the enrollment token helix-custody init used")
+    act.add_argument("--out", required=True, help="the directory helix-custody init wrote")
+    act.add_argument("--api-url", default=default_api, help="Helix API base URL")
+    act.add_argument("--json", action="store_true", help="print the result as JSON")
+    custody = sub.add_parser("custody", help="custody commands")
+    custody_sub = custody.add_subparsers(dest="custody_command", required=True)
+    _take_arguments(custody_sub.add_parser("take", help="change a custodial agent, service or owner to self-custody (a key rotation; the new key is generated here)"), default_api)
+    _take_arguments(sub.add_parser("take", help="same as custody take"), default_api)
+    return parser
 
-    if args.command == "init":
-        result = helix_init(args.api_url, args.token, args.out, did=args.did, kid=args.kid, activate=not args.no_activate, env_var=args.env_var)
-    elif args.command == "activate":
-        result = activate_agent(args.api_url, args.token, args.out)
-    else:
-        client = HelixCustodyClient(args.api_url, admin_api_key=args.admin_key, api_key=args.api_key)
-        changed = change_to_self_custody(client, args.did, args.out, subject=args.subject, overlap_seconds=args.overlap)
-        print(json.dumps({"did": args.did, "label": changed["result"].get("label"), "kid": changed["result"].get("kid"), "files": changed["files"]}, indent=2))
-        return 0
-    print(
-        json.dumps(
-            {
-                "did": result.did,
-                "kid": result.kid,
-                "label": result.label,
-                "didHosting": result.did_hosting,
-                "status": result.status,
-                "files": result.files,
-                "didDocumentUrl": result.did_document_url,
-                "cardUrl": result.card_url,
-                "resolution": result.resolution,
-            },
-            indent=2,
-        )
-    )
-    return 0 if result.status == "active" else 2
+
+def main(argv: Optional[List[str]] = None, out: Optional[TextIO] = None, err: Optional[TextIO] = None) -> int:
+    """``helix-custody init|activate|custody take``: what helix-sdk-js's
+    ``helix init|activate|custody take`` do and print. Exit 0 when the
+    command ran (an agent still waiting for its documents included), 1 with
+    the error on stderr when it failed."""
+    args = _parser().parse_args(argv)
+    stdout = out or sys.stdout
+    stderr = err or sys.stderr
+    try:
+        if args.command == "init":
+            result = helix_init(args.api_url, args.token, args.out, did=args.did, kid=args.kid, activate=not args.no_activate, env_var=args.env_var)
+            if args.json:
+                stdout.write(json.dumps(_init_json(result), indent=2) + "\n")
+            else:
+                _print_init(result, args.out, stdout)
+        elif args.command == "activate":
+            result = activate_agent(args.api_url, args.token, args.out)
+            if args.json:
+                stdout.write(json.dumps(_init_json(result), indent=2) + "\n")
+            else:
+                _print_activate(result, stdout)
+        else:
+            client = HelixCustodyClient(args.api_url, admin_api_key=args.admin_key, api_key=args.api_key)
+            changed = change_to_self_custody(client, args.did, args.out, subject=args.subject, overlap_seconds=args.overlap)
+            if args.json:
+                result = changed["result"]
+                stdout.write(json.dumps({"did": args.did, "label": result.get("label"), "kid": result.get("kid"), "previousKid": result.get("previousKid"), "files": changed["files"]}, indent=2) + "\n")
+            else:
+                _print_take(args.did, args.out, changed, stdout)
+    except Exception as error:  # noqa: BLE001 - the command line reports every failure the same way
+        stderr.write(f"{error}\n")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover
