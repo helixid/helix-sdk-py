@@ -69,3 +69,22 @@ variable. A bad setting or a missing package stops the server at startup.
 ## KYA-OS `needs_authorization` and resume (story L3-E)
 
 Set `KYAOS_AUTHORIZATION_URL` (the consent page) and a caller whose scopes do not cover a tool gets the signed `needs_authorization` challenge as the call's result instead of a 403, with a resume token bound to the agent, tool and scopes (`KYAOS_RESUME_TTL_SECONDS`, default 600; the token store follows `KYAOS_NONCE_STORE`, chosen by `helix_mcp_middleware` itself: Redis on `KYAOS_REDIS_URL` when the replay store is Redis, sharing records with JS instances, memory otherwise). The retry carries `_kyaos_resume` and the DelegationCredential as `_kyaos_delegation`. In `DEMO_MODE` the bearers `demo-agent` and `demo-agent-2` are agents with a DID and `orders:read` only, and the retry's credential is checked structurally by `demo_authorizer.py` (invoker, invocationTarget, allowedAction, validUntil, a `proof` present; no signature verification, which stories F-2 and L3-H bring); outside demo mode every retry is refused until a verifier is wired in. `AUDIT_LOG_FILE` appends every audit event as a JSON line. The same wire behaviour as the JS sample.
+
+## Discovery at `/.well-known/mcp` (story L1-D)
+
+Whenever `SERVICE_DID` is a `did:web` or `did:key`, the server answers `GET /.well-known/mcp` with the KYA-OS
+discovery document, the same bytes the JS sample serves for the same environment: the DID, `endpoints.tools` at
+`KYAOS_PUBLIC_ORIGIN` (default: the origin of `MCP_RESOURCE`), `endpoints.handshake` while the KYA-OS layer runs with
+sessions, `clockSkewSeconds` (the handshake's), `capabilities` (`proofs` true with `SERVICE_SIGNING_KEY`; the rest
+false, nothing else is on in this sample) and, with `STATUS_LIST_CREDENTIAL`, that URL. The document is validated
+against the schema at startup; `WELL_KNOWN_MCP=0` turns the route off (404) and `WELL_KNOWN_MCP=1` makes a
+`SERVICE_DID` the document cannot carry a startup error. Behind a proxy, forward `/.well-known/mcp` at the origin root
+to this process and set `KYAOS_PUBLIC_ORIGIN` (helix-sdk-js's `mcp-middleware/docs/well-known.md` has the nginx, ALB
+and API Gateway rules).
+
+```bash
+curl -s localhost:3700/.well-known/mcp | python -m json.tool
+```
+
+A `SERVICE_DID` of another method (a `did:hedera` from a Helix stack, say) cannot be the document's `serverDid`, so
+the route stays off and the `Discovery:` startup line says why.

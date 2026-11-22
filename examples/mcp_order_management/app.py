@@ -58,6 +58,7 @@ from helix_mcp_middleware import (
     KyaOsRuntime,
     McpAuditTrail,
     MCPMiddlewareOptions,
+    WellKnownMcp,
     async_helixid_mcp_middleware,
     build_protected_resource_metadata,
     extract_credential,
@@ -147,6 +148,7 @@ def create_order_app(
     on_server_error: Optional[Callable[[BaseException], None]] = None,
     audit: Optional[McpAuditTrail] = None,
     kyaos: Optional[KyaOsRuntime] = None,
+    well_known: Optional[WellKnownMcp] = None,
 ) -> Any:
     """An ASGI app. `resource` is this server's MCP endpoint URL (MCP is
     served at its path); `auth` is everything except the scopes, which this
@@ -154,7 +156,9 @@ def create_order_app(
     events (pair it with `auth.audit_sink = audit.tool_audit_sink()`);
     `kyaos` turns on the KYA-OS layer (story L2-A): the handshake tool,
     sessions, the replay store and a server-signed proof on every tool call
-    outcome."""
+    outcome. `well_known` serves the KYA-OS discovery document at
+    `/.well-known/mcp` (story L1-D, from create_well_known_mcp()); a disabled
+    one answers 404."""
     url = urlsplit(resource)
     if url.scheme not in ("http", "https") or not url.hostname:
         raise ValueError(f"resource must be an http(s) URL, got {resource!r}")
@@ -207,6 +211,8 @@ def create_order_app(
         async def respond(status: int, body: Any, headers: Optional[dict] = None) -> None:
             await JSONResponse(body, status_code=status, headers=headers)(scope, receive, send)
 
+        if well_known is not None and await well_known.handle(scope, receive, send):
+            return
         path, method = scope["path"], scope["method"]
         if path == metadata_path and method == "GET":
             await respond(200, metadata)
