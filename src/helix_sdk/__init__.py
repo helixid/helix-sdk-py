@@ -89,6 +89,8 @@ from .did_resolver import ResolvedKey, did_key_document, resolve_did, resolve_di
 from .errors import (  # noqa: F401
     HelixError,
     InvalidJWSError,
+    AuditEventInvalidError,
+    AuditEvidenceError,
     ResponseProofError,
     NeedsAuthorizationError,
     map_api_error,

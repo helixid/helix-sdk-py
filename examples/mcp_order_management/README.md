@@ -42,7 +42,10 @@ The variables are the JS sample's. `SERVICE_DID` turns on the KYA-OS door: each 
 against that DID, from public DID documents, status lists and the agent's Entity Card alone, so the server authorises
 with the Helix API unreachable (`KYAOS_TRUSTED_ISSUERS`, `KYAOS_TRUSTED_ROOTS`, `KYAOS_MAX_CHAIN_LENGTH`,
 `KYAOS_CARDS_FILE` and, in development, `KYAOS_ALLOW_LOOPBACK_HTTP=1` tune it). `HELIX_API_URL` + `HELIX_API_KEY`
-only write the audit log, never on the request path. `OAUTH_ISSUER` (alone, or with `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` for opaque tokens) for one
+(with `SERVICE_DID`) only write the audit log, never on the request path: typed KYA-OS audit events, one
+`session.established` / `tool.call.*` bracket per call plus the gate's decisions (`proof.verified` at the proof's level,
+or `proof.rejected`); tool names are withheld unless `AUDIT_INCLUDE_TOOL_NAMES=1`; an audit write that fails fails the
+call with a 500. `OAUTH_ISSUER` (alone, or with `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` for opaque tokens) for one
 authorization server; `OAUTH_ISSUERS` for several, with the `entra`, `auth0`, `okta` and `keycloak` presets. See the
 docstring of [`__main__.py`](__main__.py) and the JS sample's README for the full table.
 

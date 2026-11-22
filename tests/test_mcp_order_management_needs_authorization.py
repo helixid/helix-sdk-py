@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
 from starlette.testclient import TestClient  # noqa: E402
 
 from helix_sdk import kyaos  # noqa: E402
+from helix_sdk.audit import MemoryAuditSink  # noqa: E402
 from helix_sdk.did import build_did_document  # noqa: E402
 from helix_sdk.keys import generate_key_pair  # noqa: E402
 from helix_mcp_middleware import (  # noqa: E402
@@ -41,6 +42,7 @@ from helix_mcp_middleware import (  # noqa: E402
     NeedsAuthorizationOptions,
     RedisResumeTokenStore,
     create_kyaos,
+    create_mcp_audit_trail,
     create_needs_authorization,
 )
 from mcp_order_management import __main__ as entry  # noqa: E402
@@ -335,3 +337,54 @@ def entry_context() -> Any:
     from helix_mcp_middleware import ChallengeContext
 
     return ChallengeContext(agent_did=AGENT, tool="refund_order", scopes=["orders:admin"])
+
+
+class TestWithTheTypedAuditTrail:
+    """KYA-OS story A-1 with L3-E: the challenge is a denied call by reason needs_authorization, the retry a completed one."""
+
+    @pytest.mark.parametrize("with_kyaos", [True, False])
+    def test_records_the_challenge_as_a_denied_call_then_the_retry_as_a_completed_one(self, with_kyaos: bool) -> None:
+        clock = Clock()
+        sink = MemoryAuditSink()
+        audit = create_mcp_audit_trail(sink, SERVICE)
+        layer = create_needs_authorization(
+            NeedsAuthorizationOptions(
+                authorization_url=CONSENT,
+                authorizer=demo_retry_authorizer(SERVICE, now=clock.now),
+                audit_sink=audit.tool_audit_sink(),
+                now=clock.now,
+                service_did=SERVICE,
+            )
+        )
+        options = MCPMiddlewareOptions(service_did=SERVICE, validate_oauth_token=validate, audit_sink=audit.tool_audit_sink(), needs_authorization=layer)
+        runtime = (
+            create_kyaos(KyaOsOptions(signer=SIGNER, public_origin=BASE, now=clock.now, nonce_store=MemoryNonceStore(now=clock.now)))
+            if with_kyaos
+            else None
+        )
+        http = TestClient(create_order_app(f"{BASE}/mcp", options, audit=audit, kyaos=runtime), base_url=BASE)
+
+        def call(args: Dict[str, Any]) -> Any:
+            return http.post(
+                "/mcp",
+                headers={**JSON_HEADERS, "authorization": "Bearer agent"},
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "refund_order", "arguments": args}},
+            )
+
+        with http:
+            first = call(REFUND)
+            assert first.status_code == (200 if with_kyaos else 403), first.text
+            challenge = first.json()["result"]["structuredContent"] if with_kyaos else first.json()
+            assert challenge["error"] == "needs_authorization" and challenge["scopes"] == ["orders:admin"]
+            assert sink.event_types == ["session.established", "authorization.denied", "tool.call.denied"]
+            assert sink.events[1]["reason"] == {"code": "needs_authorization"}
+            assert sink.events[1]["authorization"]["scopeId"] == "orders:admin"
+            assert sink.events[2]["outcome"] == "denied" and sink.events[2]["reason"] == {"code": "needs_authorization"}
+            assert len({event["correlationId"] for event in sink.events}) == 1
+
+            del sink.entries[:]
+            ok = call({**REFUND, "_kyaos_resume": challenge["resumeToken"], "_kyaos_delegation": hop_for(AGENT)})
+            assert ok.status_code == 200, ok.text
+            assert json.loads(ok.json()["result"]["content"][0]["text"])["status"] == "refunded"
+            assert sink.event_types == ["session.established", "authorization.approved", "tool.call.started", "tool.call.completed"]
+            assert all(challenge["resumeToken"] not in entry.canonical for entry in sink.entries)

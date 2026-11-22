@@ -255,22 +255,30 @@ class HelixClient:
         event_type: Optional[str] = None,
         since: Optional[str] = None,
         limit: Optional[int] = None,
+        family: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        qs = _query_string({"eventType": event_type, "since": since, "limit": limit})
+        """``GET /v1/audit-log``: rows ``{id, recordedAt, eventDigest, event}``,
+        newest first, where ``event`` is the typed KYA-OS producer event
+        (helix_sdk.audit)."""
+        qs = _query_string({"eventType": event_type, "family": family, "since": since, "limit": limit})
         return self._http_required().get(f"/v1/audit-log{qs}")
 
-    def record_consent_granted_audit(self, **entry: Any) -> None:
-        """Best-effort consent-grant audit. A failure here must never
-        surface to the caller -- see AgentWallet.add_credential()."""
+    def record_audit_event(self, event: Dict[str, Any]) -> None:
+        """Records one typed producer event (``POST /v1/audit-log/events``):
+        the body is the event exactly as an ``AuditTrail`` built it, validated
+        strictly by the API. A no-op without an API key (audit writes need
+        one). Errors propagate: a producer that must not fail on an audit
+        write (the wallet) catches them."""
         if not self._api_audit_enabled:
             return
-        try:
-            self._http_required().post(
-                "/v1/audit-log/consent-granted",
-                {**entry, "subjectDid": entry.get("agentDid"), "eventType": "CONSENT_GRANTED"},
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        self._http_required().post("/v1/audit-log/events", event)
+
+    def audit_sink(self) -> Any:
+        """An ``AuditSink`` (helix_sdk.audit) for an ``AuditTrail`` whose
+        events this client should report to the API."""
+        from .audit import CallbackAuditSink
+
+        return CallbackAuditSink(lambda entry: self.record_audit_event(entry.event))
 
     # -- Verification -------------------------------------------------------
 

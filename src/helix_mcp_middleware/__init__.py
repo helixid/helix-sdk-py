@@ -21,7 +21,10 @@ HelixID, mirroring helix-sdk-js's mcp-middleware package.
   metadata; presets entra(), auth0(), okta(), keycloak().
 - to_http_error_response(), build_protected_resource_metadata(): 401 / 403
   challenges and the RFC 9728 document.
-- create_helix_audit_sink(): writes decisions to the HelixID audit log.
+- Audit (KYA-OS AAP-1): McpAuditTrail records typed events through a
+  helix_sdk.audit.AuditTrail; create_mcp_audit_trail() /
+  create_helix_audit_reporter() build one over `POST /v1/audit-log/events`,
+  create_helix_audit_sink() is the one-call legacy `audit_sink` over them.
 - TrustedIssuers / DEFAULT_TRUSTED_ISSUERS ("*"), is_trusted_issuer(),
   attestation_trust(): which issuers' capability attestations count (KYA-OS
   story C-B).
@@ -40,7 +43,19 @@ HelixID, mirroring helix-sdk-js's mcp-middleware package.
 
 from __future__ import annotations
 
-from .audit import AuditSink, ToolAuditEvent, create_helix_audit_sink
+from .audit import (
+    OAUTH_SUBJECT_KEY_ID,
+    AuditContext,
+    AuditSink,
+    McpAuditContext,
+    McpAuditTrail,
+    ToolAuditEvent,
+    ToolCallAudit,
+    create_helix_audit_reporter,
+    create_helix_audit_sink,
+    create_mcp_audit_trail,
+    current_tool_call,
+)
 from .credentials import DEFAULT_TRUSTED_ISSUERS, ExtractedCredential, TrustedIssuers, extract_credential
 from .errors import PROOF_INVALID, PROOF_MISSING, AuthorizationServerUnavailableError, MCPAuthError, ProofError, ToolScopeError
 from .metadata import (
@@ -108,8 +123,16 @@ __all__ = [
     "protected_resource_metadata_url",
     "HttpErrorResponse",
     "create_helix_audit_sink",
+    "create_helix_audit_reporter",
+    "create_mcp_audit_trail",
+    "current_tool_call",
     "AuditSink",
+    "AuditContext",
+    "McpAuditContext",
+    "McpAuditTrail",
     "ToolAuditEvent",
+    "ToolCallAudit",
+    "OAUTH_SUBJECT_KEY_ID",
     "create_local_verifier",
     "LocalVerifier",
     "LocalVerifierOptions",

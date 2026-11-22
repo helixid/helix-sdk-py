@@ -8,8 +8,13 @@
 Configuration (environment), the same as the JS sample:
   PORT, HOST            listen address (default 3700 on 127.0.0.1)
   MCP_RESOURCE          public URL of the MCP endpoint (default http://localhost:$PORT/mcp); the OAuth audience
-  HELIX_API_URL         HelixID API the audit sink writes to. Required whenever HELIX_API_KEY
-  HELIX_API_KEY         is set: there is deliberately no default URL. Never on the request path.
+  HELIX_API_URL         HelixID API the audit trail writes to. Required whenever HELIX_API_KEY
+  HELIX_API_KEY         is set: there is deliberately no default URL. Never on the request path. The
+                        key turns on the audit trail (KYA-OS typed events), whose producer is this
+                        server, so it also needs SERVICE_DID.
+  AUDIT_INCLUDE_TOOL_NAMES=1
+                        record tool names (`action.name`) in audit events; off by default, a tool
+                        name being a caller-presented reference
   SERVICE_DID           this server's DID: the KYA-OS door (story F-2). Every tool call that carries
                         a request proof in _meta["org.kya-os/request-proof"] (and its delegation chain
                         in _meta["org.kya-os/delegation-chain"]) is verified in-process against this
@@ -98,8 +103,9 @@ from helix_mcp_middleware import (
     WellKnownMcpConfig,
     WellKnownMcpError,
     auth0,
-    create_helix_audit_sink,
+    create_helix_audit_reporter,
     create_kyaos,
+    create_mcp_audit_trail,
     create_needs_authorization,
     create_well_known_mcp,
     describe_nonce_store,
@@ -454,9 +460,18 @@ def main() -> None:
         service_did=service_did or None,
         on_audit_error=lambda error: print("audit write failed:", error, file=sys.stderr),
     )
+    audit = None
     if api_url and api_key:
-        # The audit sink is the only thing that talks to the Helix API, and never on the request path.
-        auth.audit_sink = create_helix_audit_sink(api_url, api_key, service_did=service_did or None)
+        # The audit trail is the only thing that talks to the Helix API, and never on the request path.
+        if not service_did:
+            fail("HELIX_API_KEY writes audit events, whose producer is this server: set SERVICE_DID")
+        audit = create_mcp_audit_trail(
+            create_helix_audit_reporter(api_url, api_key),
+            service_did,
+            include_tool_names=env.get("AUDIT_INCLUDE_TOOL_NAMES") == "1",
+        )
+        # The gate's decisions and the call lifecycle share one trail (one source, one sequence).
+        auth.audit_sink = audit.tool_audit_sink()
     if env.get("AUDIT_LOG_FILE"):
         auth.audit_sink = _file_audit_sink(env["AUDIT_LOG_FILE"], auth.audit_sink)
     kyaos = kyaos_from_env(env, resource, service_did)
@@ -485,6 +500,7 @@ def main() -> None:
             auth,
             authorization_servers=[i.issuer for i in issuers] or None,
             on_server_error=lambda error: print("server error:", repr(error), file=sys.stderr),
+            audit=audit,
             kyaos=kyaos,
             well_known=well_known,
         )
@@ -502,8 +518,11 @@ def main() -> None:
         )
     )
     print(f"  OAuth:       {'DEMO tokens demo-reader, demo-admin, demo-agent, demo-agent-2' if demo else ', '.join(i.issuer for i in issuers) or 'off'}")
-    audits = [f"{api_url}/v1/audit-log/events" if api_url and api_key else "", f"file {env['AUDIT_LOG_FILE']}" if env.get("AUDIT_LOG_FILE") else ""]
-    print(f"  Audit:       {' + '.join(a for a in audits if a) or 'off (set HELIX_API_URL + HELIX_API_KEY, or AUDIT_LOG_FILE)'}")
+    audits = [
+        f"{api_url}/v1/audit-log/events (KYA-OS typed events; tool names {'recorded' if audit.include_tool_names else 'withheld'})" if audit else "",
+        f"file {env['AUDIT_LOG_FILE']}" if env.get("AUDIT_LOG_FILE") else "",
+    ]
+    print(f"  Audit:       {' + '.join(a for a in audits if a) or 'off (set HELIX_API_URL + HELIX_API_KEY + SERVICE_DID, or AUDIT_LOG_FILE)'}")
     if auth.needs_authorization is not None:
         store = "in redis (KYAOS_REDIS_URL)" if read_nonce_store_config(env).kind == "redis" else "in memory"
         retries = "checked structurally (DEMO_MODE, no signature verification)" if demo else "refused until a verifier is wired in"

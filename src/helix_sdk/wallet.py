@@ -117,6 +117,9 @@ class AgentWallet:
     wallet_credentials: List[WalletCredential] = field(default_factory=list)
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+    # The wallet's audit source (helix_sdk.audit.AuditTrail), built on first
+    # use: one source sequence per wallet instance.
+    _audit_trail: Optional[Any] = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.private_key_hex:
@@ -252,23 +255,44 @@ class AgentWallet:
         self._record_consent_grant(vc)
 
     def _record_consent_grant(self, vc: Dict[str, Any]) -> None:
-        """Emits CONSENT_GRANTED when the credential just stored is an
-        SP-issued delegation grant. Swallows everything: a wallet with no
-        client, a down API, or an unexpected shape must all leave the
-        stored credential untouched."""
+        """Records a typed ``consent.approved`` event (helix_sdk.audit) when
+        the credential just stored is an SP-issued delegation grant. Swallows
+        everything: a wallet with no client, a down API, or an unexpected
+        shape must all leave the stored credential untouched."""
         if self.client is None or not _is_delegation_grant_vc(vc):
             return
         try:
+            from .audit import AUDIT_BINDING_MCP, AuditTrail, pairwise_did, public_did
+
             subject = vc["credentialSubject"]
-            self.client.record_consent_granted_audit(
-                vcId=vc["id"],
-                agentDid=subject["id"],
-                issuer=vc.get("issuer"),
-                userDid=subject.get("userDid"),
-                scopes=subject.get("scopes"),
-                durability=subject.get("durability"),
-                grantedAt=_now_iso(),
-                source="sdk",
+            agent_did = subject["id"]
+            producer = pairwise_did(agent_did)
+            # One audit source per wallet instance, built on first use, so
+            # its consent events share one sequence and chain (as in the JS wallet).
+            trail = self._audit_trail
+            if trail is None:
+                trail = AuditTrail(
+                    sink=self.client.audit_sink(),
+                    source_id=f"helix-sdk-py:{agent_did}",
+                    producer=producer,
+                    tenant_ref=producer,
+                    binding=AUDIT_BINDING_MCP,
+                )
+                self._audit_trail = trail
+            issuer = vc.get("issuer")
+            if isinstance(issuer, dict):
+                issuer = issuer.get("id")
+            user_did = subject.get("userDid")
+            trail.record(
+                {
+                    "eventType": "consent.approved",
+                    "actor": pairwise_did(agent_did),
+                    "responsibleParty": public_did(user_did) if isinstance(user_did, str) else None,
+                    "resource": public_did(issuer) if isinstance(issuer, str) else None,
+                    "action": {"category": "consent"},
+                    "outcome": "succeeded",
+                    "details": {"family": "consent", "phase": "approved", "consentRef": vc["id"]},
+                }
             )
         except Exception:  # noqa: BLE001
             pass
