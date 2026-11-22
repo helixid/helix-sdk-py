@@ -7,7 +7,8 @@
 KYA-OS primitives in one namespace, the Python twin of helix-sdk-js's
 ``import { kyaos } from '@helixid/sdk-js'`` (stories rule 24): RFC 8785
 canonical JSON and hashing (L1-B), EdDSA JWS and the Signer (L1-C), the
-session handshake and the detached response proof (L2-A), and reading a
+session handshake and the detached response proof (L2-A), the signed
+needs_authorization challenge and the resume retry (L3-E), and reading a
 server's ``/.well-known/mcp`` discovery document (L1-D).
 
     from helix_sdk import kyaos
@@ -98,6 +99,23 @@ from .response_proof import (
     verify_response_proof,
     wire_json,
 )
+from .errors import NeedsAuthorizationError
+from .needs_authorization import (
+    DELEGATION_CONTROL_ARGUMENT,
+    DISPLAY_HINTS,
+    NEEDS_AUTHORIZATION,
+    RESUME_CONTROL_ARGUMENT,
+    ChallengeReasons,
+    HandledChallenge,
+    NeedsAuthorizationChallenge,
+    RetriedCall,
+    find_challenge,
+    handle_needs_authorization,
+    is_needs_authorization,
+    read_challenge,
+    retry_with_resume,
+    with_resume,
+)
 
 __all__ = [
     # jcs
@@ -119,6 +137,10 @@ __all__ = [
     "covered_request", "covered_response", "hash_request", "hash_response", "is_control_argument",
     "outcome_has_response", "proof_claims", "proof_payload", "read_response_proof", "strip_control_arguments",
     "validate_proof_meta", "verify_detached_proof", "verify_response_proof", "wire_json", "ResponseProofError",
+    # needs_authorization and resume (L3-E)
+    "DELEGATION_CONTROL_ARGUMENT", "DISPLAY_HINTS", "NEEDS_AUTHORIZATION", "RESUME_CONTROL_ARGUMENT", "ChallengeReasons",
+    "HandledChallenge", "NeedsAuthorizationChallenge", "RetriedCall", "find_challenge", "handle_needs_authorization",
+    "is_needs_authorization", "read_challenge", "retry_with_resume", "with_resume", "NeedsAuthorizationError",
     # discovery: /.well-known/mcp, client side (L1-D)
     "WELL_KNOWN_MCP_INVALID", "WELL_KNOWN_MCP_PATH", "WellKnownMcpError", "WellKnownMcpProblems",
     "fetch_well_known_mcp", "read_well_known_mcp", "well_known_mcp_url",

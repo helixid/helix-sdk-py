@@ -10,12 +10,20 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, List, Mapping, Optional
+from typing import Any, List, Literal, Mapping, Optional, Sequence, Union
 
 from helix_sdk.errors import VPInvalidStructureError
 from helix_sdk.vp_transport import HELIX_VP_META_KEY
 
 from .errors import CREDENTIAL_CONFLICT, MCPAuthError
+
+TrustedIssuers = Union[Literal["*"], Sequence[str]]
+"""KYA-OS story C-B: which issuers' capability attestations a verifier counts.
+``"*"`` trusts every issuer; a list trusts exactly those DIDs. Shipped as
+allow-all (stories rule 9); the setting stays so a service can set a list.
+See :func:`helix_mcp_middleware.trusted_issuers.is_trusted_issuer`."""
+
+DEFAULT_TRUSTED_ISSUERS: TrustedIssuers = "*"
 
 _VP_HEADER = "x-helix-vp"
 _AUTH = re.compile(r"^(\S+)\s+(\S+)$")

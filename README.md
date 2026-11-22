@@ -159,6 +159,25 @@ falls back to memory. One startup line on the `helix_mcp_middleware.kyaos` logge
 Redis password is shown as `***`); memory with `ENV` or `NODE_ENV` set to `production` also warns that it covers one
 process only.
 
+## KYA-OS signed `needs_authorization` and resume (story L3-E)
+
+Server side (`helix_mcp_middleware`): when a caller is identified but its delegation does not cover the tool's scopes, the gate answers with the SPEC §9.2 challenge instead of a plain 403: `{"error": "needs_authorization", "message", "authorizationUrl", "resumeToken", "expiresAt", "scopes", "display"?}`. Under the KYA-OS runtime it is the call's tool result, signed with `outcome: needs_authorization` and a `responseHash` over the whole result, so `authorizationUrl` is covered by the service signature.
+
+```python
+from helix_mcp_middleware import MCPMiddlewareOptions, NeedsAuthorizationOptions, create_needs_authorization
+
+needs_authorization = create_needs_authorization(NeedsAuthorizationOptions(
+    authorization_url=lambda c: f"https://consent.example/authorize?tool={c.tool}",
+    ttl_seconds=600,              # resume-token lifetime
+    # store: default follows KYAOS_NONCE_STORE (resume_token_store_from_env: Redis on KYAOS_REDIS_URL, else memory)
+    authorizer=verify_delegation, # the seam stories F-2 and L3-H implement; default refuses every retry
+    audit_sink=audit_sink,        # every challenge: AUTHZ_DENIED, reason "needs_authorization"
+))
+options = MCPMiddlewareOptions(..., needs_authorization=needs_authorization)
+```
+
+The resume token is opaque, bound to the agent, tool and scopes, single-use and gone at `expiresAt`; a retry carries it as the `_kyaos_resume` control argument and the new DelegationCredential as `_kyaos_delegation`. Completing consent alone never authorises the call. With `async_helixid_mcp_middleware` the store, authorizer and audit sink may be async. Client side (`helix_sdk.needs_authorization`): `handle_needs_authorization(response, service_did, resolve_did, request=...)` verifies the challenge's proof, recomputing both hashes, before it surfaces the URL; `retry_with_resume(resume_token, hop, call=..., send=...)` retries with the token and the credential.
+
 ## The `/.well-known/mcp` discovery document (`helix_mcp_middleware`, story L1-D)
 
 `create_well_known_mcp()` builds the KYA-OS discovery document from config, validates it against the vendored
