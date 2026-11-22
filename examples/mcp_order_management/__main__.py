@@ -28,6 +28,21 @@ Configuration (environment), the same as the JS sample:
                         or custom {"issuer", "jwksUri"?, "introspection"?: {"clientId", "clientSecret", "endpoint"?}}
   DEMO_MODE=1           local demo only: accept the fixed bearer tokens below instead of an
                         authorization server. Refused unless HOST is loopback.
+  SERVICE_SIGNING_KEY   KYA-OS (story L2-A): this server's Ed25519 private key (hex), the key
+                        SERVICE_DID's document lists as key-1. Turns on the _kyaos_handshake tool,
+                        sessions and a server-signed proof on every tool call outcome. Optional:
+  KYAOS_PUBLIC_ORIGIN     the origin agents connect to, accepted as handshake audience next to the
+                          DID (default: the origin of MCP_RESOURCE)
+  KYAOS_CLOCK_SKEW_SECONDS  30 to 600 (default 120)
+  KYAOS_SESSIONS=0        no sessions: the handshake is refused, calls are proven without one
+  KYAOS_SESSION_TTL_MINUTES idle TTL (default 30; fractions allowed)
+  KYAOS_NONCE_STORE       the replay store: memory (default, this instance only), redis or dynamo,
+                          read by helix_mcp_middleware itself (nonce_store_from_env); with it:
+                          redis: KYAOS_REDIS_URL, KYAOS_NONCE_KEY_PREFIX (pip install 'helixid-sdk-py[redis]')
+                          dynamo: KYAOS_DYNAMO_TABLE, KYAOS_DYNAMO_KEY_ATTRIBUTE, KYAOS_DYNAMO_TTL_ATTRIBUTE,
+                                  KYAOS_DYNAMO_REGION, KYAOS_DYNAMO_ENDPOINT (pip install 'helixid-sdk-py[dynamo]';
+                                  AWS credentials: boto3's chain). JS and Python instances share one store.
+                          See .env.example.
 """
 
 from __future__ import annotations
@@ -39,15 +54,24 @@ from typing import Any, Dict, List, NoReturn, Optional
 
 import uvicorn
 
+from urllib.parse import urlsplit
+
 from helix_sdk import HelixClient
+from helix_sdk.crypto.jws import EnvSigner
 from helix_mcp_middleware import (
     AuthResult,
+    KyaOsOptions,
+    KyaOsRuntime,
+    KyaOsSessionOptions,
     MCPMiddlewareOptions,
     OAuthIntrospectionOptions,
     OAuthIssuerOptions,
     auth0,
     create_helix_audit_reporter,
+    create_kyaos,
     create_mcp_audit_trail,
+    describe_nonce_store,
+    read_nonce_store_config,
     entra,
     keycloak,
     okta,
@@ -185,6 +209,51 @@ def oauth_issuers_from_env(env: Dict[str, str], resource: str) -> List[OAuthIssu
     return issuers
 
 
+_KYAOS_SETTINGS = ("KYAOS_NONCE_STORE", "KYAOS_PUBLIC_ORIGIN", "KYAOS_CLOCK_SKEW_SECONDS", "KYAOS_SESSIONS", "KYAOS_SESSION_TTL_MINUTES")
+
+
+def _positive_number(env: Dict[str, str], name: str, integer: bool) -> Optional[float]:
+    """A positive number from an optional variable; `integer` demands a whole one."""
+    raw = env.get(name)
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not value > 0 or value == float("inf") or (integer and not value.is_integer()):
+        fail(f"{name} must be a positive {'integer' if integer else 'number'}")
+    return value
+
+
+def kyaos_from_env(env: Dict[str, str], resource: str, service_did: Optional[str]) -> Optional[KyaOsRuntime]:
+    """The KYA-OS layer from SERVICE_SIGNING_KEY and the KYAOS_* variables, or None when it is off."""
+    if not env.get("SERVICE_SIGNING_KEY"):
+        if any(env.get(name) for name in _KYAOS_SETTINGS):
+            fail("KYAOS_* settings need SERVICE_SIGNING_KEY")
+        return None
+    if not service_did:
+        fail("SERVICE_SIGNING_KEY needs SERVICE_DID (the DID whose document lists the key)")
+    skew = _positive_number(env, "KYAOS_CLOCK_SKEW_SECONDS", True)
+    ttl_minutes = _positive_number(env, "KYAOS_SESSION_TTL_MINUTES", False)
+    url = urlsplit(resource)
+    try:
+        return create_kyaos(
+            KyaOsOptions(
+                # The key is read from the environment at every signature; the server never holds it.
+                signer=EnvSigner(service_did, env_var="SERVICE_SIGNING_KEY"),
+                public_origin=env.get("KYAOS_PUBLIC_ORIGIN") or f"{url.scheme}://{url.netloc}",
+                clock_skew_seconds=int(skew) if skew is not None else None,
+                session=KyaOsSessionOptions(enabled=env.get("KYAOS_SESSIONS") != "0", ttl_minutes=ttl_minutes),
+                # The replay store: the one KYAOS_NONCE_STORE names (nonce_store_from_env), read from the same environment.
+                env=env,
+                tools_endpoint=resource,
+            )
+        )
+    except ValueError as error:
+        fail(f"KYA-OS: {error}")
+
+
 def main() -> None:
     env = dict(os.environ)
     try:
@@ -235,6 +304,7 @@ def main() -> None:
     if auth.client is None and auth.validate_oauth_token is None and auth.oauth is None:
         fail("no way to authenticate callers: set HELIX_API_URL (HelixID VPs), OAUTH_ISSUER / OAUTH_ISSUERS, or DEMO_MODE=1")
 
+    kyaos = kyaos_from_env(env, resource, service_did)
     try:
         app = create_order_app(
             resource,
@@ -242,6 +312,7 @@ def main() -> None:
             authorization_servers=[i.issuer for i in issuers] or None,
             on_server_error=lambda error: print("server error:", repr(error), file=sys.stderr),
             audit=audit,
+            kyaos=kyaos,
         )
     except ValueError as error:
         fail(str(error))
@@ -255,6 +326,13 @@ def main() -> None:
         else "off (set HELIX_API_URL + HELIX_API_KEY + SERVICE_DID)"
     )
     print(f"  Audit:       {audit_line}")
+    if kyaos is not None:
+        print(
+            f"  KYA-OS:      proofs by {kyaos.server_did}, sessions {'on' if kyaos.sessions_enabled else 'off'}, "
+            f"skew {kyaos.clock_skew_seconds} s, {describe_nonce_store(read_nonce_store_config(env))}"
+        )
+    else:
+        print("  KYA-OS:      off (set SERVICE_SIGNING_KEY)")
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
