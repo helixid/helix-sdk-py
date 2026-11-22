@@ -29,9 +29,11 @@ from starlette.responses import JSONResponse
 from helix_mcp_middleware import (
     AuthorizationServerUnavailableError,
     MCPMiddlewareOptions,
+    ServeIdentityOptions,
     async_helixid_mcp_middleware,
     build_protected_resource_metadata,
     protected_resource_metadata_url,
+    serve_identity,
     to_http_error_response,
 )
 
@@ -46,10 +48,12 @@ def create_order_app(
     authorization_servers: Optional[Sequence[str]] = None,
     store: Optional[OrderStore] = None,
     on_server_error: Optional[Callable[[BaseException], None]] = None,
+    identity: Optional[ServeIdentityOptions] = None,
 ) -> Any:
     """An ASGI app. `resource` is this server's MCP endpoint URL (MCP is
     served at its path); `auth` is everything except the scopes, which this
-    sample fixes in TOOL_SCOPES."""
+    sample fixes in TOOL_SCOPES; `identity` (KYA-OS story C-A) serves this
+    server's own did.json and card.json from its origin."""
     url = urlsplit(resource)
     if url.scheme not in ("http", "https") or not url.hostname:
         raise ValueError(f"resource must be an http(s) URL, got {resource!r}")
@@ -63,6 +67,7 @@ def create_order_app(
         scopes_supported=list(dict.fromkeys(s for scopes in TOOL_SCOPES.values() for s in scopes)),
         resource_name="Order Management (HelixID sample)",
     )
+    served_identity = serve_identity(identity) if identity is not None else None
     gate = async_helixid_mcp_middleware(replace(auth, tool_scopes=TOOL_SCOPES, required_scopes=[]))
 
     server = FastMCP(
@@ -96,6 +101,8 @@ def create_order_app(
         path, method = scope["path"], scope["method"]
         if path == metadata_path and method == "GET":
             await respond(200, metadata)
+            return
+        if served_identity is not None and await served_identity.handle(scope, receive, send):
             return
         if path != mcp_path:
             await respond(404, {"error": "not_found"})

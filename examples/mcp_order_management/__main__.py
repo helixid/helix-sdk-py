@@ -24,6 +24,12 @@ Configuration (environment), the same as the JS sample:
                         or custom {"issuer", "jwksUri"?, "introspection"?: {"clientId", "clientSecret", "endpoint"?}}
   DEMO_MODE=1           local demo only: accept the fixed bearer tokens below instead of an
                         authorization server. Refused unless HOST is loopback.
+  PUBLIC_ORIGIN         KYA-OS story C-A: serve this server's did.json and card.json (its did:web is
+                        derived from the origin and MCP path). Optional with it:
+  SERVICE_NAME            the card's display name (default "Order Management (HelixID sample)")
+  SERVICE_PUBLIC_KEY_JWK  the service key's public JWK, {"kty":"OKP","crv":"Ed25519","x":...}
+  SERVICE_KID             its verification-method fragment (default key-1)
+  SERVICE_RESPONSIBLE_PARTY  the accountable org DID, when there is one
 """
 
 from __future__ import annotations
@@ -32,14 +38,17 @@ import json
 import os
 import sys
 from typing import Any, Dict, List, NoReturn, Optional
+from urllib.parse import urlsplit
 
 import uvicorn
 
 from helix_sdk import HelixClient
+from helix_sdk.errors import HelixError
 from helix_mcp_middleware import (
     AuthResult,
     MCPMiddlewareOptions,
     OAuthIntrospectionOptions,
+    ServeIdentityOptions,
     OAuthIssuerOptions,
     auth0,
     create_helix_audit_sink,
@@ -49,6 +58,7 @@ from helix_mcp_middleware import (
 )
 
 from .app import create_order_app
+from .orders import TOOL_SCOPES
 
 DEMO_TOKENS = {
     "demo-reader": AuthResult(sub="demo-reader", scopes=["orders:read"]),
@@ -180,6 +190,26 @@ def oauth_issuers_from_env(env: Dict[str, str], resource: str) -> List[OAuthIssu
     return issuers
 
 
+def identity_from_env(env: Dict[str, str], resource: str, service_did: Optional[str]) -> Optional[ServeIdentityOptions]:
+    """PUBLIC_ORIGIN and SERVICE_*: what the JS sample reads for the same card."""
+    public_origin = env.get("PUBLIC_ORIGIN")
+    if not public_origin:
+        return None
+    card: Dict[str, Any] = {
+        "name": env.get("SERVICE_NAME") or "Order Management (HelixID sample)",
+        "capabilities": ["tools/list", "tools/call", *TOOL_SCOPES.keys()],
+    }
+    if env.get("SERVICE_PUBLIC_KEY_JWK"):
+        try:
+            card["publicKeyJwk"] = json.loads(env["SERVICE_PUBLIC_KEY_JWK"])
+        except ValueError:
+            fail("SERVICE_PUBLIC_KEY_JWK is not valid JSON")
+        card["kid"] = env.get("SERVICE_KID") or "key-1"
+    if env.get("SERVICE_RESPONSIBLE_PARTY"):
+        card["responsibleParty"] = env["SERVICE_RESPONSIBLE_PARTY"]
+    return ServeIdentityOptions(public_origin=public_origin, path=urlsplit(resource).path, did=service_did or None, card=card)
+
+
 def main() -> None:
     env = dict(os.environ)
     try:
@@ -221,20 +251,26 @@ def main() -> None:
     if auth.client is None and auth.validate_oauth_token is None and auth.oauth is None:
         fail("no way to authenticate callers: set HELIX_API_URL (HelixID VPs), OAUTH_ISSUER / OAUTH_ISSUERS, or DEMO_MODE=1")
 
+    identity = identity_from_env(env, resource, service_did)
     try:
         app = create_order_app(
             resource,
             auth,
             authorization_servers=[i.issuer for i in issuers] or None,
             on_server_error=lambda error: print("server error:", repr(error), file=sys.stderr),
+            identity=identity,
         )
     except ValueError as error:
+        fail(str(error))
+    except HelixError as error:  # an invalid card (EntityCardError)
         fail(str(error))
 
     print(f"order-management MCP server on {resource}")
     print(f"  HelixID VPs: {'verified via ' + api_url if auth.client else 'off (set HELIX_API_URL)'}")
     print(f"  OAuth:       {'DEMO tokens demo-reader, demo-admin' if demo else ', '.join(i.issuer for i in issuers) or 'off'}")
     print(f"  Audit:       {api_url + '/v1/audit-log/events' if auth.audit_sink else 'off (set HELIX_API_URL + HELIX_API_KEY)'}")
+    path = urlsplit(resource).path.rstrip("/")
+    print(f"  Identity:    {identity.public_origin + path + '/{did,card}.json' if identity else 'off (set PUBLIC_ORIGIN)'}")
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 

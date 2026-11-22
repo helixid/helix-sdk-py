@@ -20,6 +20,9 @@ HelixID, mirroring helix-sdk-js's mcp-middleware package.
 - create_helix_audit_sink(): writes decisions to the HelixID audit log.
 - attach_helix_vp(): client-side, attaches a VP signed server-side (via
   HelixClient.sign_vp()) to an outgoing tool call.
+- serve_identity() / resolve_server_card() (KYA-OS story C-A): the service's
+  own did.json and card.json from its origin, the server.json projection
+  under _meta["org.kya-os/card"], and its reverse.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from .attach import attach_helix_vp
 from .audit import AuditSink, ToolAuditEvent, create_helix_audit_sink
 from .credentials import ExtractedCredential, extract_credential
 from .errors import AuthorizationServerUnavailableError, MCPAuthError, ToolScopeError
+from .identity import ServedIdentity, ServeIdentityOptions, resolve_server_card, serve_identity
 from .metadata import (
     HttpErrorResponse,
     build_protected_resource_metadata,
@@ -75,4 +79,8 @@ __all__ = [
     "create_helix_audit_sink",
     "AuditSink",
     "ToolAuditEvent",
+    "serve_identity",
+    "resolve_server_card",
+    "ServeIdentityOptions",
+    "ServedIdentity",
 ]
