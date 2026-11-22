@@ -150,6 +150,8 @@ from .custody import (
 from .errors import (  # noqa: F401
     HelixError,
     InvalidJWSError,
+    AuditEventInvalidError,
+    AuditEvidenceError,
     ResponseProofError,
     NeedsAuthorizationError,
     map_api_error,
