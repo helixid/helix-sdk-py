@@ -16,7 +16,6 @@ import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -49,7 +48,8 @@ SIGNER = kyaos.EnvSigner(SERVICE, env_var="SAMPLE_SERVICE_KEY", env={"SAMPLE_SER
 
 
 def client(kyaos_runtime: Optional[KyaOsRuntime] = None, well_known: Optional[WellKnownMcp] = None) -> TestClient:
-    options = MCPMiddlewareOptions(client=MagicMock(), service_did=SERVICE, validate_oauth_token=lambda token: {"sub": "x", "scopes": []})
+    # The discovery route is served before the gate, so no verifier is needed (F-2 replaced the VP client with `verifier`).
+    options = MCPMiddlewareOptions(service_did=SERVICE, validate_oauth_token=lambda token: {"sub": "x", "scopes": []})
     return TestClient(create_order_app(f"{BIND}/orders/mcp", options, kyaos=kyaos_runtime, well_known=well_known), base_url=BIND)
 
 
