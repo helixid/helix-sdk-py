@@ -1111,11 +1111,23 @@ def check_capabilities(
     return {"verified": verified, "unverified": unverified}
 
 
-def derive_conformance_level(check: Mapping[str, Sequence[str]], proof_floor_ok: bool = False, revocation_fresh: bool = True) -> str:
-    """SPEC-ENTITY-CARD.md section 9.4: L1 unless fully attested; L3 with the proof floor and a fresh status read; else L2."""
+def _proof_floor_holds(proof_floor: Any) -> bool:
+    """A bool, or a proof verification (a mapping or an object with ``ok``): holds only when it is ``True``."""
+    if isinstance(proof_floor, bool):
+        return proof_floor
+    if isinstance(proof_floor, Mapping):
+        return proof_floor.get("ok") is True
+    return getattr(proof_floor, "ok", None) is True
+
+
+def derive_conformance_level(check: Mapping[str, Sequence[str]], proof_floor: Any = False, revocation_fresh: bool = True) -> str:
+    """SPEC-ENTITY-CARD.md section 9.4: L1 unless fully attested; L3 with the proof floor and a fresh
+    status read; else L2. ``proof_floor`` is a bool or a request-proof verification (``{"ok": ...}``
+    or a :class:`helix_sdk.verifier.RequestProofVerification`), as helix-sdk-js's
+    ``deriveConformanceLevel(check, proofFloor, revocationFresh)`` takes it (story C-C)."""
     all_attested = len(check["verified"]) > 0 and len(check["unverified"]) == 0
     if not all_attested:
         return "L1"
-    if proof_floor_ok and revocation_fresh:
+    if _proof_floor_holds(proof_floor) and revocation_fresh:
         return "L3"
     return "L2"

@@ -189,13 +189,17 @@ def test_a_request_proof_with_its_chain_is_verified_in_process_and_the_scope_is_
 
 
 @needs_fixtures
-def test_bad_proofs_are_401_with_the_reason_and_proof_plus_bearer_is_400(app: App) -> None:
+def test_bad_proofs_are_401_with_the_reason_and_a_chain_without_proof_plus_bearer_is_400(app: App) -> None:
     meta = agent_meta("lookup_order", {"orderId": "ORD-1001"})
     tampered = app.call("lookup_order", {"orderId": "ORD-1002"}, {}, meta)
     assert tampered.status_code == 401 and "request_hash_mismatch" in tampered.json()["error_description"]
     assert 'error="invalid_token"' in tampered.headers["www-authenticate"]
+    # A proof with a bearer token is one credential (story C-C): the token is its sender constraint (cnf fusion),
+    # so the call is judged on the proof, here 403 by scope (the agent holds the fixture scopes, not orders:read).
     both = app.call("lookup_order", {"orderId": "ORD-1001"}, bearer("reader"), agent_meta("lookup_order", {"orderId": "ORD-1001"}))
-    assert both.status_code == 400 and both.json()["error"] == "invalid_request"
+    assert both.status_code == 403 and both.json()["error"] == "insufficient_scope"
+    chain_and_bearer = app.call("lookup_order", {"orderId": "ORD-1001"}, bearer("reader"), {"org.kya-os/delegation-chain": valid_chain()})
+    assert chain_and_bearer.status_code == 400 and chain_and_bearer.json()["error"] == "invalid_request"
     # The retired VP carriers are not read: no credential at all.
     retired = app.call("lookup_order", {"orderId": "ORD-1001"}, {"authorization": "HelixVP eyJ2cCI6MX0", "x-helix-vp": "eyJ2cCI6MX0"}, {"x-helix-vp": "eyJ2cCI6MX0"})
     assert retired.status_code == 401 and retired.json()["error"] == "unauthorized"

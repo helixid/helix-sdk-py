@@ -31,23 +31,13 @@ from ..credentials import (
     validate_json_schema,
     verify_data_integrity,
 )
-from ..crypto.jws import base64url_decode_strict, select_assertion_method, verification_method_to_jwk
-from ..errors import InvalidJWSError
 from .attestation import CapabilityCheck, check_capabilities
 from .card_schema import ENTITY_CARD_SCHEMA
 from .chain import evaluate_delegation_chain_rules
 from .codes import ReasonCodes
-from .request_proof import (
-    DEFAULT_PROOF_SKEW_SECONDS,
-    MAX_PROOF_TTL_SECONDS,
-    did_of_kid,
-    jwk_thumbprint,
-    parse_request_proof,
-    request_hash_content_digest,
-    verify_detached_jws,
-    window_problems,
-)
+from .request_proof import DEFAULT_PROOF_SKEW_SECONDS, MAX_PROOF_TTL_SECONDS
 from .status import FetchStatusList, check_status_entry
+from .verify_request_proof import RequestProofOptions, verify_request_proof
 
 
 class NonceStore:
@@ -99,6 +89,10 @@ class VerifierOptions:
     catalog: Optional[Sequence[str]] = None
     action: Optional[str] = None
     token_cnf_jkt: Optional[str] = None
+    require_proof: bool = True
+    """Default True: a call without a request proof is refused ``proof_missing``. False (story C-C):
+    a call carrying a chain and no proof is verified on the chain alone, with the proof floor
+    unmet, so its level is at most L2."""
 
     @classmethod
     def from_dict(cls, options: Mapping[str, Any]) -> "VerifierOptions":
@@ -115,6 +109,7 @@ class VerifierOptions:
             "catalog": "catalog",
             "action": "action",
             "tokenCnfJkt": "token_cnf_jkt",
+            "requireProof": "require_proof",
         }
         return cls(**{names[key]: value for key, value in options.items() if key in names})
 
@@ -154,7 +149,14 @@ class VerifierResult:
     fresh: bool
     warnings: List[str]
     proof_did: Optional[str] = None
+    """The accountable principal, once its proof verified."""
     proof_assurance: Optional[str] = None
+    """``L3`` on a full ``cnf`` fusion, ``L3-minus`` without a token ``cnf``; set once the proof verified."""
+    agent_did: Optional[str] = None
+    """Who the call is for: the proof's DID, or, on a call verified without a proof, the chain's
+    leaf delegate (unproven). Set on success."""
+    proof_floor: bool = False
+    """True when a request proof verified: the section 9.4 proof floor."""
 
     def to_dict(self) -> Dict[str, Any]:
         """The comparable part of the result, as the shared fixtures record it."""
@@ -200,62 +202,6 @@ def _missing_seams(seams: VerifierSeams, refusals: _Refusals) -> None:
         refusals.add(ReasonCodes.NONCE_SEAM_MISSING, "no nonce_store seam: there is no replay defense to run")
 
 
-def _resolve_signing_key(proof: Mapping[str, Any], seams: VerifierSeams, refusals: _Refusals) -> Optional[Dict[str, Any]]:
-    assert seams.resolve_did is not None
-    try:
-        document = seams.resolve_did(proof["did"])
-    except Exception as exc:  # noqa: BLE001 - a resolver that throws leaves the document unread
-        refusals.add(ReasonCodes.DID_UNRESOLVED, f"could not resolve {proof['did']}: {exc}")
-        return None
-    if document is None:
-        refusals.add(ReasonCodes.DID_UNRESOLVED, f"{proof['did']} did not resolve")
-        return None
-    try:
-        jwk = verification_method_to_jwk(select_assertion_method(document, proof["did"], proof["kid"]))
-    except InvalidJWSError as exc:
-        refusals.add(ReasonCodes.KEY_UNRESOLVABLE, f"{exc.reason}: {exc}")
-        return None
-    raw = base64url_decode_strict(jwk["x"])
-    assert raw is not None
-    return {"jwk": {"kty": "OKP", "crv": "Ed25519", "x": jwk["x"], "kid": proof["kid"]}, "public_key": raw}
-
-
-def _assert_did_membership(proof: Mapping[str, Any], key: Mapping[str, Any], seams: VerifierSeams, refusals: _Refusals) -> None:
-    assert seams.resolve_did_keys is not None
-    try:
-        published = list(seams.resolve_did_keys(proof["did"]))
-    except Exception as exc:  # noqa: BLE001
-        refusals.add(ReasonCodes.DID_KEYS_UNRESOLVABLE, f"could not list the keys of {proof['did']}: {exc}")
-        return
-    wanted = jwk_thumbprint(key["jwk"])
-    thumbprints = []
-    for jwk in published:
-        try:
-            thumbprints.append(jwk_thumbprint(jwk))
-        except Exception:  # noqa: BLE001 - a key that is no JWK has no thumbprint
-            thumbprints.append(None)
-    if wanted not in thumbprints:
-        refusals.add(ReasonCodes.KID_NOT_IN_DID_DOCUMENT, f"{proof['kid']} is not a key {proof['did']} publishes")
-
-
-def _cnf_fusion(proof: Mapping[str, Any], key: Mapping[str, Any], options: VerifierOptions, refusals: _Refusals, warnings: List[str]) -> str:
-    key_jkt = jwk_thumbprint(key["jwk"])
-    cnf = proof.get("cnf")
-    if cnf is not None and cnf["jkt"] != key_jkt:
-        refusals.add(ReasonCodes.CNF_KEY_MISMATCH, "cnf.jkt is not the thumbprint of the signing key")
-    if options.token_cnf_jkt is None:
-        if cnf is not None:
-            warnings.append("cnf_present_but_token_unfused")
-        return "L3-minus"
-    if cnf is None:
-        refusals.add(ReasonCodes.CNF_REQUIRED_BY_TOKEN, "the token is sender-constrained but the proof carries no cnf")
-        return "L3-minus"
-    if cnf["jkt"] != options.token_cnf_jkt:
-        refusals.add(ReasonCodes.CNF_TOKEN_MISMATCH, "cnf.jkt is not the token cnf.jkt")
-        return "L3-minus"
-    return "L3" if cnf["jkt"] == key_jkt else "L3-minus"
-
-
 def validate_entity_card(value: Any) -> List[str]:
     """Every way ``value`` fails the strict card schema, as ``path: message``; empty when it is a card."""
     return [f"{violation.path}: {violation.message}" for violation in validate_json_schema(ENTITY_CARD_SCHEMA, value)]
@@ -274,7 +220,6 @@ def verify(
     if isinstance(options, Mapping):
         options = VerifierOptions.from_dict(options)
     refusals = _Refusals()
-    warnings: List[str] = []
 
     # 1. Seams and options, before anything is read.
     _missing_seams(seams, refusals)
@@ -287,7 +232,6 @@ def verify(
         return _refused(refusals, ChainSummary())
     assert seams.clock is not None
     now = seams.clock()
-    now_seconds = now // 1000
     skew_seconds = options.skew_seconds
 
     # 2. The carried chain's length, bounded before any entry is parsed.
@@ -303,56 +247,31 @@ def verify(
     depth = len(hops) if hops is not None else 0
     no_chain = ChainSummary(depth=depth, fresh=False)
 
-    # 3. The proof's shape and its local bindings.
-    if proof is None:
-        refusals.add(ReasonCodes.PROOF_MISSING, "the request carries no org.kya-os/request-proof")
-        return _refused(refusals, no_chain)
-    parsed = parse_request_proof(proof)
-    if parsed is None:
-        refusals.add(ReasonCodes.MALFORMED_PROOF, "the request proof is not an org.kya-os/proof.v1 object")
-        return _refused(refusals, no_chain)
-    if did_of_kid(parsed["kid"]) != parsed["did"]:
-        refusals.add(ReasonCodes.KID_DID_MISMATCH, "kid does not belong to did")
-    if parsed["alg"] != "EdDSA":
-        refusals.add(ReasonCodes.ALG_UNSUPPORTED, f"proof alg {parsed['alg']} is not EdDSA")
-    if parsed["audience"] != options.expected_audience:
-        refusals.add(ReasonCodes.AUDIENCE_MISMATCH, f"audience {parsed['audience']} is not this verifier ({options.expected_audience})")
-    if request is None:
-        refusals.add(ReasonCodes.REQUEST_MISSING, "no request to recompute requestHash from")
-    else:
-        try:
-            computed: Optional[str] = request_hash_content_digest(request)
-        except Exception:  # noqa: BLE001 - a request with no canonical form hashes to nothing
-            computed = None
-        if computed != parsed["requestHash"]:
-            refusals.add(ReasonCodes.REQUEST_HASH_MISMATCH, "requestHash does not recompute from the request")
-    for problem in window_problems(parsed, now_seconds, skew_seconds, options.max_ttl_seconds):
-        refusals.add(problem, f"proof window: {problem}")
-    if refusals.any:
-        return _refused(refusals, no_chain)
-
-    # 4. The signing key, its DID membership and the signature.
-    key = _resolve_signing_key(parsed, seams, refusals)
-    if key is None:
-        return _refused(refusals, no_chain)
-    _assert_did_membership(parsed, key, seams, refusals)
-    if not verify_detached_jws(parsed, key["public_key"]):
-        refusals.add(ReasonCodes.INVALID_SIGNATURE, "the detached JWS does not verify over the covered claims")
-    proof_assurance = _cnf_fusion(parsed, key, options, refusals, warnings)
-    if refusals.any:
-        return _refused(refusals, no_chain, warnings=warnings)
-    # The signature held: from here the refusal names the principal it refused.
-    proved = {"proof_did": parsed["did"], "proof_assurance": proof_assurance, "warnings": warnings}
-
-    # 5. The nonce, consumed only once every binding held.
-    try:
-        expires_at = (parsed["expires"] + skew_seconds + 1) * 1000
-        if not seams.nonce_store.insert(parsed["nonce"], parsed["did"], expires_at):
-            refusals.add(ReasonCodes.NONCE_REPLAYED, f"nonce {parsed['nonce']} was already used by {parsed['did']}")
-    except Exception as exc:  # noqa: BLE001 - a store that cannot answer fails closed
-        refusals.add(ReasonCodes.NONCE_STORE_UNAVAILABLE, f"the nonce store could not answer: {exc}")
-    if refusals.any:
-        return _refused(refusals, no_chain, **proved)
+    # 3. The request proof, in the exact section 11.2 order (story C-C). A call that may go without
+    #    one (require_proof=False) and carries a chain is verified on the chain alone, without the
+    #    proof floor.
+    proof_absent = proof is None
+    proved: Dict[str, Any] = {}
+    proof_did: Optional[str] = None
+    if not proof_absent or options.require_proof or hops is None:
+        verdict = verify_request_proof(
+            proof,
+            request,
+            seams,
+            RequestProofOptions(
+                expected_audience=options.expected_audience,
+                skew_seconds=skew_seconds,
+                max_ttl_seconds=options.max_ttl_seconds,
+                token_cnf_jkt=options.token_cnf_jkt,
+            ),
+        )
+        if not verdict.ok:
+            for index, code in enumerate(verdict.reasons):
+                refusals.add(code, verdict.messages[index])
+            return _refused(refusals, no_chain)
+        proof_did = verdict.did
+        # Every binding held: from here a refusal names the principal it refused.
+        proved = {"proof_did": proof_did, "proof_assurance": verdict.assurance, "warnings": verdict.warnings, "proof_floor": True}
 
     # 6. The chain: local rules, the leaf join, trusted roots, the action, each hop's proof, each hop's status.
     summary = ChainSummary()
@@ -372,8 +291,8 @@ def verify(
             for code, reason in evaluation.broken:
                 refusals.add(code, reason)
             return _refused(refusals, summary, **proved)
-        if evaluation.leaf_invoker != parsed["did"]:
-            refusals.add(ReasonCodes.LEAF_INVOKER_MISMATCH, f"the leaf delegate {evaluation.leaf_invoker} is not the proof's did {parsed['did']}")
+        if proof_did is not None and evaluation.leaf_invoker != proof_did:
+            refusals.add(ReasonCodes.LEAF_INVOKER_MISMATCH, f"the leaf delegate {evaluation.leaf_invoker} is not the proof's did {proof_did}")
             return _refused(refusals, summary, **proved)
         root = hops[0]
         if options.trusted_root_issuers is not None and root["issuer"] not in options.trusted_root_issuers:
@@ -405,13 +324,16 @@ def verify(
         summary.fresh = chain_fresh
         leaf_allowed_action = evaluation.allowed_action
 
-    # 7. The card: its shape, the responsibleParty gate and its attestations.
+    # 7. The card: its shape, the responsibleParty gate and its attestations. Without a proof the
+    #    card is the leaf delegate's, which the chain names but nothing proves.
+    agent_did = proof_did if proof_did is not None else summary.leaf_invoker
+    assert agent_did is not None
     card_value = card
     if card_value is None and callable(seams.resolve_card):
         try:
-            card_value = seams.resolve_card(parsed["did"])
+            card_value = seams.resolve_card(agent_did)
         except Exception as exc:  # noqa: BLE001
-            refusals.add(ReasonCodes.CARD_UNRESOLVABLE, f"the card of {parsed['did']} could not be read: {exc}")
+            refusals.add(ReasonCodes.CARD_UNRESOLVABLE, f"the card of {agent_did} could not be read: {exc}")
             return _refused(refusals, summary, **proved)
     entity_card: Optional[Mapping[str, Any]] = None
     if card_value is not None:
@@ -420,8 +342,8 @@ def verify(
             refusals.add(ReasonCodes.CARD_MALFORMED, "; ".join(problems))
             return _refused(refusals, summary, **proved)
         entity_card = card_value
-        if entity_card["id"] != parsed["did"]:
-            refusals.add(ReasonCodes.CARD_SUBJECT_MISMATCH, f"the card is {entity_card['id']}'s, not {parsed['did']}'s")
+        if entity_card["id"] != agent_did:
+            refusals.add(ReasonCodes.CARD_SUBJECT_MISMATCH, f"the card is {entity_card['id']}'s, not {agent_did}'s")
             return _refused(refusals, summary, **proved)
         responsible = entity_card.get("responsibleParty")
         if hops is not None and responsible is not None and responsible != summary.responsible_party:
@@ -433,18 +355,19 @@ def verify(
         capabilities = check_capabilities(
             entity_card["capabilities"],
             seams.resolve_did,
-            subject_did=parsed["did"],
+            subject_did=agent_did,
             now_ms=now,
             trusted_issuers=seams.trusted_issuers,
             max_clock_skew_ms=options.max_clock_skew_ms,
             fetch_status_list=seams.fetch_status_list,
         )
 
-    # 8. Authority and level.
+    # 8. Authority and level (story F-1 point 4; section 9.4): the proof floor holds only when a proof verified.
     catalog = options.catalog if options.catalog is not None else leaf_allowed_action
     effective_scopes = derive_effective_scopes(capabilities.verified, leaf_allowed_action, catalog)
     fresh = chain_fresh and capabilities.fresh
-    level = derive_conformance_level({"verified": capabilities.verified, "unverified": capabilities.unverified}, True, fresh)
+    proof_floor = proof_did is not None
+    level = derive_conformance_level({"verified": capabilities.verified, "unverified": capabilities.unverified}, proof_floor, fresh)
     return VerifierResult(
         ok=True,
         level=level,
@@ -454,7 +377,9 @@ def verify(
         chain_summary=summary,
         capabilities=capabilities,
         fresh=fresh,
-        warnings=warnings,
-        proof_did=parsed["did"],
-        proof_assurance=proof_assurance,
+        warnings=list(proved.get("warnings", [])),
+        proof_did=proof_did,
+        proof_assurance=proved.get("proof_assurance"),
+        agent_did=agent_did,
+        proof_floor=proof_floor,
     )

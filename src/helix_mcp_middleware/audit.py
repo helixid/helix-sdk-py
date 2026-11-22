@@ -17,7 +17,10 @@ the API's wire format: event ('AUTHZ_GRANTED' | 'AUTHZ_DENIED'), result
 effectiveScopes, and when known agentDid (the DID the request proof verified
 as), level and fresh (KYA-OS callers: the level the local verifier derived,
 story F-2, and whether every status was read live), oauthSubject, toolName,
-requiredScope, reason, serviceDid."""
+requiredScope, reason, serviceDid. Story C-C adds, for KYA-OS callers,
+proofAssurance ('L3' | 'L3-minus'), l3Minus (an L3 resting on an unfused
+proof), cnfDiagnostics (``cnf_present_but_token_unfused``) and, on a level
+refusal, requiredLevel."""
 
 AuditSink = Callable[[ToolAuditEvent], None]
 """Receives every decision for an identified caller, before the tool runs."""
@@ -56,6 +59,14 @@ def create_helix_audit_sink(
                 body[key] = event[key]
         if event.get("fresh") is not None:
             body["fresh"] = event["fresh"]
+        if event.get("proofAssurance"):
+            body["proofAssurance"] = event["proofAssurance"]
+        if event.get("l3Minus") is not None:
+            body["l3Minus"] = event["l3Minus"]
+        if event.get("cnfDiagnostics"):
+            body["cnfDiagnostics"] = list(event["cnfDiagnostics"])
+        if event.get("requiredLevel"):
+            body["requiredLevel"] = event["requiredLevel"]
         client = http
         if client is None:
             import requests

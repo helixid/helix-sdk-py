@@ -46,7 +46,10 @@ class _Verifier:
         from types import SimpleNamespace
 
         self.calls.append(call)
-        return SimpleNamespace(ok=True, effective_scopes=self.scopes, proof_did="did:key:zTestAgent", level="L1", fresh=True, reasons=[], proof_assurance="L3-minus")
+        return SimpleNamespace(
+            ok=True, effective_scopes=self.scopes, proof_did="did:key:zTestAgent", agent_did="did:key:zTestAgent", level="L1",
+            fresh=True, reasons=[], proof_assurance="L3-minus", proof_floor=True, warnings=[],
+        )
 
 
 PROOF_META = {"org.kya-os/request-proof": {"prf": "org.kya-os/proof.v1"}}
@@ -56,7 +59,7 @@ class TestMCP:
     def test_middleware_rejects_a_call_without_a_proof(self) -> None:
         from helix_mcp_middleware import MCPMiddlewareOptions, ProofError, helixid_mcp_middleware
 
-        middleware = helixid_mcp_middleware(MCPMiddlewareOptions(verifier=_Verifier([])))
+        middleware = helixid_mcp_middleware(MCPMiddlewareOptions(minimum_level="L1", verifier=_Verifier([])))
         with pytest.raises(ProofError) as excinfo:
             middleware({"name": "get_orders", "input": {}})
         assert excinfo.value.code == "PROOF_MISSING"
@@ -65,7 +68,7 @@ class TestMCP:
         from helix_mcp_middleware import MCPMiddlewareOptions, ProofError, helixid_mcp_middleware
 
         verifier = _Verifier([])
-        middleware = helixid_mcp_middleware(MCPMiddlewareOptions(verifier=verifier))
+        middleware = helixid_mcp_middleware(MCPMiddlewareOptions(minimum_level="L1", verifier=verifier))
         with pytest.raises(ProofError):
             middleware({"name": "get_orders", "input": {"org.kya-os/request-proof": {"prf": "x"}}})
         assert verifier.calls == []
@@ -74,7 +77,7 @@ class TestMCP:
         from helix_mcp_middleware import MCPMiddlewareOptions, ProofError, helixid_mcp_middleware
 
         verifier = _Verifier(["read:orders"])
-        middleware = helixid_mcp_middleware(MCPMiddlewareOptions(verifier=verifier))
+        middleware = helixid_mcp_middleware(MCPMiddlewareOptions(minimum_level="L1", verifier=verifier))
         for call in ({"_meta": {"x-helix-vp": "e30"}}, {"headers": {"x-helix-vp": "e30"}}, {"headers": {"authorization": "HelixVP e30"}}):
             with pytest.raises(ProofError):
                 middleware({"name": "get_orders", **call})
@@ -85,10 +88,10 @@ class TestMCP:
         from helix_sdk.errors import InsufficientScopeError
 
         verifier = _Verifier(["read:orders"])
-        allowed = helixid_mcp_middleware(MCPMiddlewareOptions(verifier=verifier, required_scopes=["read:orders"]))
+        allowed = helixid_mcp_middleware(MCPMiddlewareOptions(minimum_level="L1", verifier=verifier, required_scopes=["read:orders"]))
         call = {"name": "get_orders", "_meta": PROOF_META}
         assert allowed(call) is call
-        refused = helixid_mcp_middleware(MCPMiddlewareOptions(verifier=verifier, required_scopes=["write:orders"]))
+        refused = helixid_mcp_middleware(MCPMiddlewareOptions(minimum_level="L1", verifier=verifier, required_scopes=["write:orders"]))
         with pytest.raises(InsufficientScopeError):
             refused(call)
         assert len(verifier.calls) == 2

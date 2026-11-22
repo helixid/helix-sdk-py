@@ -918,11 +918,14 @@ class TestGateAuthorize:
 
         class Verifier:
             def verify_call(self, call: Dict[str, Any]) -> Any:
-                return SimpleNamespace(ok=True, effective_scopes=["orders:read"], proof_did=AGENT, level="L2", proof_assurance="L3-minus", fresh=True, reasons=[])
+                return SimpleNamespace(
+                    ok=True, effective_scopes=["orders:read"], proof_did=AGENT, agent_did=AGENT, level="L2", proof_assurance="L3-minus",
+                    fresh=True, reasons=[], proof_floor=True, warnings=[],
+                )
 
-        gate = helixid_mcp_middleware(MCPMiddlewareOptions(verifier=Verifier(), tool_scopes={"lookup_order": ["orders:read"]}))
+        gate = helixid_mcp_middleware(MCPMiddlewareOptions(verifier=Verifier(), tool_scopes={"lookup_order": ["orders:read"]}, minimum_level="L2"))
         caller = gate.authorize({"name": "lookup_order", "_meta": {"org.kya-os/request-proof": {"prf": "org.kya-os/proof.v1"}}})  # type: ignore[attr-defined]
-        assert caller == AuthorizedCaller(auth_method="kyaos", scopes=["orders:read"], agent_did=AGENT, level="L2", proof_assurance="L3-minus", fresh=True)
+        assert caller == AuthorizedCaller(auth_method="kyaos", scopes=["orders:read"], agent_did=AGENT, level="L2", proof_assurance="L3-minus", fresh=True, proof_floor=True)
 
 
 class TestHttpRefusalWithProof:

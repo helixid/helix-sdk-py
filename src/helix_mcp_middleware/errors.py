@@ -29,6 +29,7 @@ class MCPAuthError(HelixError):
 
 PROOF_MISSING = "PROOF_MISSING"
 PROOF_INVALID = "PROOF_INVALID"
+PROOF_LEVEL_INSUFFICIENT = "PROOF_LEVEL_INSUFFICIENT"
 
 
 class ProofError(HelixError):
@@ -39,10 +40,26 @@ class ProofError(HelixError):
     without parsing the message. Always HTTP 401."""
 
     def __init__(self, code: str, message: str, reasons: Sequence[str] = ()) -> None:
-        if code not in (PROOF_MISSING, PROOF_INVALID):
-            raise ValueError(f"ProofError code must be {PROOF_MISSING} or {PROOF_INVALID}")
+        if code not in (PROOF_MISSING, PROOF_INVALID, PROOF_LEVEL_INSUFFICIENT):
+            raise ValueError(f"ProofError code must be {PROOF_MISSING}, {PROOF_INVALID} or {PROOF_LEVEL_INSUFFICIENT}")
         super().__init__(code, message, 401)
         self.reasons: Tuple[str, ...] = tuple(reasons)
+
+
+class LevelError(ProofError):
+    """A verified call below the Card level its tool demands (story C-C):
+    PROOF_LEVEL_INSUFFICIENT, HTTP 401 ``insufficient_user_authentication``.
+    ``derived_level`` is the level the call came to (``L1``, ``L2``,
+    ``L3-minus``, ``L3``), ``required_level`` the tool's minimum."""
+
+    def __init__(self, derived_level: str, required_level: str) -> None:
+        super().__init__(
+            PROOF_LEVEL_INSUFFICIENT,
+            f"This tool needs Card level {required_level}; the call came to {derived_level}",
+            ["proof_level_insufficient"],
+        )
+        self.derived_level = derived_level
+        self.required_level = required_level
 
 
 class ToolScopeError(InsufficientScopeError):
