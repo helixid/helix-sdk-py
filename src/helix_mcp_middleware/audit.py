@@ -144,19 +144,19 @@ class ToolCallAudit:
         self.delegation = delegation
         """The presented delegation credential's evidence, when the credential was a HelixID VP."""
 
-    def started(self) -> AuditTrailEntry:
+    def started(self) -> Optional[AuditTrailEntry]:
         """The tool is about to run."""
         return self._tool_event("started", "unknown")
 
-    def completed(self) -> AuditTrailEntry:
+    def completed(self) -> Optional[AuditTrailEntry]:
         """The tool answered."""
         return self._tool_event("completed", "succeeded")
 
-    def failed(self, reason_code: str) -> AuditTrailEntry:
+    def failed(self, reason_code: str) -> Optional[AuditTrailEntry]:
         """The tool failed; ``reason_code`` is a code, never the exception text."""
         return self._tool_event("failed", "failed", reason_code)
 
-    def denied(self, reason_code: str) -> AuditTrailEntry:
+    def denied(self, reason_code: str) -> Optional[AuditTrailEntry]:
         """The guard refused the call before the tool ran; ``reason_code`` is the error code."""
         return self._tool_event("denied", "denied", reason_code)
 
@@ -166,7 +166,7 @@ class ToolCallAudit:
             context["actor"] = self.actor
         return context
 
-    def _tool_event(self, phase: str, outcome: str, reason_code: Optional[str] = None) -> AuditTrailEntry:
+    def _tool_event(self, phase: str, outcome: str, reason_code: Optional[str] = None) -> Optional[AuditTrailEntry]:
         return self._audit.tool(phase, outcome, tool_name=self.tool_name, attempt="1", reason_code=reason_code, context=self.context())
 
 
@@ -183,7 +183,9 @@ class McpAuditTrail:
     (the returned entry holds the event, its canonical text and digest) under
     the MCP binding, with this server as the resource and the current tool
     call's correlation id and actor unless the context says otherwise.
-    Errors propagate: a call that cannot be recorded does not run."""
+    Errors propagate, as in JS: a call that cannot be recorded does not run.
+    ``on_error`` (Python only, for a delivery that degrades instead of
+    failing) receives a failed record instead, and the method returns None."""
 
     def __init__(
         self,
@@ -196,6 +198,7 @@ class McpAuditTrail:
         oauth_subject_key: Optional[bytes] = None,
         clock: Optional[Callable[[], int]] = None,
         new_event_id: Optional[Callable[[], str]] = None,
+        on_error: Optional[Callable[[BaseException], None]] = None,
     ) -> None:
         """``reporter`` receives every recorded entry (``create_helix_audit_reporter``,
         a ``MemoryAuditSink``, ...). ``service_did`` is this server's DID: the
@@ -207,13 +210,14 @@ class McpAuditTrail:
         name is often sensitive in itself). ``oauth_subject_key`` is the key
         OAuth subjects are committed under (default 32 random bytes per
         trail). ``clock`` (milliseconds) and ``new_event_id`` default to the
-        trail's."""
+        trail's. ``on_error``: see the class docstring."""
         if producer is None and service_did is not None:
             producer = pairwise_did(service_did)
         if producer is None:
             raise ValueError("create_mcp_audit_trail needs service_did (this server's DID) or an explicit producer")
         self.service_did = service_did
         self.include_tool_names = include_tool_names
+        self.on_error = on_error
         self._oauth_subject_key = bytes(oauth_subject_key) if oauth_subject_key is not None else os.urandom(32)
         self.trail = AuditTrail(
             sink=reporter,
@@ -232,7 +236,7 @@ class McpAuditTrail:
 
     # -- one typed event per method ---------------------------------------------
 
-    def session(self, phase: str, succeeded: bool, reason_code: Optional[str] = None, context: Optional[McpAuditContext] = None) -> AuditTrailEntry:
+    def session(self, phase: str, succeeded: bool, reason_code: Optional[str] = None, context: Optional[McpAuditContext] = None) -> Optional[AuditTrailEntry]:
         outcome = "succeeded" if succeeded else ("failed" if phase == "expired" else "denied")
         details: Dict[str, Any] = {"family": "session", "phase": phase}
         if reason_code is not None:
@@ -247,7 +251,7 @@ class McpAuditTrail:
         verification_code: Optional[str] = None,
         reason_code: Optional[str] = None,
         context: Optional[McpAuditContext] = None,
-    ) -> AuditTrailEntry:
+    ) -> Optional[AuditTrailEntry]:
         details: Dict[str, Any] = {"family": "proof", "phase": phase}
         if proof_digest is not None:
             details["proofDigest"] = proof_digest
@@ -263,7 +267,7 @@ class McpAuditTrail:
         reason_code: Optional[str] = None,
         parent_ref: Optional[str] = None,
         context: Optional[McpAuditContext] = None,
-    ) -> AuditTrailEntry:
+    ) -> Optional[AuditTrailEntry]:
         details: Dict[str, Any] = {"family": "delegation", "phase": phase, "delegationRef": delegation_ref}
         if parent_ref is not None:
             details["parentRef"] = parent_ref
@@ -277,7 +281,7 @@ class McpAuditTrail:
         grant_ref: Optional[str] = None,
         tool_name: Optional[str] = None,
         context: Optional[McpAuditContext] = None,
-    ) -> AuditTrailEntry:
+    ) -> Optional[AuditTrailEntry]:
         details: Dict[str, Any] = {"family": "authorization", "phase": phase}
         if grant_ref is not None:
             details["grantRef"] = grant_ref
@@ -292,7 +296,7 @@ class McpAuditTrail:
         attempt: str = "1",
         reason_code: Optional[str] = None,
         context: Optional[McpAuditContext] = None,
-    ) -> AuditTrailEntry:
+    ) -> Optional[AuditTrailEntry]:
         details = {"family": "tool", "phase": phase, "attempt": attempt}
         return self._record(self._input(f"tool.call.{phase}", "tool.call", outcome, details, reason_code), context, tool_name)
 
@@ -408,7 +412,7 @@ class McpAuditTrail:
         event["details"] = details
         return event
 
-    def _record(self, event: Dict[str, Any], context: Optional[McpAuditContext], tool_name: Optional[str] = None) -> AuditTrailEntry:
+    def _record(self, event: Dict[str, Any], context: Optional[McpAuditContext], tool_name: Optional[str] = None) -> Optional[AuditTrailEntry]:
         """Fills the context (explicit members over the current call's) and the resource, applies the tool-name policy, records."""
         call = _CURRENT_CALL.get()
         context = context or {}
@@ -432,7 +436,13 @@ class McpAuditTrail:
             event["authorization"] = context["authorization"]
         if tool_name is not None and self.include_tool_names:
             event["action"] = {**event["action"], "name": tool_name}
-        return self.trail.record(event)
+        try:
+            return self.trail.record(event)
+        except Exception as error:  # noqa: BLE001 - reported to on_error when one is set
+            if self.on_error is None:
+                raise
+            self.on_error(error)
+            return None
 
 
 class _HelixAuditReporter:
@@ -479,8 +489,9 @@ def create_mcp_audit_trail(
     oauth_subject_key: Optional[bytes] = None,
     clock: Optional[Callable[[], int]] = None,
     new_event_id: Optional[Callable[[], str]] = None,
+    on_error: Optional[Callable[[BaseException], None]] = None,
 ) -> McpAuditTrail:
-    """``McpAuditTrail(...)``, as JS's ``createMcpAuditTrail``."""
+    """``McpAuditTrail(...)``, as JS's ``createMcpAuditTrail`` (plus the Python-only ``on_error``)."""
     return McpAuditTrail(
         reporter,
         service_did=service_did,
@@ -491,6 +502,7 @@ def create_mcp_audit_trail(
         oauth_subject_key=oauth_subject_key,
         clock=clock,
         new_event_id=new_event_id,
+        on_error=on_error,
     )
 
 

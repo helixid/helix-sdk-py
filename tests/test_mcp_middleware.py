@@ -913,6 +913,11 @@ class TestAudit:
         assert "ignored" not in event
         with pytest.raises(AuditEventInvalidError):  # errors propagate: a call that cannot be recorded does not run
             audit.tool("started", "unknown", attempt="x")
+        # Python only: on_error takes the failure instead, and the method returns None.
+        errors: List[BaseException] = []
+        reporting = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc", on_error=errors.append)
+        assert reporting.on_error is not None and reporting.tool("started", "unknown", attempt="x") is None
+        assert isinstance(errors[0], AuditEventInvalidError)
 
     def test_commits_an_oauth_subject_under_the_trail_key(self) -> None:
         def trail(key: Any = None) -> McpAuditTrail:
