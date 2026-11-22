@@ -23,7 +23,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, List, Mapping, Optional, Union
 
-from ..credentials import issuer_of, window_verdict
+from ..credentials import issuer_of, parse_date_time, window_verdict
 from .codes import ReasonCodes
 
 MAX_STATUS_LIST_BYTES = 16 * 1024 * 1024
@@ -38,6 +38,8 @@ class StatusListRead:
     valid_from: Optional[str] = None
     valid_until: Optional[str] = None
     fresh: bool = True
+    #: True when the reader verified the list's own proof before decoding its bits (story L3-C's readers always do).
+    proof_verified: bool = False
 
 
 FetchStatusList = Callable[[str], Optional[StatusListRead]]
@@ -106,6 +108,19 @@ def decode_status_list_credential(value: Any, fresh: bool = True) -> StatusListR
     )
 
 
+_FRACTION = re.compile(r"(\.\d{6})\d+")
+
+
+def _six_digit_fraction(value: Any) -> Any:
+    """A date-time with its fractional seconds cut to six digits (what ``datetime`` reads on every Python); anything else as given."""
+    return _FRACTION.sub(r"\1", value) if isinstance(value, str) else value
+
+
+def parse_status_bound(value: Any) -> Optional[int]:
+    """Milliseconds since the epoch a status-list bound states (RFC 3339 with offset, any number of fraction digits), else None."""
+    return parse_date_time(_six_digit_fraction(value))
+
+
 def parse_status_list_index(raw: Any) -> Optional[int]:
     """The whole decimal index an entry names, or None for any other form (never coerced)."""
     if not isinstance(raw, str) or re.fullmatch(r"[0-9]+", raw) is None:
@@ -124,8 +139,16 @@ def check_status_entry(
     *,
     now_ms: int,
     max_clock_skew_ms: Any = None,
+    keeper: Optional[str] = None,
+    may_omit_id: bool = True,
+    check_window: bool = True,
 ) -> StatusVerdict:
-    """Holds ``entry`` of a credential ``credential_issuer`` issued to the list ``read`` at the entry's URL."""
+    """Holds ``entry`` of a credential ``credential_issuer`` issued to the list ``read`` at the entry's URL.
+
+    ``keeper`` is the one issuer whose list is read at the URL (default the
+    credential's issuer); ``may_omit_id`` False requires the list to state the
+    URL as its ``id``; ``check_window`` False skips the window for a cached
+    read the cache already held to it (story L3-C)."""
     fresh = read is None or read.fresh is not False
 
     def refuse(code: str, message: str) -> StatusVerdict:
@@ -139,8 +162,11 @@ def check_status_entry(
         return refuse(ReasonCodes.STATUS_ENTRY_MALFORMED, "statusListIndex is not a non-negative decimal string")
     if read is None:
         return refuse(ReasonCodes.STATUS_UNAVAILABLE, f"status list {entry.get('statusListCredential')} could not be read")
-    if read.issuer is not None and read.issuer != credential_issuer:
-        return refuse(ReasonCodes.STATUS_LIST_MISMATCH, f"status list is signed by {read.issuer}, not the credential issuer {credential_issuer}")
+    kept = keeper if keeper is not None else credential_issuer
+    if read.issuer is not None and read.issuer != kept:
+        if kept == credential_issuer:
+            return refuse(ReasonCodes.STATUS_LIST_MISMATCH, f"status list is signed by {read.issuer}, not the credential issuer {credential_issuer}")
+        return refuse(ReasonCodes.STATUS_LIST_MISMATCH, f"status list is signed by {read.issuer}, not {kept}, who keeps {entry.get('statusListCredential')}")
     purpose = entry.get("statusPurpose")
     if read.status_purpose is not None:
         purposes = read.status_purpose if isinstance(read.status_purpose, list) else [read.status_purpose]
@@ -148,9 +174,12 @@ def check_status_entry(
             return refuse(ReasonCodes.STATUS_LIST_MISMATCH, f"status list purpose does not include {purpose}")
     if read.id is not None and read.id != entry.get("statusListCredential"):
         return refuse(ReasonCodes.STATUS_LIST_MISMATCH, f"status list id {read.id} is not the URL it was read from")
-    window = window_verdict(read.valid_from, read.valid_until, now_ms, max_clock_skew_ms)
-    if window != "inside":
-        return refuse(ReasonCodes.STATUS_STALE, f"status list is outside the window it states ({window})")
+    if read.id is None and not may_omit_id:
+        return refuse(ReasonCodes.STATUS_LIST_MISMATCH, "status list states no id, and only the credential issuer's own list may leave it out")
+    if check_window:
+        window = window_verdict(_six_digit_fraction(read.valid_from), _six_digit_fraction(read.valid_until), now_ms, max_clock_skew_ms)
+        if window != "inside":
+            return refuse(ReasonCodes.STATUS_STALE, f"status list is outside the window it states ({window})")
     bit = read_status_bit(read.bits, index)
     if bit is None:
         return refuse(ReasonCodes.STATUS_ENTRY_MALFORMED, f"statusListIndex {index} is outside the list")

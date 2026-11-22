@@ -47,7 +47,8 @@ from .request_proof import (
     verify_detached_jws,
     window_problems,
 )
-from .status import FetchStatusList, check_status_entry
+from .revocation import RevocationChecker, RevocationContext, check_chain_revocation, revocation_checker_of
+from .status import FetchStatusList, StatusListRead
 
 
 class NonceStore:
@@ -80,6 +81,8 @@ class VerifierSeams:
     resolve_did: Optional[DidResolver] = None
     resolve_did_keys: Optional[Callable[[str], Sequence[Mapping[str, Any]]]] = None
     fetch_status_list: Optional[FetchStatusList] = None
+    #: The revocation check of one credential (story L3-C); default one over ``fetch_status_list``, no cache.
+    check_revocation: Optional[RevocationChecker] = None
     resolve_card: Optional[Callable[[str], Any]] = None
     nonce_store: Optional[Any] = None
     clock: Optional[Callable[[], int]] = None
@@ -256,6 +259,18 @@ def _cnf_fusion(proof: Mapping[str, Any], key: Mapping[str, Any], options: Verif
     return "L3" if cnf["jkt"] == key_jkt else "L3-minus"
 
 
+def _revocation_seam(seams: VerifierSeams, options: VerifierOptions) -> Optional[RevocationChecker]:
+    """The revocation seam in force: the one given, else one over ``fetch_status_list``, else none."""
+    if callable(seams.check_revocation):
+        return seams.check_revocation
+    return revocation_checker_of(seams.fetch_status_list, options.max_clock_skew_ms) if callable(seams.fetch_status_list) else None
+
+
+def _request_scopes(options: VerifierOptions, allowed_action: Sequence[str]) -> Sequence[str]:
+    """The scopes a request touches, which pick the status cache TTL: the invoked action, else what the leaf allows."""
+    return list(allowed_action) if options.action is None else [options.action]
+
+
 def validate_entity_card(value: Any) -> List[str]:
     """Every way ``value`` fails the strict card schema, as ``path: message``; empty when it is a card."""
     return [f"{violation.path}: {violation.message}" for violation in validate_json_schema(ENTITY_CARD_SCHEMA, value)]
@@ -354,6 +369,9 @@ def verify(
     if refusals.any:
         return _refused(refusals, no_chain, **proved)
 
+    # Lists read live for this verification: a second credential on the same list stays a live read.
+    reads: Dict[str, StatusListRead] = {}
+
     # 6. The chain: local rules, the leaf join, trusted roots, the action, each hop's proof, each hop's status.
     summary = ChainSummary()
     leaf_allowed_action: List[str] = []
@@ -388,20 +406,16 @@ def verify(
             if not verdict.ok:
                 refusals.add(ReasonCodes.HOP_PROOF_INVALID, f"hop {index}: {verdict.reason}: {verdict.message}")
                 return _refused(refusals, summary, **proved)
-        if not callable(seams.fetch_status_list):
+        checker = _revocation_seam(seams, options)
+        if checker is None:
             refusals.add(ReasonCodes.STATUS_SEAM_MISSING, "no fetch_status_list seam: the hops' status cannot be read")
             return _refused(refusals, summary, **proved)
-        for index, hop in enumerate(hops):
-            try:
-                read = seams.fetch_status_list(hop["credentialStatus"]["statusListCredential"])
-            except Exception as exc:  # noqa: BLE001
-                refusals.add(ReasonCodes.STATUS_UNAVAILABLE, f"hop {index}: status list could not be read: {exc}")
-                return _refused(refusals, summary, **proved)
-            status = check_status_entry(hop["credentialStatus"], hop["issuer"], read, now_ms=now, max_clock_skew_ms=options.max_clock_skew_ms)
-            if not status.ok:
-                refusals.add(status.code or ReasonCodes.STATUS_UNAVAILABLE, f"hop {index}: {status.message}")
-                return _refused(refusals, summary, **proved)
-            chain_fresh = chain_fresh and status.fresh
+        # Root to leaf, stopping at the first revoked or unresolvable hop (section 6.5 cascade, story L3-C point 4).
+        revocation = check_chain_revocation(hops, checker, RevocationContext(now_ms=now, scopes=_request_scopes(options, evaluation.allowed_action), reads=reads))
+        if revocation.revoked:
+            refusals.add(revocation.code or ReasonCodes.STATUS_REVOKED, f"hop {revocation.index}: {revocation.message or 'revoked'}")
+            return _refused(refusals, summary, **proved)
+        chain_fresh = revocation.fresh
         summary.fresh = chain_fresh
         leaf_allowed_action = evaluation.allowed_action
 
@@ -438,6 +452,9 @@ def verify(
             trusted_issuers=seams.trusted_issuers,
             max_clock_skew_ms=options.max_clock_skew_ms,
             fetch_status_list=seams.fetch_status_list,
+            check_revocation=_revocation_seam(seams, options),
+            scopes=_request_scopes(options, leaf_allowed_action),
+            reads=reads,
         )
 
     # 8. Authority and level.

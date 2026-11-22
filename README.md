@@ -77,6 +77,21 @@ same results, which `tests/test_verifier.py` proves over the fixture set helix-c
 `python -m helix_sdk.conformance [vectors_dir]` runs the KYA-OS vector categories `signed-proof`, `delegation-chain`,
 `status-list`, `did-key`, `did-web`, `card-proof` and `entity-card` through `helix_sdk.conformance.HelixConformanceAdapter`.
 
+## Status lists and revocation (KYA-OS story L3-C)
+
+`helix_sdk.verifier` reads status lists as SPEC.md §6.6 says, exactly as helix-sdk-js does:
+
+- `read_bitstring_status_list` / `read_status_list_2021` verify the list's own proof (`eddsa-jcs-2022`, or the §6.2
+  `Ed25519Signature2020`) by its issuer's `assertionMethod` key before decoding any bit; `create_status_list_fetcher`
+  fetches through the host's (Safe)fetch. Unreachable, malformed, unsigned, badly signed, wrong-purpose and out-of-range
+  lists read as revoked.
+- `create_revocation_checker` (the `check_revocation` seam, fail-closed) applies the keeper rules and caches lists and
+  verdicts in a `StatusCache` (`status_cache_ttl`, `high_privilege_scopes` at most 60 s, `max_stale_seconds`,
+  `invalidate(credential_id)`); a cached read is `fresh=False`, which demotes a Card L3 request to L2. Its Redis keys and
+  JSON match the JavaScript cache, so both can share one store. `check_chain_revocation` walks a chain root to leaf.
+- `verify_revocation_signal` checks Helix's revocation SET (RFC 8417): a trusted issuer and its signature, one credential.
+- The conformance `status-list` category runs through these production readers, both list formats.
+
 ## Packages in this repo
 
 - **`helix_sdk`** -- core SDK (see Quick example below).

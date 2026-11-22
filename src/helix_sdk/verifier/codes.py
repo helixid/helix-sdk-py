@@ -67,6 +67,8 @@ class ReasonCodes:
     STATUS_STALE = "status_stale"
     STATUS_ENTRY_MALFORMED = "status_entry_malformed"
     STATUS_LIST_MISMATCH = "status_list_mismatch"
+    STATUS_LIST_MALFORMED = "status_list_malformed"
+    STATUS_LIST_PROOF_INVALID = "status_list_proof_invalid"
 
     # The Entity Card the attestations come from.
     CARD_MALFORMED = "card_malformed"
