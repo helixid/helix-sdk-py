@@ -16,8 +16,9 @@ of the same key.
   (HELIX_SIGNING_KEY for EnvSigner); ``public_key_hex`` the public key.
 - to_public_key_jwk(): the public key as RFC 8037 writes it (L1.8).
 - to_did_key(): ``did:key:z6Mk...``, multicodec 0xed01 then base58btc (L1.1).
-- agent_key_registration(): the body of POST /v1/agents/{did}/keys, checked
-  to carry no private material (self-custody invariant, rule 7).
+
+Helix learns the public half through enrollment (KYA-OS story F-3,
+helix_init()): the public JWK and a signature over Helix's challenge.
 """
 
 from __future__ import annotations
@@ -143,21 +144,6 @@ def public_key_jwk_bytes(jwk: Any) -> bytes:
     if len(raw) != _ED25519_PUBLIC_KEY_LENGTH:
         raise ValueError("publicKeyJwk x must be a 32-byte Ed25519 public key")
     return raw
-
-
-def agent_key_registration(
-    public_key: Union[str, bytes, bytearray, Mapping[str, Any]], kid: Optional[str] = None
-) -> Dict[str, Any]:
-    """The body of POST /v1/agents/{did}/keys: the public JWK (kty, crv, x, nothing
-    else) and the verification-method fragment. Takes the public key as hex,
-    bytes or JWK; a JWK with ``d`` or any other member is refused."""
-    raw = public_key_jwk_bytes(public_key) if isinstance(public_key, Mapping) else _public_key_bytes(public_key)
-    fragment = DEFAULT_AGENT_KEY_ID if kid is None else kid
-    if not isinstance(fragment, str) or not fragment:
-        raise ValueError("kid must be a non-empty verification-method fragment")
-    body = {"publicKeyJwk": to_public_key_jwk(raw), "kid": fragment}
-    assert_no_private_material(body)
-    return body
 
 
 # -- base58btc (conformance L1.9) ----------------------------------------------

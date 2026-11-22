@@ -14,8 +14,8 @@ Layers:
      (fixtures/kya-os-helix/did.json): same seeds must give the same bytes;
   3. the vendored KYA-OS vectors (did-key-resolution.json,
      did-web-resolution.json, Core L1.6 to L1.9);
-  4. HelixClient.register_agent_key against a stubbed HTTP layer: the body on
-     the wire carries no private material (self-custody invariant, rule 7).
+  4. registering the key goes through enrollment only (helix_init); the L1-A
+     key route and HelixClient.register_agent_key are gone.
 
 Layers 2 and 3 read the sibling helix-core checkout (../helix-core/fixtures)
 or the directory HELIX_CORE_FIXTURES_DIR names, and skip when neither exists.
@@ -36,7 +36,6 @@ from helix_sdk import HelixClient
 from helix_sdk import did_resolver as did_resolver_module
 from helix_sdk.agent_key import (
     DEFAULT_AGENT_KEY_ID,
-    agent_key_registration,
     agent_public_key,
     assert_no_private_material,
     decode_base58btc,
@@ -133,21 +132,15 @@ class TestPublicForms:
         assert public_key_from_did_key("did:key:z" + encode_base58btc(b"\xed\x01" + self.raw[2:])) is None
 
 
-class TestRegistration:
+class TestPublicKeyJwk:
     key = generate_agent_key()
     jwk = to_public_key_jwk(key.public_key_hex)
 
-    def test_body_from_hex_bytes_or_jwk_with_default_kid(self) -> None:
-        assert agent_key_registration(self.key.public_key_hex) == {"publicKeyJwk": self.jwk, "kid": DEFAULT_AGENT_KEY_ID}
-        assert agent_key_registration(bytes.fromhex(self.key.public_key_hex), "k2") == {"publicKeyJwk": self.jwk, "kid": "k2"}
-        assert agent_key_registration({**self.jwk, "kid": "ignored"}) == {"publicKeyJwk": self.jwk, "kid": DEFAULT_AGENT_KEY_ID}
-        with pytest.raises(ValueError, match="kid"):
-            agent_key_registration(self.key.public_key_hex, "")
-
     def test_refuses_private_material_and_non_public_jwks(self) -> None:
         d = _b64url(bytes.fromhex(self.key.private_key_hex))
-        with pytest.raises(ValueError, match="found d"):
-            agent_key_registration({**self.jwk, "d": d})
+        assert to_public_key_jwk(bytes.fromhex(self.key.public_key_hex), DEFAULT_AGENT_KEY_ID) == {**self.jwk, "kid": "key-1"}
+        with pytest.raises(ValueError, match=r"found publicKeyJwk\.d"):
+            assert_no_private_material({"publicKeyJwk": {**self.jwk, "d": d}})
         with pytest.raises(ValueError, match="found d"):
             public_key_jwk_bytes({**self.jwk, "d": d})
         with pytest.raises(ValueError, match=r"unexpected members \(use\)"):
@@ -371,7 +364,6 @@ class TestHelixDidFixtures:
         assert to_did_key(key["public_key_hex"]) == key["did_key"]
         assert "z" + encode_base58btc(b"\xed\x01" + raw) == key["public_key_multibase"]
         assert public_key_from_did_key(key["did_key"]) == raw
-        assert agent_key_registration(key["public_key_hex"], key["kid_fragment"]) == key["registration_body"]
         assert key["kid"] == f"{key['did_web']}#{key['kid_fragment']}"
         assert did_key_document(key["did_key"]) == key["did_key_document"]
 
@@ -443,44 +435,9 @@ class TestKyaOsVectors:
                 resolve_did(did, fetch_json=fetch_json)
 
 
-# ── 4. HelixClient.register_agent_key ─────────────────────────────────────────
+# ── 4. registering the key ──────────────────────────────────────────────────
 
 
-class FakeHttp:
-    def __init__(self) -> None:
-        self.calls: List[Any] = []
-
-    def post(self, path: str, body: Any = None) -> Any:
-        self.calls.append((path, body))
-        return {"did": "did:web:x:agents:a", "kid": "did:web:x:agents:a#key-1", "didKey": "did:key:z6Mk", "didDocument": {}}
-
-
-class TestRegisterAgentKey:
-    def test_posts_the_public_jwk_only_to_the_agent_keys_route(self) -> None:
-        key = generate_agent_key()
-        client = HelixClient("http://helix.test", admin_api_key="admin")
-        http = FakeHttp()
-        client._http = http  # type: ignore[assignment]
-
-        result = client.register_agent_key("did:web:x:agents:a", key.public_key_hex)
-        assert result["kid"] == "did:web:x:agents:a#key-1"
-        assert http.calls == [("/v1/agents/did%3Aweb%3Ax%3Aagents%3Aa/keys", {"publicKeyJwk": to_public_key_jwk(key.public_key_hex), "kid": "key-1"})]
-        wire = json.dumps(http.calls[0][1])
-        assert '"d"' not in wire
-        assert key.private_key_hex not in wire
-        assert _b64url(bytes.fromhex(key.private_key_hex)) not in wire
-        assert sorted(http.calls[0][1]["publicKeyJwk"]) == ["crv", "kty", "x"]
-
-        client.register_agent_key("did:web:x:agents:a", to_public_key_jwk(key.public_key_hex), kid="signing")
-        assert http.calls[1][1] == {"publicKeyJwk": to_public_key_jwk(key.public_key_hex), "kid": "signing"}
-
-    def test_never_sends_a_request_that_would_carry_private_material(self) -> None:
-        key = generate_agent_key()
-        client = HelixClient("http://helix.test", admin_api_key="admin")
-        http = FakeHttp()
-        client._http = http  # type: ignore[assignment]
-        with pytest.raises(ValueError, match="Private key material"):
-            client.register_agent_key("did:web:x", {**to_public_key_jwk(key.public_key_hex), "d": _b64url(bytes.fromhex(key.private_key_hex))})
-        assert http.calls == []
-        with pytest.raises(Exception):
-            HelixClient().register_agent_key("did:web:x", key.public_key_hex)
+def test_an_agent_key_registers_through_enrollment_only() -> None:
+    """helix_init sends the public JWK with a proof of possession; the L1-A key route is gone."""
+    assert not hasattr(HelixClient, "register_agent_key")

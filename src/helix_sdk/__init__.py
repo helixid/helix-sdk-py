@@ -51,7 +51,6 @@ from .keys import (
 from .agent_key import (
     DEFAULT_AGENT_KEY_ID,
     AgentKey,
-    agent_key_registration,
     agent_public_key,
     assert_no_private_material,
     decode_base58btc,
