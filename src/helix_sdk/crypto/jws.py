@@ -99,9 +99,12 @@ class EnvSigner(Signer):
     ) -> None:
         if not did.startswith("did:"):
             raise ValueError("EnvSigner: did must be a DID")
-        fragment = kid[1:] if kid.startswith("#") else kid
+        # The fragment alone (``key-1``, ``#key-1``) or the full verification-method
+        # id the DID document publishes (``<did>#key-1``), which must be this DID's.
+        fragment = kid[len(did) + 1:] if kid.startswith(f"{did}#") else kid
+        fragment = fragment[1:] if fragment.startswith("#") else fragment
         if not fragment or "#" in fragment:
-            raise ValueError('EnvSigner: kid must be a verification-method fragment without "#"')
+            raise ValueError("EnvSigner: kid must be a verification-method fragment of this DID")
         self.did = did
         self.kid = fragment
         self._env_var = env_var

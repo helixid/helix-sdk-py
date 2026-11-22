@@ -25,6 +25,10 @@ HelixID, mirroring helix-sdk-js's mcp-middleware package.
 - TrustedIssuers / DEFAULT_TRUSTED_ISSUERS ("*"), is_trusted_issuer(),
   attestation_trust(): which issuers' capability attestations count (KYA-OS
   story C-B).
+- create_kyaos() (KYA-OS story L2-A): the `_kyaos_handshake` tool, sessions,
+  a replay store (MemoryNonceStore, RedisNonceStore, DynamoNonceStore) and a
+  server-signed detached proof on every tool call outcome at
+  `_meta["org.kya-os/response-proof"]`; describe_kyaos() for /.well-known/mcp.
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ from .metadata import (
     protected_resource_metadata_url,
     to_http_error_response,
 )
-from .middleware import async_helixid_mcp_middleware, helixid_mcp_middleware
+from .middleware import AuthorizedCaller, async_helixid_mcp_middleware, helixid_mcp_middleware
 from .oauth import (
     AuthResult,
     OAuthIntrospectionOptions,
@@ -109,4 +113,11 @@ __all__ = [
     "card_endpoint_of",
     "resolution_url",
     "KYA_OS_CARD_SERVICE_TYPE",
+    "AuthorizedCaller",
 ]
+
+# KYA-OS session, replay store and server response proof (story L2-A).
+from .kyaos import *  # noqa: E402,F401,F403
+from .kyaos import __all__ as _kyaos_all  # noqa: E402
+
+__all__ += _kyaos_all
