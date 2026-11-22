@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, TypedDict, Union
 
 from .credentials import (
     CAPABILITY_ATTESTATION_TYPE,
@@ -38,6 +38,106 @@ from .credentials import (
 from .crypto.jws import Signer
 
 Credential = Dict[str, Any]
+
+CredentialSigner = Signer
+"""Whoever holds an Ed25519 key and signs with it: ``did``, ``kid`` (the
+verification-method fragment without ``#``) and ``sign(data) -> bytes``. The
+same shape as helix-core's Signer (story L1-C); JS's ``CredentialSigner``
+signs asynchronously, Python's synchronously."""
+
+
+class _BitstringStatusEntryBase(TypedDict):
+    type: str
+    """Always ``"BitstringStatusListEntry"``."""
+    statusPurpose: str
+    """``"revocation"`` or ``"suspension"``."""
+    statusListIndex: str
+    statusListCredential: str
+
+
+class BitstringStatusEntry(_BitstringStatusEntryBase, total=False):
+    id: str
+
+
+class DataIntegrityProof(TypedDict):
+    type: str
+    """Always ``"DataIntegrityProof"``."""
+    cryptosuite: str
+    """Always ``"eddsa-jcs-2022"``."""
+    created: str
+    verificationMethod: str
+    proofPurpose: str
+    """Always ``"assertionMethod"``."""
+    proofValue: str
+
+
+_StoredCredentialOptional = TypedDict(
+    "_StoredCredentialOptional",
+    {"@context": Any, "validUntil": str, "proof": Dict[str, Any]},
+    total=False,
+)
+
+
+class StoredCredential(_StoredCredentialOptional):
+    """A credential as the store reads it: the members it needs to route and
+    order, the rest untouched (other members are allowed at runtime)."""
+
+    id: str
+    type: List[str]
+    issuer: str
+    credentialSubject: Dict[str, Any]
+
+
+class CapabilityAttestation(StoredCredential):
+    validFrom: str
+    credentialStatus: BitstringStatusEntry
+
+
+class DelegationHop(StoredCredential):
+    """``credentialSubject`` carries ``id``, ``invoker`` or ``controller``,
+    ``parentCapability``, ``invocationTarget``, ``allowedAction`` and
+    optional ``caveats`` (SPEC.md section 6.10)."""
+
+
+class CredentialStoreData(TypedDict):
+    identity: Optional[StoredCredential]
+    attestations: List[StoredCredential]
+    hops: List[StoredCredential]
+
+
+class PresentedChain(TypedDict):
+    """What a request carries (story F-1 point 7): the identity, then the hops root to leaf."""
+
+    identity: StoredCredential
+    hops: List[StoredCredential]
+
+
+class _SignAttestationsRequired(TypedDict):
+    valid_until: str
+    status_entries: Sequence[BitstringStatusEntry]
+    """One per capability, in order: the owner's own status list, or entries Helix handed out."""
+
+
+class SignAttestationsOptions(_SignAttestationsRequired, total=False):
+    """The keyword arguments of :meth:`CredentialStore.sign_attestations`, as a
+    mapping a caller can build once and pass with ``**options``."""
+
+    subject_did: str
+    """The agent the attestations are about; default the stored identity's subject."""
+    valid_from: str
+    ids: Sequence[str]
+    """Each attestation's ``id``, in order; default ``urn:uuid:`` values."""
+    created: str
+    """The proof's ``created``; default now."""
+
+
+def sign_attestation_document(document: Mapping[str, Any], signer: CredentialSigner, created: str) -> Dict[str, Any]:
+    """``eddsa-jcs-2022`` as the KYA-OS reference and helix-core write it:
+    SHA-256(canonical proof options with the document ``@context``) followed
+    by SHA-256(canonical unsecured document), Ed25519 over the two, base58btc.
+    ``signer`` must be the document's issuer and return a 64-byte signature;
+    a document that already carries a proof is refused."""
+    return sign_data_integrity(document, signer, created)
 
 
 def _kind_of(credential: Mapping[str, Any]) -> Optional[str]:
@@ -78,7 +178,7 @@ class CredentialStore:
         parsed = json.loads(data) if isinstance(data, str) else data
         return cls(parsed.get("identity"), parsed.get("attestations") or [], parsed.get("hops") or [])
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> CredentialStoreData:
         return {"identity": self._identity, "attestations": list(self._attestations), "hops": list(self._hops)}
 
     def to_json(self) -> str:
@@ -164,7 +264,7 @@ class CredentialStore:
 
     # -- presenting ------------------------------------------------------------
 
-    def present_chain(self, invocation_target: Optional[str] = None) -> Dict[str, Any]:
+    def present_chain(self, invocation_target: Optional[str] = None) -> PresentedChain:
         """The identity plus the hops delegating to the agent, root to leaf."""
         if self._identity is None:
             raise ValueError("no identity credential stored")
@@ -196,7 +296,7 @@ class CredentialStore:
     def sign_attestations(
         self,
         capabilities: Sequence[str],
-        signer: Signer,
+        signer: CredentialSigner,
         *,
         valid_until: str,
         status_entries: Sequence[Mapping[str, Any]],
@@ -224,7 +324,7 @@ class CredentialStore:
                 "credentialSubject": {"id": subject, "capability": capability},
                 "credentialStatus": dict(status_entries[index]),
             }
-            attestation = sign_data_integrity(document, signer, created)
+            attestation = sign_attestation_document(document, signer, created or _iso_now())
             self.add_attestation(attestation)
             signed.append(attestation)
         return signed
