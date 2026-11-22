@@ -8,11 +8,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Union
 
 from helix_sdk import HelixClient
 
 from .oauth import OAuthIssuerOptions
+
+if TYPE_CHECKING:  # pragma: no cover - a type only; the module imports the gate's errors
+    from .needs_authorization import NeedsAuthorization
 
 MCPToolCall = Dict[str, Any]
 """A dict with at least 'name' and 'input' keys, matching the JS
@@ -53,6 +56,11 @@ class MCPMiddlewareOptions:
     """Called when `audit_sink` raises. Audit failures never block a tool call."""
     service_did: Optional[str] = None
     """Included in audit events; defaults to `expected_target_service`."""
+    needs_authorization: Optional["NeedsAuthorization"] = None
+    """KYA-OS story L3-E: answers a call whose delegation is missing or does
+    not cover the tool's scopes with a signed `needs_authorization` challenge
+    (instead of the plain 403), and verifies the retry that carries the resume
+    token and the new delegation credential. See create_needs_authorization."""
 
 
 @dataclass
