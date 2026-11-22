@@ -17,13 +17,20 @@ must be recorded before the handler runs, so a failed intent answers
 ``audit_delivery_failed`` and the handler never runs; a terminal append that
 fails after the handler ran returns the result marked degraded
 (``_meta["org.kya-os/audit"] = {"status": "degraded", "reason": ...}`` with
-``isError``), the reference middleware's marker."""
+``isError``), the reference middleware's marker.
+
+``audit_tool_handlers`` (``auditToolHandlers``) wraps every tool a FastMCP
+server registers in ``async_run_audited_tool``. Python servers are usually
+built once, not per request, so the call defaults to the tool call
+``McpAuditTrail.begin_tool_call`` opened in the current context."""
 
 from __future__ import annotations
 
+import functools
 import inspect
 import json
-from typing import Any, Awaitable, Callable, Dict, Optional, Union
+import typing
+from typing import Any, Awaitable, Callable, Dict, Optional, TypeVar, Union
 
 from helix_sdk.audit import (
     AuditDeliverySink,
@@ -32,7 +39,7 @@ from helix_sdk.audit import (
     MemoryAuditOutbox,
 )
 
-from .audit import ToolCallAudit
+from .audit import ToolCallAudit, current_tool_call
 
 AUDIT_META_KEY = "org.kya-os/audit"
 """The ``_meta`` member the reference middleware reports audit status under."""
@@ -105,6 +112,71 @@ async def async_run_audited_tool(
     if not _record(call.completed, "terminal", on_audit_error):
         return mark_audit_degraded(result, TERMINAL_FAILED)  # type: ignore[arg-type]
     return result  # type: ignore[return-value]
+
+
+def _as_tool_result(value: Any) -> Dict[str, Any]:
+    """A tool function's return value as a tool result: a ``CallToolResult`` as
+    it is, text as one text block, anything else as its JSON text."""
+    dump = getattr(value, "model_dump", None)
+    if callable(dump) and type(value).__name__ == "CallToolResult":
+        return dump(by_alias=True, exclude_none=True, mode="json")
+    text = value if isinstance(value, str) else json.dumps(value)
+    return {"content": [{"type": "text", "text": text}]}
+
+
+_Server = TypeVar("_Server")
+
+
+def audit_tool_handlers(
+    server: _Server,
+    call: Optional[ToolCallAudit] = None,
+    on_audit_error: Optional[Callable[[BaseException, str], None]] = None,
+) -> _Server:
+    """Wraps every tool callback the FastMCP ``server`` registers from now on
+    (``@server.tool(...)`` and ``server.add_tool(...)``) in
+    ``async_run_audited_tool``, so the intent is recorded before the tool runs
+    and the completion after. ``call`` defaults to the current context's tool
+    call (``current_tool_call()``); with none, the tool runs unaudited. Call
+    it before the tools are registered. The wrapped tool answers a
+    ``CallToolResult`` (``audit_delivery_failed``, or the result marked
+    degraded, when delivery fails); its parameters, and so its input schema,
+    are the original function's."""
+    from mcp.types import CallToolResult  # the mcp extra (Python 3.10+)
+
+    def audited(fn: Callable[..., Any]) -> Callable[..., Any]:
+        hints = typing.get_type_hints(fn, include_extras=True)
+        signature = inspect.signature(fn)
+        resolved = signature.replace(
+            parameters=[parameter.replace(annotation=hints.get(name, parameter.annotation)) for name, parameter in signature.parameters.items()],
+            return_annotation=CallToolResult,
+        )
+
+        @functools.wraps(fn)
+        async def tool(*args: Any, **kwargs: Any) -> Any:
+            current = call if call is not None else current_tool_call()
+            if current is None:
+                value = fn(*args, **kwargs)
+                return await value if inspect.isawaitable(value) else value
+
+            async def handler() -> Dict[str, Any]:
+                value = fn(*args, **kwargs)
+                if inspect.isawaitable(value):
+                    value = await value
+                return _as_tool_result(value)
+
+            result = await async_run_audited_tool(current, handler, on_audit_error)
+            return CallToolResult.model_validate(result)
+
+        # FastMCP reads the parameters (resolved here, so string annotations
+        # need not resolve in this module) and passes a CallToolResult through.
+        tool.__signature__ = resolved  # type: ignore[attr-defined]
+        tool.__annotations__ = {**hints, "return": CallToolResult}
+        return tool
+
+    # FastMCP's @server.tool(...) registers through add_tool, so wrapping it covers both.
+    add_tool = server.add_tool  # type: ignore[attr-defined]
+    server.add_tool = lambda fn, *args, **kwargs: add_tool(audited(fn), *args, **kwargs)  # type: ignore[attr-defined]
+    return server
 
 
 def create_helix_audit_delivery(

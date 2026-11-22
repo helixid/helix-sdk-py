@@ -39,7 +39,10 @@ curl    "${H[@]}" -H 'authorization: Bearer demo-admin'  $MCP -d "$CALL"   # ref
 The variables are the JS sample's: `HELIX_API_URL` + `HELIX_API_KEY` + `SERVICE_DID` to verify agent VPs and write the
 audit log (typed KYA-OS audit events, one `session.established` / `tool.call.*` bracket per call plus the gate's
 decisions, with `delegation.verified` naming the presented agent credential; tool names are withheld unless
-`AUDIT_INCLUDE_TOOL_NAMES=1`; an audit write that fails fails the call with a 500); `OAUTH_ISSUER` (alone, or with `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` for opaque tokens) for one
+`AUDIT_INCLUDE_TOOL_NAMES=1`; a session that cannot be recorded fails the call with a 500, and under the default
+`AUDIT_DELIVERY=required` a tool whose intent cannot be recorded does not run and answers `audit_delivery_failed`,
+while one whose completion cannot be recorded is marked degraded; `AUDIT_DELIVERY=buffered` with `AUDIT_OUTBOX_DIR`,
+or `best-effort` with `AUDIT_ACCEPT_AAP1=1`, as in the JS sample); `OAUTH_ISSUER` (alone, or with `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` for opaque tokens) for one
 authorization server; `OAUTH_ISSUERS` for several, with the `entra`, `auth0`, `okta` and `keycloak` presets. See the
 docstring of [`__main__.py`](__main__.py) and the JS sample's README for the full table.
 
@@ -49,4 +52,6 @@ A small ASGI wrapper sits in front of the MCP SDK's Streamable HTTP app. For eac
 awaits `async_helixid_mcp_middleware` with the tool name, `params._meta` and the request headers; a denial becomes a
 401 / 400 / 403 through `to_http_error_response()`, an unreachable authorization server a 503, and anything else is
 handed, body intact, to the transport. `initialize` and `tools/list` are not gated. The tools
-([`orders.py`](orders.py)) contain no auth code.
+([`orders.py`](orders.py)) contain no auth or audit code: with an audit trail, `audit_tool_handlers(server)` wraps
+each one before it is registered, so it runs under the tool call `begin_tool_call` opened for the request (the JS
+sample's `auditToolHandlers`).

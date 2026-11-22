@@ -359,17 +359,17 @@ def test_batches_are_refused_before_the_gate_so_nothing_is_audited(app: App) -> 
     assert app.audit == []
 
 
-def test_a_transport_refusal_after_the_gate_is_a_failed_call(app: App) -> None:
+def test_a_transport_refusal_after_the_gate_records_no_tool_events(app: App) -> None:
     # The MCP transport wants `accept: application/json, text/event-stream`; without it the
-    # call was authorized but never ran, so it is recorded as failed, not completed.
+    # call was authorized but the tool never ran. The tool events come from the tool itself
+    # (audit_tool_handlers, as the JS sample's auditToolHandlers), so none are recorded.
     res = app.http.post(
         "/mcp",
         json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "lookup_order", "arguments": {"orderId": "ORD-1001"}}},
         headers={"content-type": "application/json", "accept": "text/plain", **bearer("reader")},
     )
     assert res.status_code == 406
-    assert app.event_types == ["session.established", "authorization.approved", "tool.call.started", "tool.call.failed"]
-    assert app.audit[-1]["reason"] == {"code": "handler_error"}
+    assert app.event_types == ["session.established", "authorization.approved"]
 
 
 def test_the_legacy_audit_sink_alone_still_receives_decisions() -> None:

@@ -19,8 +19,12 @@ by typed KYA-OS audit events: `session.established` before the gate, the
 gate's own decision events (`proof.verified`, `delegation.verified` for a
 HelixID VP, `authorization.approved` / `denied`), then `tool.call.started`
 and `tool.call.completed` / `tool.call.failed`, or `tool.call.denied` when
-the gate refused, all under one correlationId. An audit write that fails
-fails the call (a 500): a call that cannot be recorded does not run."""
+the gate refused, all under one correlationId. A session that cannot be
+recorded fails the call (a 500) before the gate. Each tool runs through
+``audit_tool_handlers`` (A-2, as the JS sample): under required delivery a
+tool whose intent cannot be recorded does not run and answers
+``audit_delivery_failed``, and an answer whose completion cannot be recorded
+is marked degraded (``_meta["org.kya-os/audit"]``)."""
 
 from __future__ import annotations
 
@@ -38,18 +42,15 @@ from starlette.responses import JSONResponse
 from helix_sdk import decode_helix_vp
 from helix_mcp_middleware import (
     AuthorizationServerUnavailableError,
-    audit_unavailable_response,
-    mark_audit_degraded,
     McpAuditTrail,
     MCPMiddlewareOptions,
     async_helixid_mcp_middleware,
+    audit_tool_handlers,
     build_protected_resource_metadata,
     extract_credential,
     protected_resource_metadata_url,
     to_http_error_response,
 )
-
-from helix_mcp_middleware.audit_delivery import TERMINAL_FAILED
 
 from .orders import TOOL_SCOPES, OrderStore, create_order_store, register_order_tools
 
@@ -100,6 +101,9 @@ def create_order_app(
             ],
         ),
     )
+    if audit is not None:
+        # A-2: each tool runs audited, under the tool call begin_tool_call opens per request.
+        audit_tool_handlers(server)
     register_order_tools(server, store if store is not None else create_order_store())
     mcp_app = server.streamable_http_app()
 
@@ -155,7 +159,7 @@ def create_order_app(
             return
 
         if not (isinstance(body, dict) and body.get("method") == "tools/call"):
-            await handle(scope, raw, receive, send, None)
+            await handle(scope, raw, receive, send)
             return
         params = body.get("params") if isinstance(body.get("params"), dict) else {}
         name = params.get("name")
@@ -185,7 +189,7 @@ def create_order_app(
                     if call_audit is not None:
                         call_audit.failed(_reason_code(error))
                     raise
-                await handle(scope, raw, receive, send, call_audit)
+                await handle(scope, raw, receive, send)
         except Exception as error:  # noqa: BLE001 - not the caller's fault: a 500 (or 503), reported
             if on_server_error is not None:
                 on_server_error(error)
@@ -202,15 +206,10 @@ def create_order_app(
             else:
                 await respond(500, {"error": "server_error"})
 
-    async def handle(scope: Any, raw: bytes, receive: Any, send: Any, call_audit: Any) -> None:
-        """Hands the request, body intact, to the MCP transport; with a tool
-        call's audit, `tool.call.started` first and `completed` on a 2xx
-        answer, else `failed`. Under required delivery (A-2) the tool does not
-        run when its intent cannot be recorded (`audit_delivery_failed`), and an
-        answer whose completion cannot be recorded is marked degraded
-        (`_meta["org.kya-os/audit"]`), so the answer is held until then."""
+    async def handle(scope: Any, raw: bytes, receive: Any, send: Any) -> None:
+        """Hands the request, body intact, to the MCP transport. A tool call's
+        audit events come from the tools themselves (audit_tool_handlers)."""
         replayed = False
-        messages: list = []
 
         async def replay() -> Any:
             nonlocal replayed
@@ -219,70 +218,9 @@ def create_order_app(
                 return {"type": "http.request", "body": raw, "more_body": False}
             return await receive()
 
-        async def capture(message: Any) -> None:
-            messages.append(message)
-
-        if call_audit is None:
-            await mcp_app(scope, replay, send)
-            return
-        if not _recorded(call_audit.started):
-            await _send_json(send, 200, {"jsonrpc": "2.0", "id": _rpc_id(raw), "result": audit_unavailable_response()})
-            return
-        try:
-            await mcp_app(scope, replay, capture)
-        except Exception:
-            _recorded(lambda: call_audit.failed("handler_error"))
-            raise
-        status = next((m["status"] for m in messages if m["type"] == "http.response.start"), None)
-        if status is not None and 200 <= status < 300:
-            if not _recorded(call_audit.completed):
-                messages = _degraded(messages)
-        else:
-            _recorded(lambda: call_audit.failed("handler_error"))
-        for message in messages:
-            await send(message)
+        await mcp_app(scope, replay, send)
 
     return app
-
-
-def _recorded(step: Callable[[], Any]) -> bool:
-    """One audit append: False when it raised or the trail swallowed a failure."""
-    try:
-        return step() is not None
-    except Exception:  # noqa: BLE001 - the caller answers for a failed append
-        return False
-
-
-def _rpc_id(raw: bytes) -> Any:
-    try:
-        message = json.loads(raw)
-    except ValueError:
-        return None
-    first = message[0] if isinstance(message, list) and message else message
-    return first.get("id") if isinstance(first, dict) else None
-
-
-async def _send_json(send: Any, status: int, body: Any) -> None:
-    payload = json.dumps(body).encode("utf-8")
-    await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(payload)).encode())]})
-    await send({"type": "http.response.body", "body": payload, "more_body": False})
-
-
-def _degraded(messages: list) -> list:
-    """The held answer with every tool result marked degraded: the completion was not recorded."""
-    start = next(m for m in messages if m["type"] == "http.response.start")
-    body = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
-    try:
-        answer = json.loads(body)
-    except ValueError:
-        return messages
-    replies = answer if isinstance(answer, list) else [answer]
-    for reply in replies:
-        if isinstance(reply, dict) and isinstance(reply.get("result"), dict):
-            reply["result"] = mark_audit_degraded(reply["result"], TERMINAL_FAILED)
-    payload = json.dumps(answer).encode("utf-8")
-    headers = [(k, v) for k, v in start.get("headers", []) if k.lower() != b"content-length"] + [(b"content-length", str(len(payload)).encode())]
-    return [{**start, "headers": headers}, {"type": "http.response.body", "body": payload, "more_body": False}]
 
 
 def _reason_code(error: BaseException) -> str:

@@ -46,6 +46,7 @@ from .audit import (
 from .audit_delivery import (
     AUDIT_META_KEY,
     async_run_audited_tool,
+    audit_tool_handlers,
     audit_unavailable_response,
     create_helix_audit_delivery,
     mark_audit_degraded,
@@ -74,6 +75,7 @@ from .types import AttachHelixVPOptions, MCPMiddlewareOptions, MCPToolCall
 __all__ = [
     "AUDIT_META_KEY",
     "async_run_audited_tool",
+    "audit_tool_handlers",
     "audit_unavailable_response",
     "create_helix_audit_delivery",
     "mark_audit_degraded",
