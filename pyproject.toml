@@ -50,6 +50,10 @@ all = [
     "crewai>=1.0; python_version >= '3.10'",
 ]
 
+[project.scripts]
+# KYA-OS story F-3: helix-custody init|activate|take
+helix-custody = "helix_sdk.custody:main"
+
 [project.urls]
 Homepage = "https://github.com/helixid/helix-sdk-py"
 Repository = "https://github.com/helixid/helix-sdk-py"

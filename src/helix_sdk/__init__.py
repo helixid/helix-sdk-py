@@ -70,9 +70,7 @@ from .keys import (
 from .agent_key import (
     DEFAULT_AGENT_KEY_ID,
     AgentKey,
-    AgentKeyRegistration,
     AgentPublicKeyJwk,
-    agent_key_registration,
     agent_public_key,
     assert_no_private_material,
     decode_base58btc,
@@ -124,6 +122,28 @@ from .entity_card import (
     same_did,
     server_card_meta,
     validate_entity_card,
+)
+
+# KYA-OS story F-3: custody preference. helix_init (self-custody onboarding),
+# HelixCustodialSigner (custodial agents sign through the API), the custody
+# API client; the agent runtime takes any Signer (a request proof: helix_sdk.verifier.sign_request_proof).
+from . import custody  # noqa: F401  (helix-sdk-js exports it as the `custody` namespace)
+from .custody import (
+    CustodyApiError,
+    CustodyLabel,
+    DidHostingMode,
+    EnvSigner,
+    HelixCustodialSigner,
+    HelixCustodyClient,
+    HelixInitResult,
+    KeyCustodyMode,
+    Signer,
+    activate_agent,
+    change_to_self_custody,
+    check_own_hosting,
+    helix_init,
+    rotation_proof,
+    verification_method_of,
 )
 
 # Errors
@@ -242,9 +262,7 @@ __all__ = [
     # KYA-OS story L1-A: the same names helix-sdk-js's index exports, Python style.
     "DEFAULT_AGENT_KEY_ID",
     "AgentKey",
-    "AgentKeyRegistration",
     "AgentPublicKeyJwk",
-    "agent_key_registration",
     "agent_public_key",
     "assert_no_private_material",
     "decode_base58btc",
@@ -262,6 +280,22 @@ __all__ = [
     "HelixError",
     "map_api_error",
     "codes",
+    "custody",
+    "CustodyApiError",
+    "CustodyLabel",
+    "DidHostingMode",
+    "EnvSigner",
+    "HelixCustodialSigner",
+    "HelixCustodyClient",
+    "HelixInitResult",
+    "KeyCustodyMode",
+    "Signer",
+    "activate_agent",
+    "change_to_self_custody",
+    "check_own_hosting",
+    "helix_init",
+    "rotation_proof",
+    "verification_method_of",
     # KYA-OS story C-A: Entity Cards (helix_sdk.entity_card).
     "ENTITY_TYPES",
     "KYA_OS_CARD_META_KEY",
