@@ -49,6 +49,7 @@ from .keys import (
 from .errors import (  # noqa: F401
     HelixError,
     InvalidJWSError,
+    ResponseProofError,
     map_api_error,
     ValidationError,
     InternalError,
@@ -143,4 +144,10 @@ __all__ = [
     "HelixError",
     "map_api_error",
     "codes",
+    "kyaos",
 ]
+
+# KYA-OS (story L2-A): canonical JSON hashing, EdDSA JWS and the Signer, the
+# session handshake and the client side of the detached response proof, as
+# one namespace like helix-sdk-js's `kyaos` export.
+from . import kyaos  # noqa: E402

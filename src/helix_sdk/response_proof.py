@@ -62,6 +62,10 @@ class ProofReasons:
 
 
 DidResolver = Callable[[str], Optional[Mapping[str, Any]]]
+"""A function from a DID to its document (or None). An object with a
+``resolve(did)`` method is accepted too, as helix-sdk-js accepts an
+IDidResolver: its answer may be the document itself or a DID resolution
+result carrying it as ``didDocument`` / ``did_document``."""
 
 _SHA256 = re.compile(r"^sha256:[a-f0-9]{64}$")
 _DID = re.compile(r"^did:[a-z0-9]+:.+$")
@@ -219,6 +223,23 @@ def read_response_proof(meta: Any) -> Optional[Dict[str, Any]]:
 # ── verification ──────────────────────────────────────────────────────────────
 
 
+def _as_did_resolver(source: Any) -> DidResolver:
+    if callable(source):
+        return source  # type: ignore[no-any-return]
+    resolve = getattr(source, "resolve", None)
+    if not callable(resolve):
+        raise TypeError("resolve_did must be a function or an object with resolve(did)")
+
+    def resolver(did: str) -> Optional[Mapping[str, Any]]:
+        answer = resolve(did)
+        if _is_record(answer) and ("didDocument" in answer or "did_document" in answer):
+            return answer.get("didDocument", answer.get("did_document"))
+        document = getattr(answer, "did_document", None) if not _is_record(answer) else None
+        return document if document is not None else answer
+
+    return resolver
+
+
 @dataclass
 class VerifiedProof:
     meta: Dict[str, Any]
@@ -253,7 +274,7 @@ def verify_detached_proof(
     if jwk is not None:
         verification = verify_jws(proof["jws"], jwk, expected_kid=meta["kid"], expected_did=meta["did"])
     else:
-        verification = verify_jws_by_kid(proof["jws"], resolve_did, expected_kid=meta["kid"], expected_did=meta["did"])  # type: ignore[arg-type]
+        verification = verify_jws_by_kid(proof["jws"], _as_did_resolver(resolve_did), expected_kid=meta["kid"], expected_did=meta["did"])
     if verification.payload_bytes.decode("utf-8", errors="replace") != proof_payload(meta):
         _refuse(ProofReasons.PAYLOAD_MISMATCH, "the signed payload is not the canonical form of the proof meta")
     now_seconds = int(time.time() if now is None else now)
