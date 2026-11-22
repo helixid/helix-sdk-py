@@ -16,6 +16,10 @@ HelixID, mirroring helix-sdk-js's mcp-middleware package.
 - create_local_verifier() (story F-2): the local verifier the gate runs, from
   the presented proof and chain, public DID documents, status lists and
   cards, a local replay store and local config. The Helix API is never asked.
+  Status lists are read proof first through a fail-closed revocation checker
+  and a StatusCache (story L3-C); RevocationSignalClient invalidates it on a
+  revocation SET (SSE, or RFC 8935 push), RedisStatusCacheStore shares it
+  between instances, create_resolution_fetch is the default fetch.
 - OAuth: OAuthIssuerOptions (one trusted issuer or a list), validated by
   JWKS, by RFC 7662 introspection, or with endpoints read from the issuer's
   metadata; presets entra(), auth0(), okta(), keycloak().
@@ -50,6 +54,23 @@ from .oauth import (
 from .providers import auth0, entra, keycloak, okta
 from .types import MCPMiddlewareOptions, MCPToolCall
 from .trusted_issuers import attestation_trust, is_trusted_issuer
+from .resolution_fetch import (
+    RESOLUTION_MAX_BYTES,
+    RESOLUTION_TIMEOUT_MS,
+    ResolutionRefusedError,
+    create_resolution_fetch,
+    is_public_unicast_address,
+    resolution_target,
+)
+from .revocation_signals import (
+    PushResponse,
+    RevocationSignalClient,
+    SignalOutcome,
+    SignalReport,
+    SseParser,
+    create_revocation_signal_client,
+)
+from .status_cache_store import RedisStatusCacheClient, RedisStatusCacheStore
 from .verify_locally import (
     KYA_OS_CARD_SERVICE_TYPE,
     LocalVerifier,
@@ -109,4 +130,18 @@ __all__ = [
     "card_endpoint_of",
     "resolution_url",
     "KYA_OS_CARD_SERVICE_TYPE",
+    "create_resolution_fetch",
+    "resolution_target",
+    "is_public_unicast_address",
+    "ResolutionRefusedError",
+    "RESOLUTION_MAX_BYTES",
+    "RESOLUTION_TIMEOUT_MS",
+    "RevocationSignalClient",
+    "SseParser",
+    "SignalReport",
+    "SignalOutcome",
+    "PushResponse",
+    "create_revocation_signal_client",
+    "RedisStatusCacheStore",
+    "RedisStatusCacheClient",
 ]

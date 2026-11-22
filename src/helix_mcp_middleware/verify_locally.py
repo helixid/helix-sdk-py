@@ -14,8 +14,16 @@ resolution only:
   this process only; story L2-A brings the middleware's shared stores);
 - DID documents over HTTPS (did:web) or offline (did:key), through an
   injected ``fetch`` where the host has one of its own;
-- status lists and Entity Cards over HTTPS, decoded here (story L3-C adds
-  the list's own proof check at this seam);
+- status lists over HTTPS, each list's own proof verified before any bit is
+  read, through a revocation checker that fails closed and a
+  :class:`helix_sdk.verifier.StatusCache` (story L3-C: ``status_cache_ttl``,
+  ``high_privilege_scopes`` held to at most 60 s, cached reads reported
+  ``fresh=False``), which a :class:`RevocationSignalClient` invalidates at once
+  on a revocation signal; in multi-instance mode the cache lives in the
+  shared Redis (:class:`RedisStatusCacheStore`);
+- Entity Cards over HTTPS, through the same fetch: by default
+  :func:`create_resolution_fetch` (https only, public IP literals only,
+  same-origin redirects, 5 s, 1 MiB);
 - ``trusted_issuers`` (default ``"*"``) and ``max_chain_length`` (default 10).
 
 The Helix API is never asked: a call verifies with the API down, and a
@@ -29,28 +37,29 @@ unrecorded.
 from __future__ import annotations
 
 import inspect
-import json
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 from urllib.parse import urlsplit, urlunsplit
-from urllib.request import Request, urlopen
 
 from helix_sdk.verifier import (
     MemoryNonceStore,
+    StatusCache,
     VerifierOptions,
     VerifierResult,
     VerifierSeams,
     create_did_keys_resolver,
     create_did_resolver,
-    decode_status_list_credential,
+    create_revocation_checker,
+    create_status_list_fetcher,
     read_carried_chain,
     read_request_proof,
     verify,
 )
 
 from .credentials import meta_mapping
+from .resolution_fetch import ResolverFetch, create_resolution_fetch, status_list_http_fetch
 
 KYA_OS_CARD_SERVICE_TYPE = "KyaOsEntityCard"
 
@@ -60,10 +69,6 @@ match the JS report: timestamp, serviceDid, toolName, agentDid, ok, level,
 proofAssurance, effectiveScopes, reasons, fresh, chainDepth."""
 
 ReportVerification = Callable[[VerificationReport], Any]
-
-ResolverFetch = Callable[[str], Any]
-"""How DID documents, status lists and cards are read: ``url -> parsed JSON``;
-raise when the URL does not answer with a document."""
 
 _LOOPBACK = ("127.0.0.1", "localhost", "::1")
 
@@ -94,7 +99,8 @@ class LocalVerifierOptions:
     nonce_store: Any = None
     """The replay store (``insert(nonce, agent_did, expires_at_ms) -> bool``); default in memory, this process only."""
     fetch: Optional[ResolverFetch] = None
-    """``url -> parsed JSON``; default an HTTP GET, ``https:`` only."""
+    """``url -> parsed JSON``: the host's SafeFetch (story C-A). Default: :func:`create_resolution_fetch`
+    (https only, public IP literals only, same-origin redirects, 5 s, 1 MiB)."""
     allow_loopback_http: bool = False
     """Development only: also read ``http:`` URLs on loopback hosts (a did:web on ``127.0.0.1``, say)."""
     resolve_did: Optional[Callable[[str], Any]] = None
@@ -102,7 +108,14 @@ class LocalVerifierOptions:
     resolve_did_keys: Optional[Callable[[str], Any]] = None
     """Default: every Ed25519 key the resolved document publishes."""
     fetch_status_list: Optional[Callable[[str], Any]] = None
-    """Default: fetch the list at its URL and decode it."""
+    """Default: fetch the list at its URL, verify its proof, then decode it (story L3-C)."""
+    check_revocation: Optional[Callable[..., Any]] = None
+    """The revocation seam; default: a checker over ``fetch_status_list`` with ``status_cache``."""
+    status_cache: Any = None
+    """A :class:`helix_sdk.verifier.StatusCache`, or a dict of its options (story L3-C point 6). Default: one in
+    memory with ``status_cache_ttl`` 300 s; pass ``store=RedisStatusCacheStore(...)`` to share it between instances."""
+    status_list_issuers: Optional[Mapping[str, Sequence[str]]] = None
+    """Issuer DID to the status-list URLs or ``https:`` origins bound to it (SPEC.md §6.6 keeper rules 1 and 2)."""
     cards: Optional[Mapping[str, Any]] = None
     """Entity Cards by agent DID, from local config, read before ``resolve_card``."""
     resolve_card: Optional[Callable[[str], Any]] = None
@@ -170,12 +183,6 @@ def unrecorded_reporter(log: Optional[Callable[[str], Any]] = None) -> ReportVer
     return report
 
 
-def _http_get_json(url: str) -> Any:
-    # The URL was already confined to https (or loopback http in development) by resolution_url.
-    with urlopen(Request(url, headers={"accept": "application/json"}), timeout=5) as response:  # noqa: S310
-        return json.loads(response.read().decode("utf-8"))
-
-
 class LocalVerifier:
     """Verifies tool calls in-process. Build it with :func:`create_local_verifier`."""
 
@@ -189,21 +196,39 @@ class LocalVerifier:
         self._clock = clock
         self.nonce_store = options.nonce_store if options.nonce_store is not None else MemoryNonceStore(now_ms=clock)
         allow = options.allow_loopback_http
-        do_fetch = options.fetch or _http_get_json
-
-        def fetch_json(url: str) -> Any:
-            target = resolution_url(url, allow)
-            if target is None:
-                raise ValueError(f"refusing to fetch {url}: only https: URLs are read")
-            return do_fetch(target)
+        host_fetch = options.fetch
+        if host_fetch is None:
+            fetch_json: ResolverFetch = create_resolution_fetch(allow_loopback_http=allow)
+        else:
+            # A host's own fetch (its SafeFetch) is held to the URL policy here; the default applies it itself.
+            def fetch_json(url: str) -> Any:
+                target = resolution_url(url, allow)
+                if target is None:
+                    raise ValueError(f"refusing to fetch {url}: only https: URLs are read")
+                return host_fetch(target)
 
         # A URL that is not read is refused inside fetch_json; the verifier reports the DID unresolved.
         resolve_did = options.resolve_did or create_did_resolver(fetch_json)
         resolve_did_keys = options.resolve_did_keys or create_did_keys_resolver(resolve_did)
 
-        def default_status_list(url: str) -> Any:
-            # Read live from its issuer; story L3-C adds the proof check and the cache that reports fresh=False.
-            return decode_status_list_credential(fetch_json(url), fresh=True)
+        # Every list's proof is verified, by its issuer's assertionMethod key, before any bit is read (story L3-C point 2).
+        fetch_status_list = options.fetch_status_list or create_status_list_fetcher(status_list_http_fetch(fetch_json), resolve_did)
+        # A cache the host built (duck-typed), else one from the options.
+        given = options.status_cache
+        if given is not None and callable(getattr(given, "invalidate", None)) and callable(getattr(given, "get_list", None)):
+            self.status_cache = given
+        else:
+            settings = {"clock": clock, **(dict(given) if given is not None else {})}
+            if options.max_clock_skew_ms is not None:
+                settings["max_clock_skew_ms"] = options.max_clock_skew_ms
+            self.status_cache = StatusCache(**settings)
+        check_revocation = options.check_revocation or create_revocation_checker(
+            fetch_status_list,
+            cache=self.status_cache,
+            max_clock_skew_ms=options.max_clock_skew_ms,
+            status_list_issuers={issuer: list(urls) for issuer, urls in options.status_list_issuers.items()} if options.status_list_issuers is not None else None,
+            trusted_root_issuer=options.resource_owner,
+        )
 
         def resolve_card(did: str) -> Any:
             configured = (options.cards or {}).get(did)
@@ -218,7 +243,8 @@ class LocalVerifier:
         self.seams = VerifierSeams(
             resolve_did=resolve_did,
             resolve_did_keys=resolve_did_keys,
-            fetch_status_list=options.fetch_status_list or default_status_list,
+            fetch_status_list=fetch_status_list,
+            check_revocation=check_revocation,
             resolve_card=resolve_card,
             nonce_store=self.nonce_store,
             clock=clock,

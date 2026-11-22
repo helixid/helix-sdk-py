@@ -22,6 +22,22 @@ Configuration (environment), the same as the JS sample:
                           the card is fetched from the agent's DID document)
   KYAOS_ALLOW_LOOPBACK_HTTP=1  development only: read DID documents, cards and status lists over
                           http on loopback hosts
+  Revocation (story L3-C): every status list's proof is verified before a bit is read; lists and
+  verdicts are cached (in KYAOS_REDIS_URL when set, shared by every instance, JS or Python):
+  KYAOS_STATUS_CACHE_TTL      seconds a list or verdict is cached (default 300)
+  KYAOS_HIGH_PRIVILEGE_SCOPES comma-separated scopes whose reads are cached at most
+  KYAOS_HIGH_PRIVILEGE_TTL      seconds (default 60, at most 60)
+  KYAOS_MAX_STALE_SECONDS     seconds a list may be served past its validUntil from the cache (default 60)
+  KYAOS_STATUS_LIST_ISSUERS   JSON object: issuer DID -> status-list URLs or https origins it keeps
+  KYAOS_SIGNAL_ISSUERS        comma-separated DIDs whose revocation signals (RFC 8417 SETs) are honoured;
+                              needed by either of:
+  KYAOS_REVOCATION_EVENTS_URL   Helix's SSE endpoint (<api>/v1/events/revocations): one outbound
+                                connection, reconnecting on drop
+  KYAOS_REVOCATION_WEBHOOK_PATH a path on this server that receives pushed SETs (RFC 8935)
+  KYAOS_VERIFICATION_LOG      1: print each verification (level, fresh, reasons) and each revocation signal
+                              as one JSON line; a file path: append them there as JSON lines instead
+  KYAOS_REDIS_URL             redis://host:port: the status cache shared by every instance; without it the
+                              cache is in memory and covers this instance only
   OAUTH_ISSUER          OAuth door, one authorization server. The issuer alone is enough: its keys are
                         read from its metadata (aud must be MCP_RESOURCE). Optional:
   OAUTH_JWKS_URI          its jwks_uri, to skip discovery
@@ -42,7 +58,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from typing import Any, Dict, List, NoReturn, Optional
+from typing import Any, Callable, Dict, List, NoReturn, Optional, Tuple
 
 import uvicorn
 
@@ -52,15 +68,35 @@ from helix_mcp_middleware import (
     MCPMiddlewareOptions,
     OAuthIntrospectionOptions,
     OAuthIssuerOptions,
+    RedisStatusCacheStore,
+    RevocationSignalClient,
+    SignalReport,
     auth0,
     create_helix_audit_sink,
+    create_local_verifier,
+    create_revocation_signal_client,
     entra,
     keycloak,
     okta,
 )
+from helix_sdk.verifier import StatusCache
 
 from .app import create_order_app
 from .orders import TOOL_SCOPES
+from .redis_client import RedisClient
+
+L3C_SETTINGS = (
+    "KYAOS_STATUS_CACHE_TTL",
+    "KYAOS_HIGH_PRIVILEGE_SCOPES",
+    "KYAOS_HIGH_PRIVILEGE_TTL",
+    "KYAOS_MAX_STALE_SECONDS",
+    "KYAOS_STATUS_LIST_ISSUERS",
+    "KYAOS_SIGNAL_ISSUERS",
+    "KYAOS_REVOCATION_EVENTS_URL",
+    "KYAOS_REVOCATION_WEBHOOK_PATH",
+    "KYAOS_VERIFICATION_LOG",
+    "KYAOS_REDIS_URL",
+)
 
 DEMO_TOKENS = {
     "demo-reader": AuthResult(sub="demo-reader", scopes=["orders:read"]),
@@ -203,6 +239,101 @@ def did_list(env: Dict[str, str], name: str) -> Optional[List[str]]:
     return dids
 
 
+def seconds_from_env(env: Dict[str, str], name: str, positive: bool = False) -> Optional[float]:
+    """A number of seconds from an optional variable: non-negative, or positive when ``positive``."""
+    raw = env.get(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if value != value or value in (float("inf"),) or value < 0 or (positive and value == 0):
+        fail(f"{name} must be a {'positive' if positive else 'non-negative'} number of seconds")
+    return value
+
+
+def json_object_from_env(env: Dict[str, str], name: str) -> Optional[Dict[str, Any]]:
+    raw = env.get(name)
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        fail(f"{name} is not valid JSON")
+    if not isinstance(parsed, dict):
+        fail(f"{name} must be a JSON object")
+    return parsed
+
+
+def event_logger(env: Dict[str, str]) -> Optional[Callable[[str, Dict[str, Any]], None]]:
+    """One JSON line per verification or signal: on stdout (KYAOS_VERIFICATION_LOG=1), or appended to the file it names."""
+    target = env.get("KYAOS_VERIFICATION_LOG") or None
+    if target is None:
+        return None
+
+    def log_event(kind: str, report: Dict[str, Any]) -> None:
+        if target == "1":
+            print(f"[kya-os] {kind} {json.dumps(report)}", flush=True)
+        else:
+            with open(target, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"kind": kind, **report}) + "\n")
+
+    return log_event
+
+
+def status_cache_from_env(env: Dict[str, str], redis: Optional[RedisClient]) -> StatusCache:
+    """The status cache (story L3-C point 6), shared through KYAOS_REDIS_URL when set."""
+    scopes = [scope.strip() for scope in (env.get("KYAOS_HIGH_PRIVILEGE_SCOPES") or "").split(",") if scope.strip()]
+    settings: Dict[str, Any] = {"high_privilege_scopes": scopes}
+    for name, key, positive in (
+        ("KYAOS_STATUS_CACHE_TTL", "status_cache_ttl", True),
+        ("KYAOS_HIGH_PRIVILEGE_TTL", "high_privilege_ttl", True),
+        ("KYAOS_MAX_STALE_SECONDS", "max_stale_seconds", False),
+    ):
+        value = seconds_from_env(env, name, positive)
+        if value is not None:
+            settings[key] = value
+    if redis is not None:
+        # Shared by every instance: one signal's delete is seen by all.
+        settings["store"] = RedisStatusCacheStore(redis)
+    try:
+        return StatusCache(**settings)
+    except ValueError as error:
+        fail(f"status cache: {error}")
+
+
+def revocation_signals_from_env(
+    env: Dict[str, str], verifier: Any, log_event: Optional[Callable[[str, Dict[str, Any]], None]]
+) -> Tuple[Optional[RevocationSignalClient], Optional[str]]:
+    """The revocation signal client (story L3-C point 7) and the webhook path, from the environment."""
+    events_url = env.get("KYAOS_REVOCATION_EVENTS_URL") or None
+    webhook_path = env.get("KYAOS_REVOCATION_WEBHOOK_PATH") or None
+    signal_issuers = did_list(env, "KYAOS_SIGNAL_ISSUERS")
+    if not events_url and not webhook_path:
+        if signal_issuers is not None:
+            fail("KYAOS_SIGNAL_ISSUERS needs KYAOS_REVOCATION_EVENTS_URL or KYAOS_REVOCATION_WEBHOOK_PATH")
+        return None, None
+    if signal_issuers is None:
+        fail("KYAOS_REVOCATION_EVENTS_URL / KYAOS_REVOCATION_WEBHOOK_PATH need KYAOS_SIGNAL_ISSUERS (the Helix issuer DID)")
+    if webhook_path is not None and not webhook_path.startswith("/"):
+        fail("KYAOS_REVOCATION_WEBHOOK_PATH must be a path")
+
+    def on_signal(report: SignalReport) -> None:
+        # Every signal, honoured or ignored, is one line: the sample's audit of the signal channel.
+        print(f"[kya-os] revocation-signal {json.dumps(report.to_dict())}", flush=True)
+        if log_event is not None:
+            log_event("revocation-signal", report.to_dict())
+
+    def on_connection_change(connected: bool, error: Optional[BaseException]) -> None:
+        print(f"[kya-os] revocation-events {'connected' if connected else 'disconnected'}{f': {error}' if error else ''}", flush=True)
+        if log_event is not None:
+            log_event("revocation-events", {"connected": connected, **({"error": str(error)} if error else {})})
+
+    client = create_revocation_signal_client(verifier, signal_issuers, events_url=events_url, on_signal=on_signal, on_connection_change=on_connection_change)
+    return client, webhook_path
+
+
 def verifier_from_env(env: Dict[str, str], service_did: str) -> LocalVerifierOptions:
     """The local verifier's settings (story F-2), the same variables as the JS sample."""
     max_chain_length: Optional[int] = None
@@ -223,6 +354,12 @@ def verifier_from_env(env: Dict[str, str], service_did: str) -> LocalVerifierOpt
         if not isinstance(cards, dict):
             fail("KYAOS_CARDS_FILE must hold a JSON object of agent DID to card")
     trusted = did_list(env, "KYAOS_TRUSTED_ISSUERS")
+    redis_url = env.get("KYAOS_REDIS_URL") or None
+    try:
+        redis = RedisClient(redis_url) if redis_url else None
+    except ValueError as error:
+        fail(f"KYAOS_REDIS_URL: {error}")
+    log_event = event_logger(env)
     return LocalVerifierOptions(
         service_did=service_did,
         trusted_issuers=trusted if trusted is not None else "*",
@@ -231,6 +368,9 @@ def verifier_from_env(env: Dict[str, str], service_did: str) -> LocalVerifierOpt
         cards=cards,
         allow_loopback_http=env.get("KYAOS_ALLOW_LOOPBACK_HTTP") == "1",
         catalog=list(dict.fromkeys(scope for scopes in TOOL_SCOPES.values() for scope in scopes)),
+        status_cache=status_cache_from_env(env, redis),
+        status_list_issuers=json_object_from_env(env, "KYAOS_STATUS_LIST_ISSUERS"),
+        report_verification=(lambda report: log_event("verification", report)) if log_event is not None else None,
         # Story A-1 connects the audit trail here; until then each verification is logged once as unrecorded.
         log=lambda message: print(message, file=sys.stderr),
     )
@@ -264,11 +404,15 @@ def main() -> None:
     if api_url and api_key:
         # The audit sink is the only thing that talks to the Helix API, and never on the request path.
         auth.audit_sink = create_helix_audit_sink(api_url, api_key, service_did=service_did or None)
+    signals: Optional[RevocationSignalClient] = None
+    webhook_path: Optional[str] = None
     if service_did:
         # The KYA-OS door (story F-2): every request proof is verified here, in-process.
-        auth.verifier = verifier_from_env(env, service_did)
-    elif any(env.get(name) for name in ("KYAOS_TRUSTED_ISSUERS", "KYAOS_TRUSTED_ROOTS", "KYAOS_MAX_CHAIN_LENGTH", "KYAOS_CARDS_FILE")):
-        fail("KYAOS_TRUSTED_ISSUERS / KYAOS_TRUSTED_ROOTS / KYAOS_MAX_CHAIN_LENGTH / KYAOS_CARDS_FILE need SERVICE_DID")
+        local = create_local_verifier(verifier_from_env(env, service_did))
+        auth.verifier = local
+        signals, webhook_path = revocation_signals_from_env(env, local, event_logger(env))
+    elif any(env.get(name) for name in ("KYAOS_TRUSTED_ISSUERS", "KYAOS_TRUSTED_ROOTS", "KYAOS_MAX_CHAIN_LENGTH", "KYAOS_CARDS_FILE", *L3C_SETTINGS)):
+        fail("KYAOS_TRUSTED_ISSUERS / KYAOS_TRUSTED_ROOTS / KYAOS_MAX_CHAIN_LENGTH / KYAOS_CARDS_FILE and the revocation settings need SERVICE_DID")
     if demo:
         def demo_token(token: str) -> AuthResult:
             if token not in DEMO_TOKENS:
@@ -287,6 +431,7 @@ def main() -> None:
             auth,
             authorization_servers=[i.issuer for i in issuers] or None,
             on_server_error=lambda error: print("server error:", repr(error), file=sys.stderr),
+            revocation_webhook=(webhook_path, signals.asgi_webhook()) if signals is not None and webhook_path else None,
         )
     except ValueError as error:
         fail(str(error))
@@ -302,9 +447,21 @@ def main() -> None:
             else "off (set SERVICE_DID)"
         )
     )
+    if verifier is not None:
+        channels = [f"SSE {signals.events_url}" if signals is not None and signals.events_url else "", f"webhook {webhook_path}" if webhook_path else ""]
+        cache = f"redis {env['KYAOS_REDIS_URL']}" if env.get("KYAOS_REDIS_URL") else "in memory"
+        print(f"  Revocation:  list proofs verified, cache {cache}, signals {' + '.join(c for c in channels if c) or 'off'}")
     print(f"  OAuth:       {'DEMO tokens demo-reader, demo-admin' if demo else ', '.join(i.issuer for i in issuers) or 'off'}")
     print(f"  Audit:       {api_url + '/v1/audit-log/events' if auth.audit_sink else 'off (set HELIX_API_URL + HELIX_API_KEY)'}")
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    sys.stdout.flush()
+    if signals is not None and signals.events_url:
+        signals.start()
+    try:
+        # uvicorn stops on SIGTERM / SIGINT; the signal stream closes with it.
+        uvicorn.run(app, host=host, port=port, log_level="warning")
+    finally:
+        if signals is not None:
+            signals.stop()
 
 
 if __name__ == "__main__":

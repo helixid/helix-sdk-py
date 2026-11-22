@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from mcp.server.fastmcp import FastMCP
@@ -46,10 +46,13 @@ def create_order_app(
     authorization_servers: Optional[Sequence[str]] = None,
     store: Optional[OrderStore] = None,
     on_server_error: Optional[Callable[[BaseException], None]] = None,
+    revocation_webhook: Optional[Tuple[str, Callable[[Any, Any, Any], Any]]] = None,
 ) -> Any:
     """An ASGI app. `resource` is this server's MCP endpoint URL (MCP is
     served at its path); `auth` is everything except the scopes, which this
-    sample fixes in TOOL_SCOPES."""
+    sample fixes in TOOL_SCOPES. `revocation_webhook` (KYA-OS story L3-C) is
+    `(path, asgi_app)`: the RFC 8935 receiver of Helix's revocation signals
+    (`RevocationSignalClient.asgi_webhook()`), mounted at `path`."""
     url = urlsplit(resource)
     if url.scheme not in ("http", "https") or not url.hostname:
         raise ValueError(f"resource must be an http(s) URL, got {resource!r}")
@@ -96,6 +99,9 @@ def create_order_app(
         path, method = scope["path"], scope["method"]
         if path == metadata_path and method == "GET":
             await respond(200, metadata)
+            return
+        if revocation_webhook is not None and path == revocation_webhook[0]:
+            await revocation_webhook[1](scope, receive, send)
             return
         if path != mcp_path:
             await respond(404, {"error": "not_found"})

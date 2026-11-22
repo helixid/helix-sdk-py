@@ -92,6 +92,35 @@ same results, which `tests/test_verifier.py` proves over the fixture set helix-c
 - `verify_revocation_signal` checks Helix's revocation SET (RFC 8417): a trusted issuer and its signature, one credential.
 - The conformance `status-list` category runs through these production readers, both list formats.
 
+`helix_mcp_middleware` uses them the way `@helixid/mcp-middleware` does:
+
+- `create_local_verifier` reads every list through `create_status_list_fetcher` and a fail-closed revocation checker,
+  and exposes `status_cache`. Options: `status_cache` (a `StatusCache`, or a dict of its options), `status_list_issuers`,
+  `check_revocation`. The default fetch is `create_resolution_fetch`: https only, a host written as an IP must be public
+  unicast, same-origin redirects, 5 s, 1 MiB. Pass your SafeFetch as `fetch` to pin the connection too.
+- `RedisStatusCacheStore` shares the cache between instances (any client with redis-py's `get`/`set(px=)`/`delete`/`incr`).
+- `RevocationSignalClient` / `create_revocation_signal_client(verifier, trusted_issuers, ...)` receive Helix's SETs:
+  over SSE by default (one outbound connection on a background thread, reconnecting with backoff and `Last-Event-ID`),
+  or pushed (RFC 8935) through `asgi_webhook()` or the framework-neutral `handle_push()` (202, or 400 `{err, description}`).
+  A valid SET calls `status_cache.invalidate(credential_id)`; a bad or foreign one is ignored and reported through
+  `on_signal`.
+
+```python
+from helix_mcp_middleware import RedisStatusCacheStore, create_local_verifier, create_revocation_signal_client
+
+verifier = create_local_verifier(
+    service_did="did:web:mcp.example.com",
+    status_cache={"store": RedisStatusCacheStore(redis.Redis()), "status_cache_ttl": 300, "high_privilege_scopes": ["orders:admin"]},
+)
+signals = create_revocation_signal_client(
+    verifier,
+    ["did:web:api.helixid.example"],  # the Helix issuer whose SETs are honoured
+    events_url="https://api.helixid.example/v1/events/revocations",
+    on_signal=lambda report: audit(report.to_dict()),
+)
+signals.start()  # or mount signals.asgi_webhook() at the URL registered with Helix
+```
+
 ## Packages in this repo
 
 - **`helix_sdk`** -- core SDK (see Quick example below).

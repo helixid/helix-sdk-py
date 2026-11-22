@@ -52,6 +52,7 @@ from .revocation import (
     revocation_checker_of,
 )
 from .revocation_signal import (
+    DEFAULT_SIGNAL_MAX_AGE_SECONDS,
     REVOCATION_EVENT_TYPE,
     SECEVENT_JWT_MEDIA_TYPE,
     SECEVENT_JWT_TYP,
@@ -84,7 +85,12 @@ from .status_cache import (
     VerdictKey,
 )
 from .status_list_reader import (
+    BITSTRING_LIST_CREDENTIAL_TYPE,
+    BITSTRING_LIST_SUBJECT_TYPE,
+    STATUS_LIST_2021_CREDENTIAL_TYPE,
+    STATUS_LIST_2021_SUBJECT_TYPE,
     StatusListError,
+    StatusListHttpFetch,
     create_status_list_fetcher,
     is_calendar_date_time,
     read_bitstring_status_list,
@@ -192,6 +198,12 @@ __all__ = [
     "verify_capability_attestation",
     "verify_detached_jws",
     "verify_revocation_signal",
+    "DEFAULT_SIGNAL_MAX_AGE_SECONDS",
+    "BITSTRING_LIST_CREDENTIAL_TYPE",
+    "BITSTRING_LIST_SUBJECT_TYPE",
+    "STATUS_LIST_2021_CREDENTIAL_TYPE",
+    "STATUS_LIST_2021_SUBJECT_TYPE",
+    "StatusListHttpFetch",
     "verify_status_list_proof",
     "window_problems",
 ]
