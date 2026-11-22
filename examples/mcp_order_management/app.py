@@ -16,9 +16,11 @@ once per tool call, not once per request.
 
 With an `audit` trail (McpAuditTrail), every gated tools/call is bracketed
 by typed KYA-OS audit events: `session.established` before the gate, the
-gate's own decision events, then `tool.call.started` and
-`tool.call.completed` / `tool.call.failed`, or `tool.call.denied` when the
-gate refused, all under one correlationId."""
+gate's own decision events (`proof.verified`, `delegation.verified` for a
+HelixID VP, `authorization.approved` / `denied`), then `tool.call.started`
+and `tool.call.completed` / `tool.call.failed`, or `tool.call.denied` when
+the gate refused, all under one correlationId. An audit write that fails
+fails the call (a 500): a call that cannot be recorded does not run."""
 
 from __future__ import annotations
 
@@ -33,6 +35,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 
+from helix_sdk import decode_helix_vp
 from helix_mcp_middleware import (
     AuthorizationServerUnavailableError,
     audit_unavailable_response,
@@ -41,6 +44,7 @@ from helix_mcp_middleware import (
     MCPMiddlewareOptions,
     async_helixid_mcp_middleware,
     build_protected_resource_metadata,
+    extract_credential,
     protected_resource_metadata_url,
     to_http_error_response,
 )
@@ -99,10 +103,17 @@ def create_order_app(
     register_order_tools(server, store if store is not None else create_order_store())
     mcp_app = server.streamable_http_app()
 
-    async def app(scope: Any, receive: Any, send: Any) -> None:
+    async def app(scope: Any, receive: Any, raw_send: Any) -> None:
         if scope["type"] != "http":  # lifespan: the MCP session manager starts and stops with the app
-            await mcp_app(scope, receive, send)
+            await mcp_app(scope, receive, raw_send)
             return
+        started = False
+
+        async def send(message: Any) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await raw_send(message)
 
         async def respond(status: int, body: Any, headers: Optional[dict] = None) -> None:
             await JSONResponse(body, status_code=status, headers=headers)(scope, receive, send)
@@ -148,40 +159,48 @@ def create_order_app(
             return
         params = body.get("params") if isinstance(body.get("params"), dict) else {}
         name = params.get("name")
-        audit_scope = audit.begin_tool_call(name if isinstance(name, str) else None) if audit is not None else nullcontext()
-        with audit_scope as call_audit:
-            try:
-                await gate({
-                    "name": name,
-                    "input": params.get("arguments") if isinstance(params.get("arguments"), dict) else {},
-                    "_meta": params.get("_meta") if isinstance(params.get("_meta"), dict) else None,
-                    "headers": Headers(scope=scope),
-                })
-            except Exception as error:  # noqa: BLE001
-                denial = to_http_error_response(error, metadata_url)
-                if denial is not None:
+        meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else None
+        headers = Headers(scope=scope)
+        try:
+            audit_scope = (
+                audit.begin_tool_call(name if isinstance(name, str) else None, credential=_presented_vp(headers, meta))
+                if audit is not None
+                else nullcontext()
+            )
+            with audit_scope as call_audit:
+                try:
+                    await gate({
+                        "name": name,
+                        "input": params.get("arguments") if isinstance(params.get("arguments"), dict) else {},
+                        "_meta": meta,
+                        "headers": headers,
+                    })
+                except Exception as error:  # noqa: BLE001
+                    denial = to_http_error_response(error, metadata_url)
+                    if denial is not None:
+                        if call_audit is not None:
+                            call_audit.denied(_reason_code(error))
+                        await respond(denial.status, denial.body, {"www-authenticate": denial.headers["WWW-Authenticate"]})
+                        return
                     if call_audit is not None:
-                        call_audit.denied(_reason_code(error))
-                    await respond(denial.status, denial.body, {"www-authenticate": denial.headers["WWW-Authenticate"]})
-                    return
-                if on_server_error is not None:
-                    on_server_error(error)
-                if isinstance(error, AuthorizationServerUnavailableError):
-                    # The caller's token was not shown to be bad; its authorization
-                    # server could not be asked. Say so, and invite a retry.
-                    if call_audit is not None:
-                        call_audit.failed("authorization_server_unavailable")
-                    await respond(
-                        503,
-                        {"error": "temporarily_unavailable", "error_description": "The authorization server could not be reached"},
-                        {"retry-after": "5"},
-                    )
-                else:
-                    if call_audit is not None:
-                        call_audit.failed("server_error")
-                    await respond(500, {"error": "server_error"})
+                        call_audit.failed(_reason_code(error))
+                    raise
+                await handle(scope, raw, receive, send, call_audit)
+        except Exception as error:  # noqa: BLE001 - not the caller's fault: a 500 (or 503), reported
+            if on_server_error is not None:
+                on_server_error(error)
+            if started:
                 return
-            await handle(scope, raw, receive, send, call_audit)
+            if isinstance(error, AuthorizationServerUnavailableError):
+                # The caller's token was not shown to be bad; its authorization
+                # server could not be asked. Say so, and invite a retry.
+                await respond(
+                    503,
+                    {"error": "temporarily_unavailable", "error_description": "The authorization server could not be reached"},
+                    {"retry-after": "5"},
+                )
+            else:
+                await respond(500, {"error": "server_error"})
 
     async def handle(scope: Any, raw: bytes, receive: Any, send: Any, call_audit: Any) -> None:
         """Hands the request, body intact, to the MCP transport; with a tool
@@ -267,6 +286,17 @@ def _degraded(messages: list) -> list:
 
 
 def _reason_code(error: BaseException) -> str:
-    """The gate's verdict as a reason code (never its message): the error's wire code, lower-cased."""
+    """The code a refused or failed call is audited with: the error's code (never its message), lower-cased, else `server_error`."""
     code = getattr(error, "code", None)
-    return code.lower() if isinstance(code, str) and code else "request_denied"
+    return code.lower() if isinstance(code, str) and code else "server_error"
+
+
+def _presented_vp(headers: Any, meta: Optional[dict]) -> Optional[dict]:
+    """The HelixID VP a tool call presents, decoded, so the audit trail can
+    derive the delegation evidence (SPEC section 7.8). None when there is none
+    or it does not decode: the gate, not this, answers a bad credential."""
+    try:
+        credential = extract_credential(headers, meta)
+        return decode_helix_vp(credential.value) if credential is not None and credential.kind == "vp" else None
+    except Exception:  # noqa: BLE001
+        return None

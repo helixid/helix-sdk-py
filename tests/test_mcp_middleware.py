@@ -32,6 +32,8 @@ from helix_sdk.audit import (
     AuditTrailEntry,
     MemoryAuditSink,
     audit_event_digest,
+    credential_digest,
+    delegation_chain_digests,
     keyed_commitment_value,
     pairwise_did,
     public_did,
@@ -54,6 +56,7 @@ from helix_mcp_middleware import (
     create_helix_audit_sink,
     create_mcp_audit_trail,
     current_tool_call,
+    delegation_evidence_of,
     create_introspection_validator,
     create_jwt_validator,
     create_oauth_validator,
@@ -695,6 +698,22 @@ class TestHttp:
 # ── audit ────────────────────────────────────────────────────────────────────
 
 
+def posted(call: Dict[str, Any]) -> Any:
+    """The JSON body of a recorded POST (the reporter sends the canonical event text)."""
+    return json.loads(call["data"].decode("utf-8"))
+
+
+def _agent_vc(vc_id: str) -> Dict[str, Any]:
+    """An agent credential signed the way SPEC section 7.8 reads it (proofValue is base64)."""
+    return {
+        "id": vc_id,
+        "type": ["VerifiableCredential", "HelixAgentCredential"],
+        "issuer": "did:web:issuer.example",
+        "credentialSubject": {"id": "did:key:a"},
+        "proof": {"type": "Ed25519Signature2020", "proofValue": "AQIDBA=="},
+    }
+
+
 class TestAudit:
     def test_events_for_vp_callers(self) -> None:
         events: List[Dict[str, Any]] = []
@@ -724,6 +743,37 @@ class TestAudit:
         assert mw({"name": "t", "_meta": {"x-helix-vp": VP}})
         assert len(events) == 1 and str(errors[0]) == "sink down"
 
+    # -- create_helix_audit_reporter (JS: createHelixAuditReporter) -------------
+
+    def test_reporter_posts_the_canonical_event_text_with_the_bearer_key(self) -> None:
+        http = FakeHttp({"http://api.test/v1/audit-log/events": {}})
+        reporter = create_helix_audit_reporter("http://api.test/", "hak", timeout_seconds=2.5, http=http)
+        trail = AuditTrail(sink=reporter, source_id="s", producer=pairwise_did("did:web:svc"), tenant_ref=pairwise_did("did:web:svc"))
+        entry = trail.record({"eventType": "session.established", "action": {"category": "session"}, "outcome": "succeeded", "details": {"family": "session", "phase": "established"}})
+        assert http.calls == [{
+            "method": "POST",
+            "url": "http://api.test/v1/audit-log/events",
+            "data": entry.canonical.encode("utf-8"),
+            "headers": {"content-type": "application/json", "authorization": "Bearer hak"},
+            "timeout": 2.5,
+        }]
+        assert posted(http.calls[0]) == entry.event
+
+    def test_reporter_raises_on_a_non_2xx_answer(self) -> None:
+        entry = AuditTrailEntry(event={"eventType": "x"}, canonical="{}", event_digest="sha256:" + "0" * 64)
+        with pytest.raises(RuntimeError, match="responded 500"):
+            create_helix_audit_reporter("http://api.test", "hak", http=FakeHttp({"http://api.test/v1/audit-log/events": Response({}, 500)})).append(entry)
+
+    def test_reporter_uses_requests_and_a_5_s_timeout_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import requests
+
+        calls: List[Dict[str, Any]] = []
+        monkeypatch.setattr(requests, "post", lambda url, **kw: calls.append({"url": url, **kw}) or Response({}, 201))
+        create_helix_audit_reporter("http://api.test", "hak").append(AuditTrailEntry(event={"eventType": "x"}, canonical='{"eventType":"x"}', event_digest="sha256:" + "0" * 64))
+        assert calls[0]["url"] == "http://api.test/v1/audit-log/events" and calls[0]["data"] == b'{"eventType":"x"}' and calls[0]["timeout"] == 5.0
+
+    # -- create_helix_audit_sink (JS: createHelixAuditSink) ---------------------
+
     def test_helix_audit_sink_posts_typed_events(self) -> None:
         http = FakeHttp({"http://api.test/v1/audit-log/events": {}})
         sink = create_helix_audit_sink("http://api.test/", "hak_1", service_did="did:web:svc", http=http)
@@ -731,11 +781,11 @@ class TestAudit:
         assert len(http.calls) == 1
         call = http.calls[0]
         assert call["headers"]["authorization"] == "Bearer hak_1" and call["timeout"] == 5.0
-        event = call["json"]
+        event = posted(call)
         assert validate_audit_event(event) == (True, event)
         assert event["eventType"] == "authorization.denied" and event["outcome"] == "denied"
         assert event["binding"] == AUDIT_BINDING_MCP
-        assert event["source"] == {"producer": {"kind": "pairwise_did", "did": "did:web:svc"}, "sourceId": "helix-mcp-middleware:did:web:svc", "sourceSequence": "1"}
+        assert event["source"] == {"producer": {"kind": "pairwise_did", "did": "did:web:svc"}, "sourceId": "mcp-middleware:did:web:svc", "sourceSequence": "1"}
         assert event["resource"] == {"kind": "public_did", "did": "did:web:svc"}
         assert event["actor"]["kind"] == "keyed_commitment" and event["actor"]["keyId"] == "oauth-subject-v1"
         assert event["reason"] == {"code": "insufficient_scope"}
@@ -746,149 +796,312 @@ class TestAudit:
 
         # A HelixID VP caller: proof.verified then authorization.approved, chained by the trail.
         sink({"event": "AUTHZ_GRANTED", "result": "allowed", "timestamp": "t", "authMethod": "helixvp", "effectiveScopes": ["read"], "agentDid": "did:key:agent", "vpId": "vp:1", "toolName": "q"})
-        assert [c["json"]["eventType"] for c in http.calls] == ["authorization.denied", "proof.verified", "authorization.approved"]
-        assert [c["json"]["source"]["sourceSequence"] for c in http.calls] == ["1", "2", "3"]
-        assert http.calls[2]["json"]["source"]["previousSourceEventDigest"] == audit_event_digest(http.calls[1]["json"])
-        assert http.calls[1]["json"]["actor"] == {"kind": "pairwise_did", "did": "did:key:agent"}
-        assert http.calls[1]["json"]["details"] == {"family": "proof", "phase": "verified", "verificationCode": "VP_VERIFIED"}
+        events = [posted(c) for c in http.calls]
+        assert [e["eventType"] for e in events] == ["authorization.denied", "proof.verified", "authorization.approved"]
+        assert [e["source"]["sourceSequence"] for e in events] == ["1", "2", "3"]
+        assert events[2]["source"]["previousSourceEventDigest"] == audit_event_digest(events[1])
+        assert events[1]["actor"] == {"kind": "pairwise_did", "did": "did:key:agent"}
+        assert events[1]["details"] == {"family": "proof", "phase": "verified", "verificationCode": "VP_VERIFIED"}
 
-        with pytest.raises(ValueError, match="service_did"):
-            create_helix_audit_sink("http://api.test", "k", http=http)
-        with pytest.raises(RuntimeError, match="responded 404"):
-            create_helix_audit_sink("http://api.test", "k", service_did="did:web:d", http=FakeHttp())({"event": "AUTHZ_GRANTED", "result": "allowed", "timestamp": "t", "authMethod": "oauth", "oauthSubject": "s", "effectiveScopes": []})
-
-    def test_include_tool_names_and_source_id(self) -> None:
+    def test_helix_audit_sink_passes_source_id_and_include_tool_names_through(self) -> None:
         http = FakeHttp({"http://api.test/v1/audit-log/events": {}})
         sink = create_helix_audit_sink("http://api.test", "k", service_did="did:web:svc", http=http, source_id="srv-1", include_tool_names=True)
         sink({"event": "AUTHZ_GRANTED", "result": "allowed", "timestamp": "t", "authMethod": "oauth", "oauthSubject": "s", "effectiveScopes": [], "toolName": "refund"})
-        event = http.calls[0]["json"]
+        event = posted(http.calls[0])
         assert event["action"] == {"category": "authorization", "name": "refund"} and event["source"]["sourceId"] == "srv-1"
 
-    def test_gate_decisions_become_typed_events(self) -> None:
+    def test_helix_audit_sink_lets_a_failed_post_propagate_and_needs_the_server_did(self) -> None:
+        with pytest.raises(ValueError, match="service_did"):
+            create_helix_audit_sink("http://api.test", "k", http=FakeHttp())
+        with pytest.raises(RuntimeError, match="responded 404"):
+            create_helix_audit_sink("http://api.test", "k", service_did="did:web:d", http=FakeHttp())({"event": "AUTHZ_GRANTED", "result": "allowed", "timestamp": "t", "authMethod": "oauth", "oauthSubject": "s", "effectiveScopes": []})
+
+    # -- create_mcp_audit_trail (JS: createMcpAuditTrail) ------------------------
+
+    def test_trail_needs_a_server_did_or_a_producer(self) -> None:
+        with pytest.raises(ValueError, match="service_did"):
+            create_mcp_audit_trail(MemoryAuditSink())
+        assert create_mcp_audit_trail(MemoryAuditSink(), producer=public_did("did:web:p")).service_did is None
+
+    def test_trail_defaults(self) -> None:
+        memory = MemoryAuditSink()
+        audit = create_mcp_audit_trail(memory, "did:web:svc")
+        assert isinstance(audit, McpAuditTrail) and audit.service_did == "did:web:svc" and audit.include_tool_names is False
+        event = audit.session("established", True).event
+        assert event["source"]["producer"] == pairwise_did("did:web:svc") and event["source"]["sourceId"] == "mcp-middleware:did:web:svc"
+        assert event["tenantRef"] == pairwise_did("did:web:svc") and event["binding"] == AUDIT_BINDING_MCP
+        assert event["resource"] == public_did("did:web:svc")
+        assert event["eventId"].startswith("audit_")
+
+    def test_trail_takes_producer_tenant_source_clock_and_ids_and_has_no_resource_without_a_server_did(self) -> None:
+        memory = MemoryAuditSink()
+        ids = iter(["e-1", "e-2"])
+        audit = create_mcp_audit_trail(
+            memory,
+            producer=public_did("did:web:p"),
+            tenant_ref=public_did("did:web:t"),
+            source_id="src",
+            clock=lambda: 1750000000000,
+            new_event_id=lambda: next(ids),
+        )
+        event = audit.session("established", True).event
+        assert event["source"] == {"producer": public_did("did:web:p"), "sourceId": "src", "sourceSequence": "1"}
+        assert event["tenantRef"] == public_did("did:web:t") and event["occurredAt"] == 1750000000000 and event["eventId"] == "e-1"
+        assert "resource" not in event
+        assert create_mcp_audit_trail(MemoryAuditSink(), producer=public_did("did:web:p")).session("established", True).event["source"]["sourceId"] == "mcp-middleware:server"
+
+    # -- McpAuditTrail events -----------------------------------------------------
+
+    def test_session_an_expired_session_failed_a_rejected_one_was_denied(self) -> None:
+        audit = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc")
+        assert audit.session("expired", False).event["outcome"] == "failed"
+        rejected = audit.session("rejected", False, reason_code="replay").event
+        assert rejected["outcome"] == "denied" and rejected["reason"] == {"code": "replay"}
+        assert rejected["details"] == {"family": "session", "phase": "rejected", "reasonCode": "replay"}
+        assert audit.session("replay_rejected", False).event["outcome"] == "denied"
+
+    def test_proof_digest_verification_code_and_reason(self) -> None:
+        audit = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc")
+        event = audit.proof("rejected", "failed", proof_digest="sha256:" + "a" * 64, verification_code="VP_EXPIRED", reason_code="vp_expired").event
+        assert event["eventType"] == "proof.rejected" and event["action"] == {"category": "proof"} and event["outcome"] == "failed"
+        assert event["details"] == {"family": "proof", "phase": "rejected", "proofDigest": "sha256:" + "a" * 64, "verificationCode": "VP_EXPIRED"}
+        assert event["reason"] == {"code": "vp_expired"}
+        assert audit.proof("generated", "succeeded").event["details"] == {"family": "proof", "phase": "generated"}
+
+    def test_delegation_reference_parent_and_reason(self) -> None:
+        audit = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc")
+        event = audit.delegation("rejected", "urn:uuid:d", "denied", reason_code="chain_broken", parent_ref="urn:uuid:p").event
+        assert event["details"] == {"family": "delegation", "phase": "rejected", "delegationRef": "urn:uuid:d", "parentRef": "urn:uuid:p"}
+        assert event["reason"] == {"code": "chain_broken"} and event["action"] == {"category": "delegation"}
+        assert audit.delegation("issued", "urn:uuid:e", "succeeded").event["details"] == {"family": "delegation", "phase": "issued", "delegationRef": "urn:uuid:e"}
+
+    def test_authorization_every_phase_grant_used_the_grant_reference_and_the_tool_name_policy(self) -> None:
+        withheld = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc")
+        named = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc", include_tool_names=True)
+        for phase in ("evaluated", "approved", "denied", "step_up_required"):
+            assert withheld.authorization(phase, "succeeded").event["eventType"] == f"authorization.{phase}"
+        used = withheld.authorization("grant_used", "succeeded", grant_ref="vc:grant-1", tool_name="refund").event
+        assert used["eventType"] == "grant.used" and used["details"] == {"family": "authorization", "phase": "grant_used", "grantRef": "vc:grant-1"}
+        assert used["action"] == {"category": "authorization"}
+        assert named.authorization("approved", "succeeded", tool_name="refund").event["action"] == {"category": "authorization", "name": "refund"}
+        challenged = withheld.authorization("step_up_required", "challenged", reason_code="mfa").event
+        assert challenged["reason"] == {"code": "mfa"} and challenged["outcome"] == "challenged"
+
+    def test_tool_attempt_defaults_to_1_reason_and_the_tool_name_policy(self) -> None:
+        withheld = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc")
+        named = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc", include_tool_names=True)
+        assert withheld.tool("started", "unknown", tool_name="refund").event["details"] == {"family": "tool", "phase": "started", "attempt": "1"}
+        failed = withheld.tool("failed", "failed", tool_name="refund", attempt="2", reason_code="handler_error").event
+        assert failed["details"] == {"family": "tool", "phase": "failed", "attempt": "2"} and failed["reason"] == {"code": "handler_error"}
+        assert failed["action"] == {"category": "tool.call"}
+        assert named.tool("completed", "succeeded", tool_name="refund").event["action"] == {"category": "tool.call", "name": "refund"}
+
+    def test_copies_the_context_onto_the_event(self) -> None:
+        audit = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc")
+        context = {
+            "actor": pairwise_did("did:key:a"),
+            "responsibleParty": public_did("did:key:user"),
+            "correlationId": "c",
+            "causationId": "k",
+            "authorization": {"source": "policy", "decision": "allowed"},
+            "ignored": 1,
+        }
+        event = audit.session("established", True, context=context).event
+        assert event["actor"] == pairwise_did("did:key:a") and event["responsibleParty"] == public_did("did:key:user")
+        assert event["correlationId"] == "c" and event["causationId"] == "k"
+        assert event["authorization"] == {"source": "policy", "decision": "allowed"}
+        assert "ignored" not in event
+        with pytest.raises(AuditEventInvalidError):  # errors propagate: a call that cannot be recorded does not run
+            audit.tool("started", "unknown", attempt="x")
+        # Python only: on_error takes the failure instead, and the method returns None.
+        errors: List[BaseException] = []
+        reporting = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc", on_error=errors.append)
+        assert reporting.on_error is not None and reporting.tool("started", "unknown", attempt="x") is None
+        assert isinstance(errors[0], AuditEventInvalidError)
+
+    def test_commits_an_oauth_subject_under_the_trail_key(self) -> None:
+        def trail(key: Any = None) -> McpAuditTrail:
+            return create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc", oauth_subject_key=key)
+
+        fixed = trail(b"k" * 32)
+        assert fixed.oauth_actor("alice") == fixed.oauth_actor("alice") == trail(bytearray(b"k" * 32)).oauth_actor("alice")
+        assert fixed.oauth_actor("alice") != fixed.oauth_actor("bob")
+        assert fixed.oauth_actor("alice") != trail().oauth_actor("alice")  # a random key per trail
+        assert fixed.oauth_actor("alice") == {"kind": "keyed_commitment", "value": keyed_commitment_value(b"k" * 32, "alice"), "keyId": OAUTH_SUBJECT_KEY_ID}
+
+    # -- McpAuditTrail.tool_audit_sink (JS: toolAuditSink) ------------------------
+
+    def test_sink_a_helixid_caller_allowed(self) -> None:
+        memory = MemoryAuditSink()
+        sink = create_mcp_audit_trail(memory, "did:web:svc").tool_audit_sink()
+        sink({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "helixvp", "agentDid": "did:key:a", "effectiveScopes": ["read"], "toolName": "q"})
+        proof, approved = memory.events
+        assert memory.event_types == ["proof.verified", "authorization.approved"]
+        assert proof["actor"] == approved["actor"] == pairwise_did("did:key:a")
+        assert "authorization" not in proof and proof["details"] == {"family": "proof", "phase": "verified", "verificationCode": "VP_VERIFIED"}
+        assert approved["authorization"] == {"source": "delegation", "decision": "allowed"} and approved["outcome"] == "succeeded"
+
+    def test_sink_records_delegation_verified_when_the_decision_carries_the_presented_credential(self) -> None:
+        memory = MemoryAuditSink()
+        sink = create_mcp_audit_trail(memory, "did:web:svc").tool_audit_sink()
+        delegation = {"delegationRef": "urn:uuid:d", "delegationCredentialDigest": "sha256:" + "a" * 64, "delegationChainDigests": ["sha256:" + "a" * 64], "ignored": None}
+        sink({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "helixvp", "agentDid": "did:key:a", "effectiveScopes": [], "delegation": delegation})
+        proof, verified, approved = memory.events
+        expected = {"source": "delegation", "decision": "allowed", "delegationRef": "urn:uuid:d", "delegationCredentialDigest": "sha256:" + "a" * 64, "delegationChainDigests": ["sha256:" + "a" * 64]}
+        assert memory.event_types == ["proof.verified", "delegation.verified", "authorization.approved"]
+        assert proof["authorization"] == verified["authorization"] == approved["authorization"] == expected
+        assert verified["details"] == {"family": "delegation", "phase": "verified", "delegationRef": "urn:uuid:d"}
+
+    def test_sink_names_an_id_less_presented_credential_unknown(self) -> None:
+        memory = MemoryAuditSink()
+        create_mcp_audit_trail(memory, "did:web:svc").tool_audit_sink()({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "helixvp", "effectiveScopes": [], "delegation": {}})
+        assert memory.events[1]["details"]["delegationRef"] == "unknown"
+        assert memory.events[1]["authorization"] == {"source": "delegation", "decision": "allowed"}
+
+    def test_sink_a_helixid_caller_denied(self) -> None:
+        memory = MemoryAuditSink()
+        sink = create_mcp_audit_trail(memory, "did:web:svc").tool_audit_sink()
+        sink({"event": "AUTHZ_DENIED", "result": "denied", "authMethod": "helixvp", "agentDid": "did:key:a", "effectiveScopes": [], "requiredScope": "write"})
+        sink({"event": "AUTHZ_DENIED", "result": "denied", "authMethod": "helixvp", "agentDid": "did:key:a", "effectiveScopes": [], "delegation": {"delegationRef": "urn:uuid:d"}})
+        events = memory.events
+        assert memory.event_types == ["proof.verified", "authorization.denied", "proof.verified", "delegation.verified", "authorization.denied"]
+        assert events[1]["reason"] == {"code": "insufficient_scope"} and events[1]["authorization"] == {"source": "delegation", "decision": "denied", "scopeId": "write"}
+        assert events[4]["reason"] == {"code": "tool_not_permitted"} and events[4]["authorization"] == {"source": "delegation", "decision": "denied", "delegationRef": "urn:uuid:d"}
+        sink({"event": "AUTHZ_DENIED", "result": "denied", "authMethod": "helixvp", "agentDid": "did:key:a", "effectiveScopes": [], "requiredScope": "write", "delegation": {"delegationRef": "urn:uuid:d"}})
+        assert memory.events[-1]["authorization"] == {"source": "delegation", "decision": "denied", "scopeId": "write", "delegationRef": "urn:uuid:d"}
+
+    def test_sink_an_oauth_caller(self) -> None:
+        memory = MemoryAuditSink()
+        audit = create_mcp_audit_trail(memory, "did:web:svc", oauth_subject_key=b"k" * 32)
+        audit.tool_audit_sink()({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "oauth", "oauthSubject": "u-1", "effectiveScopes": ["read"]})
+        assert memory.event_types == ["authorization.approved"]
+        event = memory.events[0]
+        assert event["actor"] == audit.oauth_actor("u-1") and event["authorization"] == {"source": "policy", "decision": "allowed"}
+        assert "u-1" not in json.dumps(event)
+
+    def test_sink_handles_odd_shapes_and_no_named_caller(self) -> None:
+        memory = MemoryAuditSink()
+        sink = create_mcp_audit_trail(memory, "did:web:svc").tool_audit_sink()
+        sink({"event": "AUTHZ_DENIED", "result": "denied", "authMethod": "oauth", "effectiveScopes": [], "toolName": 5, "requiredScope": 7, "delegation": "not-a-dict"})
+        sink({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "helixvp", "effectiveScopes": [], "correlationId": "given"})
+        events = memory.events
+        assert "actor" not in events[0] and events[0]["reason"] == {"code": "tool_not_permitted"} and events[0]["authorization"] == {"source": "policy", "decision": "denied"}
+        assert "actor" not in events[1] and events[1]["correlationId"] == "given" and events[2]["correlationId"] == "given"
+
+    def test_sink_records_the_tool_name_on_the_authorization_event_only_when_include_tool_names(self) -> None:
+        decision = {"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "oauth", "oauthSubject": "s", "effectiveScopes": [], "toolName": "refund"}
+        withheld, named = MemoryAuditSink(), MemoryAuditSink()
+        create_mcp_audit_trail(withheld, "did:web:svc").tool_audit_sink()(decision)
+        create_mcp_audit_trail(named, "did:web:svc", include_tool_names=True).tool_audit_sink()(decision)
+        assert withheld.events[0]["action"] == {"category": "authorization"}
+        assert named.events[0]["action"] == {"category": "authorization", "name": "refund"}
+
+    def test_sink_lets_a_reporter_failure_propagate(self) -> None:
+        class Failing:
+            def append(self, entry: AuditTrailEntry) -> None:
+                raise RuntimeError("reporter down")
+
+        with pytest.raises(RuntimeError, match="reporter down"):
+            create_mcp_audit_trail(Failing(), "did:web:svc").tool_audit_sink()({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "oauth", "oauthSubject": "s", "effectiveScopes": []})
+
+    # -- McpAuditTrail.begin_tool_call (JS: beginToolCall) -------------------------
+
+    def test_begin_tool_call_gives_an_audit_uuid_correlation_id_or_keeps_the_one_given(self) -> None:
+        audit = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc")
+        with audit.begin_tool_call("q") as call:
+            assert call.correlation_id.startswith("audit_") and len(call.correlation_id) == len("audit_") + 36
+        with audit.begin_tool_call("q", correlation_id="call-1") as call:
+            assert call.correlation_id == "call-1" and call.tool_name == "q" and call.delegation is None
+        assert current_tool_call() is None
+
+    def test_begin_tool_call_joins_the_gate_decision_and_the_lifecycle(self) -> None:
         memory = MemoryAuditSink()
         audit = create_mcp_audit_trail(memory, "did:web:svc", include_tool_names=True)
         mw = gate(client=verifying_client(["read"], agent="did:key:agent"), validate_oauth_token=lambda t: {"sub": "u-1", "scopes": ["read"]}, tool_scopes={"q": ["read"], "u": ["write"]}, audit_sink=audit.tool_audit_sink(), expected_target_service="did:web:svc")
         with audit.begin_tool_call("q", correlation_id="call-1") as call:
+            assert current_tool_call() is call
             mw({"name": "q", "_meta": {"x-helix-vp": VP}})
-            call.started()
-            call.completed()
+            started = call.started()
+            completed = call.completed()
+        assert started.event["eventType"] == "tool.call.started" and completed.event["outcome"] == "succeeded"
         denied(lambda: mw({"name": "u", "headers": {"authorization": "Bearer tok"}}))
-        denied(lambda: mw({"name": "zzz", "headers": {"authorization": "Bearer tok"}}))
         events = memory.events
-        assert memory.event_types == [
-            "session.established", "proof.verified", "authorization.approved", "tool.call.started", "tool.call.completed",
-            "authorization.denied", "authorization.denied",
-        ]
+        assert memory.event_types == ["session.established", "proof.verified", "authorization.approved", "tool.call.started", "tool.call.completed", "authorization.denied"]
         assert all(e["correlationId"] == "call-1" for e in events[:5]) and "correlationId" not in events[5]
+        assert "actor" not in events[0]  # the caller is not known before the gate
         assert all(e["actor"] == {"kind": "pairwise_did", "did": "did:key:agent"} for e in events[1:5])
-        assert events[2]["authorization"] == {"source": "delegation", "decision": "allowed"}  # a grant names no requiredScope
         assert events[3]["action"] == {"category": "tool.call", "name": "q"}
-        assert events[5]["reason"] == {"code": "insufficient_scope"} and events[5]["authorization"] == {"source": "policy", "decision": "denied", "scopeId": "write"}
-        assert events[6]["reason"] == {"code": "tool_not_permitted"} and events[6]["authorization"] == {"source": "policy", "decision": "denied"}
-        assert events[5]["actor"] == events[6]["actor"] and events[5]["actor"]["kind"] == "keyed_commitment"
-        assert "u-1" not in json.dumps(events)
         assert call.actor == {"kind": "pairwise_did", "did": "did:key:agent"}  # learned from the gate's decision
-        assert current_tool_call() is None
+        assert events[5]["actor"]["kind"] == "keyed_commitment" and "u-1" not in json.dumps(events)
 
-    def test_mcp_audit_trail_methods(self) -> None:
-        memory = MemoryAuditSink()
-        audit = McpAuditTrail(AuditTrail(sink=memory, source_id="s", producer=pairwise_did("did:web:svc"), tenant_ref=pairwise_did("did:web:svc")), service_did="did:web:svc")
-        context = {"actor": pairwise_did("did:key:a"), "responsibleParty": public_did("did:key:user"), "correlationId": "c", "causationId": "k", "ignored": 1}
-        audit.session("rejected", False, reason_code="replay", context=context)
-        audit.proof("rejected", "failed", proof_digest="sha256:" + "a" * 64, verification_code="VP_EXPIRED")
-        assert audit.proof("generated", "succeeded").event["details"] == {"family": "proof", "phase": "generated"}
-        audit.delegation("rejected", "urn:uuid:d", "denied", reason_code="chain_broken", parent_ref="urn:uuid:p", context={"authorization": {"source": "delegation", "decision": "denied"}})
-        audit.authorization("grant_used", "succeeded", grant_ref="vc:grant-1")
-        audit.authorization("step_up_required", "challenged", reason_code="mfa")
-        audit.tool("failed", "failed", tool_name="refund", attempt="2", reason_code="handler_error", resource=public_did("did:web:other"))
-        events = memory.events
-        assert memory.event_types == ["session.rejected", "proof.rejected", "proof.generated", "delegation.rejected", "grant.used", "authorization.step_up_required", "tool.call.failed"]
-        del events[2]
-        assert events[0]["details"] == {"family": "session", "phase": "rejected", "reasonCode": "replay"} and events[0]["reason"] == {"code": "replay"}
-        assert events[0]["outcome"] == "failed" and events[0]["responsibleParty"] == public_did("did:key:user") and events[0]["causationId"] == "k"
-        assert "ignored" not in events[0]
-        assert events[1]["details"] == {"family": "proof", "phase": "rejected", "proofDigest": "sha256:" + "a" * 64, "verificationCode": "VP_EXPIRED"}
-        assert events[2]["details"] == {"family": "delegation", "phase": "rejected", "delegationRef": "urn:uuid:d", "parentRef": "urn:uuid:p"}
-        assert events[2]["authorization"] == {"source": "delegation", "decision": "denied"} and events[2]["reason"] == {"code": "chain_broken"}
-        assert events[3]["details"] == {"family": "authorization", "phase": "grant_used", "grantRef": "vc:grant-1"} and events[3]["action"] == {"category": "authorization"}
-        assert events[4]["reason"] == {"code": "mfa"} and events[4]["outcome"] == "challenged"
-        assert events[5]["details"] == {"family": "tool", "phase": "failed", "attempt": "2"} and "name" not in events[5]["action"]
-        assert events[5]["resource"] == public_did("did:web:other")
-        assert all(e["resource"] == public_did("did:web:svc") for e in events[:5])
-        # Without a service DID there is no resource; with a bad input the error surfaces unless on_error is set.
-        bare = McpAuditTrail(AuditTrail(sink=MemoryAuditSink(), source_id="s", producer=pairwise_did("did:web:svc"), tenant_ref=pairwise_did("did:web:svc")))
-        assert "resource" not in bare.session("established", True).event
-        with pytest.raises(AuditEventInvalidError):
-            bare.tool("started", "unknown", attempt="x")
-        errors: List[BaseException] = []
-        bare.on_error = errors.append
-        assert bare.tool("started", "unknown", attempt="x") is None and isinstance(errors[0], AuditEventInvalidError)
-
-    def test_subject_commitment_is_keyed(self) -> None:
-        def trail(key: Any = None) -> McpAuditTrail:
-            return McpAuditTrail(AuditTrail(sink=MemoryAuditSink(), source_id="s", producer=pairwise_did("did:web:svc"), tenant_ref=pairwise_did("did:web:svc")), subject_commitment_key=key)
-
-        fixed = trail(b"k" * 32)
-        assert fixed.subject_commitment("alice") == fixed.subject_commitment("alice") == trail(bytearray(b"k" * 32)).subject_commitment("alice")
-        assert fixed.subject_commitment("alice") != fixed.subject_commitment("bob")
-        assert fixed.subject_commitment("alice") != trail().subject_commitment("alice")  # a random key per trail
-        assert fixed.subject_commitment("alice") == {"kind": "keyed_commitment", "value": keyed_commitment_value(b"k" * 32, "alice"), "keyId": OAUTH_SUBJECT_KEY_ID}
-
-    def test_tool_audit_sink_edge_shapes(self) -> None:
-        memory = MemoryAuditSink()
-        audit = create_mcp_audit_trail(memory, "did:web:svc")
-        sink = audit.tool_audit_sink()
-        # A VP decision with the presented credential: delegation.verified in between.
-        sink({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "helixvp", "agentDid": "did:key:a", "effectiveScopes": [], "serviceDid": "did:web:named",
-              "delegation": {"delegationRef": "urn:uuid:d", "delegationCredentialDigest": "sha256:" + "a" * 64, "delegationChainDigests": ["sha256:" + "a" * 64], "ignored": None}})
-        # A VP decision with a delegation dict that shows no reference, and no agent DID.
-        sink({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "helixvp", "effectiveScopes": [], "delegation": {}})
-        # Neither a VP nor an OAuth subject: no actor, policy source.
-        sink({"event": "AUTHZ_DENIED", "result": "denied", "authMethod": "oauth", "effectiveScopes": [], "toolName": 5, "requiredScope": 7})
-        events = memory.events
-        assert memory.event_types == ["proof.verified", "delegation.verified", "authorization.approved", "proof.verified", "delegation.verified", "authorization.approved", "authorization.denied"]
-        assert events[0]["resource"] == public_did("did:web:named") and events[1]["resource"] == public_did("did:web:named")
-        assert events[1]["authorization"] == {"source": "delegation", "decision": "allowed", "delegationRef": "urn:uuid:d", "delegationCredentialDigest": "sha256:" + "a" * 64, "delegationChainDigests": ["sha256:" + "a" * 64]}
-        assert events[1]["details"] == {"family": "delegation", "phase": "verified", "delegationRef": "urn:uuid:d"}
-        assert "actor" not in events[3] and events[4]["details"]["delegationRef"] == "unknown"
-        assert events[4]["authorization"] == {"source": "delegation", "decision": "allowed"}
-        assert "actor" not in events[6] and events[6]["reason"] == {"code": "tool_not_permitted"} and events[6]["authorization"] == {"source": "policy", "decision": "denied"}
-
-    def test_begin_tool_call_records_denied_and_failed(self) -> None:
+    def test_begin_tool_call_keeps_a_given_actor_and_records_failed_and_denied(self) -> None:
         memory = MemoryAuditSink()
         audit = create_mcp_audit_trail(memory, "did:web:svc", source_id="s", tenant_ref=public_did("did:web:tenant"))
         with audit.begin_tool_call(None, actor=pairwise_did("did:key:a")) as call:
-            assert current_tool_call() is call and call.tool_name is None
-            assert call.correlation_id.startswith("call_")
+            assert call.tool_name is None
             call.denied("vp_missing")
         with audit.begin_tool_call("t") as call:
             call.failed("handler_error")
+        with audit.begin_tool_call("t", actor=pairwise_did("did:key:given")):
+            # A decision that names no caller keeps the call's actor.
+            audit.tool_audit_sink()({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "helixvp", "effectiveScopes": []})
+        assert memory.events[-1]["actor"] == memory.events[-2]["actor"] == pairwise_did("did:key:given")
+        del memory.entries[4:]
         events = memory.events
         assert memory.event_types == ["session.established", "tool.call.denied", "session.established", "tool.call.failed"]
         assert events[0]["correlationId"] == events[1]["correlationId"] != events[2]["correlationId"]
-        assert events[0]["actor"] == pairwise_did("did:key:a") and events[1]["reason"] == {"code": "vp_missing"}
+        assert events[0]["actor"] == events[1]["actor"] == pairwise_did("did:key:a")
+        assert events[1]["reason"] == {"code": "vp_missing"} and events[1]["outcome"] == "denied"
         assert events[3]["reason"] == {"code": "handler_error"} and events[3]["outcome"] == "failed"
         assert all(e["tenantRef"] == public_did("did:web:tenant") and e["source"]["sourceId"] == "s" for e in events)
-        with pytest.raises(ValueError, match="service_did"):
-            create_mcp_audit_trail(memory, "")
 
-    def test_helix_audit_reporter(self) -> None:
-        http = FakeHttp({"http://api.test/v1/audit-log/events": {}})
-        reporter = create_helix_audit_reporter("http://api.test/", "hak", timeout_seconds=2.5, http=http)
-        trail = AuditTrail(sink=reporter, source_id="s", producer=pairwise_did("did:web:svc"), tenant_ref=pairwise_did("did:web:svc"))
-        entry = trail.record({"eventType": "session.established", "action": {"category": "session"}, "outcome": "succeeded", "details": {"family": "session", "phase": "established"}})
-        assert http.calls == [{"method": "POST", "url": "http://api.test/v1/audit-log/events", "json": entry.event, "headers": {"authorization": "Bearer hak"}, "timeout": 2.5}]
-        with pytest.raises(RuntimeError, match="responded 500"):
-            create_helix_audit_reporter("http://api.test", "hak", http=FakeHttp({"http://api.test/v1/audit-log/events": Response({}, 500)})).append(entry)
+    def test_begin_tool_call_scopes_the_context_an_explicit_member_wins(self) -> None:
+        memory = MemoryAuditSink()
+        audit = create_mcp_audit_trail(memory, "did:web:svc")
+        audit.tool("started", "unknown")
+        with audit.begin_tool_call("q", correlation_id="inside", actor=pairwise_did("did:key:a")):
+            audit.tool("started", "unknown")
+            audit.tool("started", "unknown", context={"correlationId": "explicit", "actor": pairwise_did("did:key:b")})
+        events = memory.events
+        assert "correlationId" not in events[0] and "actor" not in events[0]
+        assert events[2]["correlationId"] == "inside" and events[2]["actor"] == pairwise_did("did:key:a")
+        assert events[3]["correlationId"] == "explicit" and events[3]["actor"] == pairwise_did("did:key:b")
 
-    def test_helix_audit_reporter_uses_requests_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        import requests
+    def test_begin_tool_call_derives_delegation_evidence_from_a_decoded_vp(self) -> None:
+        memory = MemoryAuditSink()
+        audit = create_mcp_audit_trail(memory, "did:web:svc")
+        parent = _agent_vc("urn:uuid:parent")
+        leaf = {**_agent_vc("urn:uuid:leaf"), "delegationChain": [parent]}
+        vp = {"verifiableCredential": [_agent_vc("urn:uuid:other"), {"type": ["VerifiableCredential", "DelegationGrantCredential"]}, leaf]}
+        expected = {
+            "delegationRef": "urn:uuid:leaf",
+            "delegationCredentialDigest": credential_digest(leaf),
+            "delegationChainDigests": delegation_chain_digests([parent, leaf]),
+        }
+        with audit.begin_tool_call("q", credential=vp) as call:
+            assert call.delegation == expected
+            audit.tool_audit_sink()({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "helixvp", "agentDid": "did:key:a", "effectiveScopes": []})
+        assert memory.event_types == ["session.established", "proof.verified", "delegation.verified", "authorization.approved"]
+        authorization = {"source": "delegation", "decision": "allowed", **expected}
+        assert memory.events[1]["authorization"] == memory.events[2]["authorization"] == memory.events[3]["authorization"] == authorization
+        assert memory.events[2]["details"]["delegationRef"] == "urn:uuid:leaf"
+        # A decision that carries its own delegation wins over the call's.
+        with audit.begin_tool_call("q", credential=vp):
+            audit.tool_audit_sink()({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "helixvp", "agentDid": "did:key:a", "effectiveScopes": [], "delegation": {"delegationRef": "urn:uuid:own"}})
+        assert memory.events[-2]["details"]["delegationRef"] == "urn:uuid:own"
 
-        calls: List[Dict[str, Any]] = []
-        monkeypatch.setattr(requests, "post", lambda url, **kw: calls.append({"url": url, **kw}) or Response({}, 201))
-        reporter = create_helix_audit_reporter("http://api.test", "hak")
-        reporter.append(AuditTrailEntry(event={"eventType": "x"}, canonical="{}", event_digest="sha256:" + "0" * 64))
-        assert calls[0]["url"] == "http://api.test/v1/audit-log/events" and calls[0]["json"] == {"eventType": "x"}
+    def test_delegation_evidence_of(self) -> None:
+        assert delegation_evidence_of(None) is None
+        assert delegation_evidence_of({"verifiableCredential": "x"}) is None
+        assert delegation_evidence_of({"verifiableCredential": [{"type": ["VerifiableCredential"]}, "x"]}) is None
+        by_subject = {"credentialSubject": {"type": "HelixAgent", "id": "did:key:a"}, "proof": {"proofValue": "AQIDBA=="}}
+        assert delegation_evidence_of({"verifiableCredential": [by_subject]}) == {
+            "delegationCredentialDigest": credential_digest(by_subject),
+            "delegationChainDigests": [credential_digest(by_subject)],
+        }
+        unsigned = {"id": "urn:uuid:u", "type": ["HelixAgentCredential"]}
+        assert delegation_evidence_of({"verifiableCredential": [unsigned]}) == {"delegationRef": "urn:uuid:u"}
+        assert delegation_evidence_of({"verifiableCredential": [{**unsigned, "delegationChain": "x"}]}) == {"delegationRef": "urn:uuid:u"}
 
 
 def test_async_wrapper_runs_the_same_gate() -> None:

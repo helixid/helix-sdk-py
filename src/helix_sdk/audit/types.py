@@ -19,12 +19,35 @@ object's metadata (see ``evidence.py``), never its bytes.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Literal, Optional, Tuple
 
 PartyRef = Dict[str, Any]
 EvidenceRef = Dict[str, Any]
 AuditProducerEvent = Dict[str, Any]
 AuditEventInput = Dict[str, Any]
+
+# The closed value sets of the event, as in helix-core's types.ts (for type checkers; the
+# validator in schema.py enforces them at run time).
+PartyRefKind = Literal["public_did", "pairwise_did", "keyed_commitment", "evidence_ref"]
+AuditOutcome = Literal["succeeded", "failed", "denied", "challenged", "unknown"]
+AuditEventFamily = Literal["session", "tool", "proof", "delegation", "authorization", "consent", "key", "ledger", "administration"]
+SessionPhase = Literal["established", "rejected", "expired", "replay_rejected"]
+ToolPhase = Literal["started", "completed", "failed", "denied", "challenged"]
+ProofPhase = Literal["generated", "verified", "rejected"]
+DelegationPhase = Literal["issued", "verified", "rejected", "revoked", "cascade_revoked", "outbound_attached"]
+AuthorizationPhase = Literal["evaluated", "approved", "denied", "step_up_required", "grant_used"]
+ConsentPhase = Literal["requested", "approved", "denied", "credential_required", "credential_verified", "credential_failed"]
+KeyPhase = Literal["rotated", "policy_changed", "configuration_changed", "integrity_suite_transitioned"]
+LedgerPhase = Literal[
+    "epoch_started",
+    "epoch_transitioned",
+    "checkpoint_created",
+    "checkpoint_anchored",
+    "checkpoint_anchor_failed",
+    "evidence_disposed",
+    "projection_reconciled",
+]
+AdministrationPhase = Literal["source_high_water", "accessed", "exported", "legal_hold_applied", "retention_executed"]
 
 AUDIT_EVENT_SCHEMA = "https://schema.kya-os.org/v1/protocol/audit/event/v1.0.0"
 AUDIT_EVENT_VERSION = "1.0.0"

@@ -238,8 +238,8 @@ def main() -> None:
                 reporter,
                 service_did,
                 include_tool_names=env.get("AUDIT_INCLUDE_TOOL_NAMES") == "1",
-                on_error=auth.on_audit_error,
             )
+            # The gate's decisions and the call lifecycle share one trail (one source, one sequence).
             auth.audit_sink = audit.tool_audit_sink()
     if demo:
         def demo_token(token: str) -> AuthResult:
@@ -267,7 +267,12 @@ def main() -> None:
     print(f"order-management MCP server on {resource}")
     print(f"  HelixID VPs: {'verified via ' + api_url if auth.client else 'off (set HELIX_API_URL)'}")
     print(f"  OAuth:       {'DEMO tokens demo-reader, demo-admin' if demo else ', '.join(i.issuer for i in issuers) or 'off'}")
-    print(f"  Audit:       {api_url + '/v1/audit-log/events' if audit else 'off (set HELIX_API_URL + HELIX_API_KEY + SERVICE_DID)'}")
+    audit_line = (
+        f"{api_url}/v1/audit-log/events (KYA-OS typed events; tool names {'recorded' if audit.include_tool_names else 'withheld'})"
+        if audit
+        else "off (set HELIX_API_URL + HELIX_API_KEY + SERVICE_DID)"
+    )
+    print(f"  Audit:       {audit_line}")
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 

@@ -32,6 +32,8 @@ from .audit import (
     OAUTH_SUBJECT_KEY_ID,
     AuditContext,
     AuditSink,
+    DelegationEvidence,
+    McpAuditContext,
     McpAuditTrail,
     ToolAuditEvent,
     ToolCallAudit,
@@ -39,6 +41,7 @@ from .audit import (
     create_helix_audit_sink,
     create_mcp_audit_trail,
     current_tool_call,
+    delegation_evidence_of,
 )
 from .audit_delivery import (
     AUDIT_META_KEY,
@@ -104,8 +107,11 @@ __all__ = [
     "create_helix_audit_reporter",
     "create_mcp_audit_trail",
     "current_tool_call",
+    "delegation_evidence_of",
     "AuditSink",
     "AuditContext",
+    "McpAuditContext",
+    "DelegationEvidence",
     "McpAuditTrail",
     "ToolAuditEvent",
     "ToolCallAudit",

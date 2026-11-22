@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import math
 from typing import Any
 
 from ..crypto.jcs import canonicalize
@@ -67,3 +68,25 @@ def keyed_commitment_value(key: bytes, value: Any) -> str:
     of ``value``, so an index over low-entropy identifiers (an account id, an
     email) cannot be reversed by dictionary without the key."""
     return "sha256:" + hmac.new(bytes(key), canonicalize(value).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _wire_form(value: Any) -> Any:
+    """``value`` as JSON carries it, the way ``JSON.parse(JSON.stringify(value))``
+    reads it back in JavaScript: a non-finite number becomes ``null``, a
+    tuple a list, a non-string member name a string."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {str(key): _wire_form(member) for key, member in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_wire_form(member) for member in value]
+    return value
+
+
+def json_digest(value: Any) -> str:
+    """``sha256:`` of the JCS of a value's JSON wire form (JS ``jsonDigest``),
+    for an in-memory document or credential that JCS itself would refuse only
+    for a non-finite number; a string that is not well-formed Unicode still
+    raises ``CanonicalJsonError``. Not domain separated: the same value as
+    ``hash_json`` gives once it is in wire form."""
+    return digest_bytes(canonicalize(_wire_form(value)).encode("utf-8"))
