@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
+from . import codes
 from .errors import HelixError
 
 KYA_OS_CARD_SERVICE_TYPE = "KyaOsEntityCard"
@@ -60,7 +61,7 @@ class EntityCardError(HelixError):
     """A card, a DID or a discovery step that is not what the spec asks for; ``reason`` codes it."""
 
     def __init__(self, reason: str, message: str) -> None:
-        super().__init__("ENTITY_CARD_INVALID", message, 400, {"reason": reason})
+        super().__init__(codes.ENTITY_CARD_INVALID, message, 400, {"reason": reason})
         self.reason = reason
 
 
@@ -68,7 +69,7 @@ class SafeFetchRefusedError(HelixError):
     """SafeFetch refused or failed a read; ``reason`` codes why."""
 
     def __init__(self, reason: str, message: str) -> None:
-        super().__init__("SAFE_FETCH_REFUSED", message, 502, {"reason": reason})
+        super().__init__(codes.SAFE_FETCH_REFUSED, message, 502, {"reason": reason})
         self.reason = reason
 
 
@@ -513,6 +514,33 @@ def node_transport(url: str, headers: Mapping[str, str], address: Optional[str],
     finally:
         connection.close()
 
+
+
+def requests_transport(session: Any = None) -> Transport:
+    """A transport over ``requests`` (helix-sdk-js's ``fetchTransport``): for tests that serve canned
+    responses, and for a proxy-only network. It cannot pin the connection (the pinned address is
+    ignored), so it is never the default. Redirects are left to SafeFetch."""
+    import requests
+
+    http = session if session is not None else requests.Session()
+
+    def transport(url: str, headers: Mapping[str, str], address: Optional[str], timeout: float, max_bytes: int) -> Tuple[int, Dict[str, str], bytes]:
+        response = http.get(url, headers=dict(headers), timeout=timeout, allow_redirects=False, stream=True)
+        try:
+            response_headers = {name.lower(): value for name, value in response.headers.items()}
+            declared = response_headers.get("content-length")
+            if declared is not None and declared.isdigit() and int(declared) > max_bytes:
+                raise SafeFetchRefusedError("too_large", f"SafeFetch: declared content-length {declared} exceeds the cap of {max_bytes} bytes")
+            body = b""
+            for chunk in response.iter_content(chunk_size=65536):
+                body += chunk
+                if len(body) > max_bytes:
+                    raise SafeFetchRefusedError("too_large", f"SafeFetch: response body exceeds the cap of {max_bytes} bytes")
+            return response.status_code, response_headers, body
+        finally:
+            response.close()
+
+    return transport
 
 _REDIRECTS = {301, 302, 303, 307, 308}
 

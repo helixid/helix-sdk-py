@@ -250,3 +250,53 @@ def test_host_and_origin_are_limited_to_this_server_and_loopback() -> None:
     for bad in ("localhost:3700/mcp", "ftp://x/mcp", "/mcp"):
         with pytest.raises(ValueError, match="http"):
             create_order_app(bad, options)
+
+
+# ── KYA-OS story C-A: the sample serves its own did.json and card.json ───────
+
+def _identity_app(**identity: Any) -> TestClient:
+    from helix_mcp_middleware import ServeIdentityOptions
+
+    options = MCPMiddlewareOptions(client=fake_client(), service_did="did:web:orders.example", validate_oauth_token=validate)
+    ident = ServeIdentityOptions(**{"public_origin": "http://localhost", "path": "/mcp", "did": "did:web:orders.example",
+                                    "card": {"name": "Orders (test)", "capabilities": ["tools/list", "tools/call"]}, **identity})
+    return TestClient(create_order_app(RESOURCE, options, identity=ident), base_url=BASE)
+
+
+def test_serves_its_own_did_document_and_card_and_the_card_names_the_canonical_document() -> None:
+    http = _identity_app()
+    did = http.get("/.well-known/did.json")
+    assert did.status_code == 200
+    assert did.headers["content-type"] == "application/json"
+    assert did.json()["id"] == "did:web:orders.example"
+    assert did.json()["service"] == [{"id": "#kya-os-card", "type": "KyaOsEntityCard", "serviceEndpoint": "http://localhost/.well-known/kya-os-card.json"}]
+    card = http.get("/.well-known/kya-os-card.json")
+    assert card.status_code == 200
+    assert card.json() == {"id": "did:web:orders.example", "entityType": "mcp", "name": "Orders (test)", "capabilities": ["tools/list", "tools/call"],
+                           "didDocument": "http://localhost/.well-known/did.json", "proofProfile": "org.kya-os/proof.v1"}
+    assert http.post("/.well-known/did.json").status_code == 404
+    assert http.get("/.well-known/oauth-protected-resource/mcp").status_code == 200
+
+
+def test_without_identity_the_documents_are_not_served(app: App) -> None:
+    assert app.http.get("/.well-known/did.json").status_code == 404
+
+
+def test_identity_from_env_reads_the_same_variables_as_the_js_sample(monkeypatch: pytest.MonkeyPatch) -> None:
+    import mcp_order_management.__main__ as entry
+
+    assert entry.identity_from_env({}, RESOURCE, None) is None
+    jwk = {"kty": "OKP", "crv": "Ed25519", "x": "JUO5L_EJVRFHatyDadtt3JM2ZaEZeN2hQE7hBmypVZ0"}
+    ident = entry.identity_from_env(
+        {"PUBLIC_ORIGIN": "https://mcp.example.com", "SERVICE_NAME": "Orders", "SERVICE_PUBLIC_KEY_JWK": json.dumps(jwk), "SERVICE_KID": "k2",
+         "SERVICE_RESPONSIBLE_PARTY": "did:web:example.com:org:acme"},
+        "https://mcp.example.com/mcp",
+        "did:web:mcp.example.com:mcp",
+    )
+    assert (ident.public_origin, ident.path, ident.did) == ("https://mcp.example.com", "/mcp", "did:web:mcp.example.com:mcp")
+    assert ident.card == {"name": "Orders", "capabilities": ["tools/list", "tools/call", "lookup_order", "refund_order"], "publicKeyJwk": jwk, "kid": "k2",
+                          "responsibleParty": "did:web:example.com:org:acme"}
+    defaults = entry.identity_from_env({"PUBLIC_ORIGIN": "http://127.0.0.1:3700", "SERVICE_PUBLIC_KEY_JWK": json.dumps(jwk)}, RESOURCE, None)
+    assert defaults.card["name"] == "Order Management (HelixID sample)" and defaults.card["kid"] == "key-1" and defaults.did is None
+    with pytest.raises(SystemExit):
+        entry.identity_from_env({"PUBLIC_ORIGIN": "https://x", "SERVICE_PUBLIC_KEY_JWK": "{"}, RESOURCE, None)

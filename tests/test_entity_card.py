@@ -471,3 +471,57 @@ def test_node_transport_over_local_server(local_server):
     assert pinned(f"http://pinned.test:{port}/card.json").json() == {"path": "/card.json", "host": f"pinned.test:{port}"}
     assert _reason(lambda: create_safe_fetch(lookup=lambda _h: ["127.0.0.1"])(f"https://pinned.test:{port}/")) == "host_refused"
     assert _reason(lambda: create_safe_fetch(development=True, timeout=0.1)(f"{origin}/slow")) == "deadline_exceeded"
+
+
+# ── requests_transport (helix-sdk-js's fetchTransport) ────────────────────────
+
+class _FakeResponse:
+    def __init__(self, status: int, headers: Dict[str, str], chunks: List[bytes]) -> None:
+        self.status_code = status
+        self.headers = headers
+        self._chunks = chunks
+        self.closed = False
+
+    def iter_content(self, chunk_size: int = 0):
+        return iter(self._chunks)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeSession:
+    def __init__(self, routes: Dict[str, _FakeResponse]) -> None:
+        self.routes = routes
+        self.calls: List[Any] = []
+
+    def get(self, url: str, **kwargs: Any) -> _FakeResponse:
+        self.calls.append((url, kwargs))
+        return self.routes[url]
+
+
+def test_requests_transport_leaves_redirects_to_safe_fetch_and_caps_the_body():
+    from helix_sdk.entity_card import requests_transport
+
+    big = _FakeResponse(200, {}, [b"x" * (1024 * 1024), b"x"])
+    declared = _FakeResponse(200, {"Content-Length": str(2 * 1024 * 1024)}, [b"s"])
+    ok = _FakeResponse(200, {"Content-Type": "application/json"}, [b'{"ok"', b":1}"])
+    moved = _FakeResponse(302, {"Location": "/card.json"}, [])
+    session = _FakeSession({"https://helix.test/": ok, "https://helix.test/big": big, "https://helix.test/declared": declared,
+                            "https://helix.test/old": moved, "https://helix.test/card.json": ok})
+    safe_fetch = create_safe_fetch(lookup=lambda _h: [PUBLIC], transport=requests_transport(session))
+    assert safe_fetch("https://helix.test/").json() == {"ok": 1}
+    assert session.calls[0][1]["allow_redirects"] is False and session.calls[0][1]["stream"] is True
+    assert session.calls[0][1]["headers"]["accept"] == "application/json"
+    assert safe_fetch("https://helix.test/old").url == "https://helix.test/card.json"
+    assert _reason(lambda: safe_fetch("https://helix.test/big")) == "too_large"
+    assert _reason(lambda: safe_fetch("https://helix.test/declared")) == "too_large"
+    assert big.closed and declared.closed
+
+
+def test_requests_transport_default_session_reads_a_local_server(local_server):
+    from helix_sdk.entity_card import requests_transport
+
+    origin, _port = local_server
+    safe_fetch = create_safe_fetch(transport=requests_transport(), development=True)
+    assert safe_fetch(f"{origin}/card.json").json()["path"] == "/card.json"
+    assert _reason(lambda: safe_fetch(f"{origin}/big")) == "too_large"
