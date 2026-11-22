@@ -20,7 +20,12 @@ make it an authenticated one); every other tool call is started before the
 transport sees it (session lookup, authorization, control arguments stripped)
 and its JSON-RPC result is finished on the way out, where it is hashed and the
 proof signed into `_meta["org.kya-os/response-proof"]`. A refusal carries its
-`denied` proof in the 400/401/403 body."""
+`denied` proof in the 400/401/403 body.
+
+With `auth.needs_authorization` set (story L3-E), a caller whose delegation
+does not cover the tool gets the signed `needs_authorization` challenge as the
+call's result, and a retry carrying `_kyaos_resume` and `_kyaos_delegation` is
+verified through that layer before the tool runs."""
 
 from __future__ import annotations
 
@@ -39,6 +44,7 @@ from starlette.responses import JSONResponse
 from helix_mcp_middleware import (
     AuthorizationServerUnavailableError,
     KyaOsDenied,
+    KyaOsNeedsAuthorization,
     KyaOsRuntime,
     MCPMiddlewareOptions,
     ServeIdentityOptions,
@@ -286,6 +292,11 @@ def create_order_app(
                 return
             if isinstance(started, KyaOsDenied):
                 await refuse(started.error, started.proof)
+                return
+            if isinstance(started, KyaOsNeedsAuthorization):
+                # KYA-OS story L3-E: the signed challenge is the call's result (a tool error result with the
+                # proof in _meta), answered here since the tool itself never runs.
+                await respond(200, {"jsonrpc": "2.0", "id": message.get("id"), "result": started.result})
                 return
             # Control arguments (`_kyaos*`) never reach the tool.
             message["params"] = {**params, "arguments": started.arguments}
