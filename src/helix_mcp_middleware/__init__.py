@@ -8,10 +8,14 @@ helix_mcp_middleware -- MCP (Model Context Protocol) integration for
 HelixID, mirroring helix-sdk-js's mcp-middleware package.
 
 - helixid_mcp_middleware() / async_helixid_mcp_middleware(): server-side
-  gate for every incoming tool call. Accepts a HelixID VP
-  (`Authorization: HelixVP`, `X-Helix-VP`, or MCP `_meta["x-helix-vp"]`) or
-  an OAuth 2.1 bearer token, enforces per-tool scopes (deny by default) and
-  records each decision.
+  gate for every incoming tool call. Accepts a KYA-OS request proof (MCP
+  `_meta["org.kya-os/request-proof"]`, with the delegation chain at
+  `_meta["org.kya-os/delegation-chain"]`), verified in-process by the local
+  verifier, or an OAuth 2.1 bearer token; enforces per-tool scopes (deny by
+  default) and records each decision.
+- create_local_verifier() (story F-2): the local verifier the gate runs, from
+  the presented proof and chain, public DID documents, status lists and
+  cards, a local replay store and local config. The Helix API is never asked.
 - OAuth: OAuthIssuerOptions (one trusted issuer or a list), validated by
   JWKS, by RFC 7662 introspection, or with endpoints read from the issuer's
   metadata; presets entra(), auth0(), okta(), keycloak().
@@ -21,8 +25,6 @@ HelixID, mirroring helix-sdk-js's mcp-middleware package.
 - TrustedIssuers / DEFAULT_TRUSTED_ISSUERS ("*"), is_trusted_issuer(),
   attestation_trust(): which issuers' capability attestations count (KYA-OS
   story C-B).
-- attach_helix_vp(): client-side, attaches a VP signed server-side (via
-  HelixClient.sign_vp()) to an outgoing tool call.
 - serve_identity() / resolve_server_card() (KYA-OS story C-A): the service's
   own did.json and card.json from its origin, the server.json projection
   under _meta["org.kya-os/card"], and its reverse.
@@ -41,10 +43,9 @@ HelixID, mirroring helix-sdk-js's mcp-middleware package.
 
 from __future__ import annotations
 
-from .attach import attach_helix_vp
 from .audit import AuditSink, ToolAuditEvent, create_helix_audit_sink
 from .credentials import DEFAULT_TRUSTED_ISSUERS, ExtractedCredential, TrustedIssuers, extract_credential
-from .errors import AuthorizationServerUnavailableError, MCPAuthError, ToolScopeError
+from .errors import PROOF_INVALID, PROOF_MISSING, AuthorizationServerUnavailableError, MCPAuthError, ProofError, ToolScopeError
 from .identity import ServedIdentity, ServeIdentityOptions, resolve_server_card, serve_identity
 from .metadata import (
     HttpErrorResponse,
@@ -62,15 +63,27 @@ from .oauth import (
     create_oauth_validator,
 )
 from .providers import auth0, entra, keycloak, okta
-from .types import AttachHelixVPOptions, MCPMiddlewareOptions, MCPToolCall
+from .types import MCPMiddlewareOptions, MCPToolCall
 from .trusted_issuers import attestation_trust, is_trusted_issuer
+from .verify_locally import (
+    KYA_OS_CARD_SERVICE_TYPE,
+    LocalVerifier,
+    LocalVerifierOptions,
+    MiddlewareVerifierOptions,
+    ReportVerification,
+    ResolverFetch,
+    VerificationReport,
+    card_endpoint_of,
+    create_local_verifier,
+    resolution_url,
+    unrecorded_reporter,
+)
 
 __all__ = [
     "helixid_mcp_middleware",
     "async_helixid_mcp_middleware",
-    "attach_helix_vp",
     "MCPMiddlewareOptions",
-    "AttachHelixVPOptions",
+    "MiddlewareVerifierOptions",
     "MCPToolCall",
     "AuthResult",
     "OAuthIssuerOptions",
@@ -89,6 +102,9 @@ __all__ = [
     "is_trusted_issuer",
     "attestation_trust",
     "MCPAuthError",
+    "ProofError",
+    "PROOF_MISSING",
+    "PROOF_INVALID",
     "ToolScopeError",
     "AuthorizationServerUnavailableError",
     "to_http_error_response",
@@ -102,6 +118,16 @@ __all__ = [
     "resolve_server_card",
     "ServeIdentityOptions",
     "ServedIdentity",
+    "create_local_verifier",
+    "LocalVerifier",
+    "LocalVerifierOptions",
+    "VerificationReport",
+    "ReportVerification",
+    "ResolverFetch",
+    "unrecorded_reporter",
+    "card_endpoint_of",
+    "resolution_url",
+    "KYA_OS_CARD_SERVICE_TYPE",
     "AuthorizedCaller",
 ]
 

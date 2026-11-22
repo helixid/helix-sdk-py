@@ -284,7 +284,8 @@ class NeedsAuthorization:
         auth_method: Optional[str],
         effective_scopes: Optional[Sequence[str]],
         oauth_subject: Optional[str],
-        vp_id: Optional[str],
+        level: Optional[str],
+        fresh: Optional[bool],
     ) -> None:
         sink = self._options.audit_sink
         if sink is None:
@@ -293,10 +294,12 @@ class NeedsAuthorization:
             "event": "AUTHZ_DENIED",
             "result": "denied",
             "timestamp": datetime.fromtimestamp(self._now(), timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-            "authMethod": auth_method if auth_method is not None else "helixvp",
+            "authMethod": auth_method if auth_method is not None else "kyaos",
             "agentDid": context.agent_did,
             **({"oauthSubject": oauth_subject} if oauth_subject is not None else {}),
-            **({"vpId": vp_id} if vp_id is not None else {}),
+            # KYA-OS callers: the level the local verifier derived (story F-2) and whether every status was read live.
+            **({"level": level} if level is not None else {}),
+            **({"fresh": fresh} if fresh is not None else {}),
             "toolName": context.tool,
             "requiredScope": required_scope,
             "effectiveScopes": list(effective_scopes or []),
@@ -321,7 +324,8 @@ class NeedsAuthorization:
         auth_method: Optional[str] = None,
         effective_scopes: Optional[Sequence[str]] = None,
         oauth_subject: Optional[str] = None,
-        vp_id: Optional[str] = None,
+        level: Optional[str] = None,
+        fresh: Optional[bool] = None,
     ) -> NeedsAuthorizationError:
         """Issues a resume token bound to the agent, tool and scopes and builds the challenge; audits it."""
         context = ChallengeContext(agent_did=agent_did, tool=tool, scopes=list(scopes))
@@ -341,7 +345,7 @@ class NeedsAuthorization:
             "scopes": list(context.scopes),
             **({"display": dict(shown)} if shown is not None else {}),
         }
-        self._audit(context, lacking[0], auth_method, effective_scopes, oauth_subject, vp_id)
+        self._audit(context, lacking[0], auth_method, effective_scopes, oauth_subject, level, fresh)
         return NeedsAuthorizationError(body)
 
     def authorize_retry(self, resume_token: Any, credential: Any, context: ChallengeContext) -> RetryAuthorization:

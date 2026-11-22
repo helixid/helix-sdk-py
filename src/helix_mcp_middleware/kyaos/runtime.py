@@ -20,7 +20,7 @@ L2-A), mirroring helix-sdk-js's createKyaOs(). One runtime per server:
 
 The runtime is async, like the JS one; stores, ``authorize`` and ``run`` may
 be sync or async. Only KYA-OS ``_meta`` keys are ever read; everything else in
-``_meta`` is ignored (L2.17). The VP path is not extended: nothing here reads
+``_meta`` is ignored (L2.17). The VP path is gone (story F-2): nothing reads
 ``x-helix-vp``. Times are Unix seconds (``now`` defaults to ``time.time``).
 """
 

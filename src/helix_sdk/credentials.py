@@ -96,7 +96,7 @@ def _iso_now() -> str:
 _KNOWN_KEYWORDS = {
     "$schema", "$id", "$defs", "title", "description", "examples", "type", "properties", "required",
     "additionalProperties", "items", "minItems", "contains", "enum", "const", "pattern", "minLength",
-    "format", "allOf", "anyOf", "oneOf", "$ref",
+    "maxLength", "minimum", "maximum", "format", "allOf", "anyOf", "oneOf", "$ref",
 }
 
 
@@ -199,11 +199,21 @@ def _validate_at(root: Mapping[str, Any], schema: Mapping[str, Any], value: Any,
         min_length = schema.get("minLength")
         if isinstance(min_length, int) and len(value) < min_length:
             out.append(SchemaViolation(path, f"expected at least {min_length} characters"))
+        max_length = schema.get("maxLength")
+        if isinstance(max_length, int) and len(value) > max_length:
+            out.append(SchemaViolation(path, f"expected at most {max_length} characters"))
         pattern = schema.get("pattern")
         if isinstance(pattern, str) and re.search(pattern, value) is None:
             out.append(SchemaViolation(path, f"does not match pattern {pattern}"))
         if schema.get("format") == "date-time" and parse_date_time(value) is None:
             out.append(SchemaViolation(path, "is not an RFC 3339 date-time with offset"))
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        minimum = schema.get("minimum")
+        if isinstance(minimum, (int, float)) and value < minimum:
+            out.append(SchemaViolation(path, f"expected at least {minimum}"))
+        maximum = schema.get("maximum")
+        if isinstance(maximum, (int, float)) and value > maximum:
+            out.append(SchemaViolation(path, f"expected at most {maximum}"))
     if isinstance(value, list):
         min_items = schema.get("minItems")
         if isinstance(min_items, int) and len(value) < min_items:

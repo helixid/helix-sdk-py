@@ -64,15 +64,32 @@ signature, same base58btc-encoded proof value, in every language. See
 If you regenerate the vectors in `helix-server` (`pnpm generate:golden-vectors`),
 re-copy the three JSON files here too, the same way `helix-sdk-js` does.
 
+## Local verifier (KYA-OS story F-2)
+
+`helix_sdk.verifier.verify(proof, seams, options, chain=..., request=..., card=...)` verifies a KYA-OS request proof
+(`org.kya-os/proof.v1`) and the delegation chain the request carries, in-process, from the presented artifacts and
+what its seams answer (`resolve_did`, `resolve_did_keys`, `fetch_status_list`, `resolve_card`, `nonce_store`, `clock`,
+`trusted_issuers`). It never reads a Helix database, and a missing seam fails closed with its reason code
+(`helix_sdk.verifier.ReasonCodes`). It is the port of helix-sdk-js's `kyaos.verifier.verify`: same seams, same codes,
+same results, which `tests/test_verifier.py` proves over the fixture set helix-core generates
+(`fixtures/verifier/*.json`, read from the sibling checkout or `HELIX_CORE_FIXTURES_DIR`).
+
+`python -m helix_sdk.conformance [vectors_dir]` runs the KYA-OS vector categories `signed-proof`, `delegation-chain`,
+`status-list`, `did-key`, `did-web`, `card-proof` and `entity-card` through `helix_sdk.conformance.HelixConformanceAdapter`.
+
 ## Packages in this repo
 
 - **`helix_sdk`** -- core SDK (see Quick example below).
 - **`helix_mcp_middleware`** -- Model Context Protocol integration, the same
   Phase 1 surface as `@helixid/mcp-middleware`:
   `helixid_mcp_middleware()` / `async_helixid_mcp_middleware()` gate every
-  incoming tool call. A caller presents a HelixID VP
-  (`Authorization: HelixVP`, `X-Helix-VP`, or MCP `_meta["x-helix-vp"]`) or
-  an OAuth 2.1 bearer token; `tool_scopes` maps each tool to the scopes it
+  incoming tool call. A caller presents a KYA-OS request proof (MCP
+  `_meta["org.kya-os/request-proof"]`, with its delegation chain at
+  `_meta["org.kya-os/delegation-chain"]`), which the gate verifies in-process
+  with `helix_sdk.verifier` (`verifier=LocalVerifierOptions(...)` or
+  `create_local_verifier()`, story F-2; the Helix API is never asked), or an
+  OAuth 2.1 bearer token. The Helix VP (`HelixVP`, `X-Helix-VP`,
+  `_meta["x-helix-vp"]`) is no longer read. `tool_scopes` maps each tool to the scopes it
   needs and denies unlisted tools; every decision goes to `audit_sink`
   (`create_helix_audit_sink()` writes to the HelixID audit log).
   `oauth=` takes one trusted issuer or a list: `OAuthIssuerOptions(issuer,
@@ -80,8 +97,7 @@ re-copy the three JSON files here too, the same way `helix-sdk-js` does.
   presets `entra()`, `auth0()`, `okta()`, `keycloak()`; opaque tokens are
   checked by RFC 7662 introspection at the one issuer you run.
   `to_http_error_response()` and `build_protected_resource_metadata()` give
-  the 401 / 403 challenges and the RFC 9728 document. `attach_helix_vp()`
-  attaches a VP to an outgoing call. A runnable server is in
+  the 401 / 403 challenges and the RFC 9728 document. A runnable server is in
   [`examples/mcp_order_management`](examples/mcp_order_management).
   Install with the `mcp-middleware` extra:
   `pip install helixid-sdk-py[mcp-middleware]`.

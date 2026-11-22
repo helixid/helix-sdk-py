@@ -6,10 +6,10 @@
 """How the gate (helixid_mcp_middleware) uses the L3-E layer, kept out of
 middleware.py so that file only gains two calls; mirrors helix-sdk-js's
 mcp-middleware/src/needs-authorization-guard.ts. The agent a challenge or a
-retry is bound to is the caller's DID (HelixID callers) or OAuth subject
+retry is bound to is the caller's DID (KYA-OS callers) or OAuth subject
 (OAuth callers): whatever identified the caller. ``caller`` is the gate's
 internal dict (``authMethod``, ``scopes``, ``agentDid``, ``oauthSubject``,
-``vpId``)."""
+``level``, ``proofAssurance``, ``fresh``)."""
 
 from __future__ import annotations
 
@@ -63,5 +63,6 @@ def challenge_for(
         auth_method=caller.get("authMethod"),
         effective_scopes=list(caller["scopes"]),
         oauth_subject=caller.get("oauthSubject"),
-        vp_id=caller.get("vpId"),
+        level=caller.get("level"),
+        fresh=caller.get("fresh"),
     )

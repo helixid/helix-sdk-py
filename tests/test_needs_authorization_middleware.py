@@ -111,7 +111,7 @@ class TestCreate:
 
     def test_builds_the_spec_challenge_with_a_bound_token_and_audits_it(self) -> None:
         na, _clock, events = layer(ttl_seconds=300, display={"title": "Orders", "hint": ["link"]})
-        error = na.challenge(agent_did=AGENT, tool=TOOL, scopes=SCOPES, effective_scopes=["orders:read"], auth_method="oauth", oauth_subject="sub-1", vp_id="vp-1")
+        error = na.challenge(agent_did=AGENT, tool=TOOL, scopes=SCOPES, effective_scopes=["orders:read"], auth_method="oauth", oauth_subject="sub-1", level="L2", fresh=True)
         assert isinstance(error, NeedsAuthorizationError)
         assert is_needs_authorization_error(error) and is_needs_authorization_error(MagicMock(code="NEEDS_AUTHORIZATION"))
         assert not is_needs_authorization_error(ValueError("x"))
@@ -137,7 +137,8 @@ class TestCreate:
                 "authMethod": "oauth",
                 "agentDid": AGENT,
                 "oauthSubject": "sub-1",
-                "vpId": "vp-1",
+                "level": "L2",
+                "fresh": True,
                 "toolName": TOOL,
                 "requiredScope": "orders:admin",
                 "effectiveScopes": ["orders:read"],
@@ -160,7 +161,7 @@ class TestCreate:
         assert error.challenge["authorizationUrl"] == "https://consent.example/authorize?tool=refund_order&scope=orders:read+orders:admin"
         assert error.challenge["message"] == "grant orders:read, orders:admin to did:key:z6Mkagent"
         assert error.challenge["display"] == {"hint": ["qr"], "qrUrl": "https://consent.example/qr"}
-        assert events[0]["requiredScope"] == "orders:admin" and events[0]["effectiveScopes"] == [] and events[0]["authMethod"] == "helixvp"
+        assert events[0]["requiredScope"] == "orders:admin" and events[0]["effectiveScopes"] == [] and events[0]["authMethod"] == "kyaos"
         assert "oauthSubject" not in events[0]
         plain = na.challenge(agent_did=AGENT, tool=TOOL, scopes=SCOPES, message="please", missing=[])
         assert plain.challenge["message"] == "please" and "display" not in plain.challenge
@@ -342,13 +343,17 @@ class TestGate:
 
     def test_keeps_the_plain_403_without_an_identity_to_bind_to_and_when_off(self) -> None:
         na = create_needs_authorization(NeedsAuthorizationOptions(authorization_url=CONSENT, now=lambda: NOW))
-        client = MagicMock()
-        client.verify_vp.return_value = {"valid": True, "effectiveScopes": ["orders:read"]}
-        from helix_sdk.vp_transport import encode_helix_vp
+        from types import SimpleNamespace
 
-        anonymous = helixid_mcp_middleware(MCPMiddlewareOptions(client=client, tool_scopes={TOOL: ["orders:admin"]}, needs_authorization=na))
+        class Verifier:
+            """A verified proof whose principal the local verifier did not name (story F-2): nothing to bind the token to."""
+
+            def verify_call(self, call: Any) -> Any:
+                return SimpleNamespace(ok=True, effective_scopes=["orders:read"], proof_did=None, level="L1", proof_assurance=None, fresh=True, reasons=[])
+
+        anonymous = helixid_mcp_middleware(MCPMiddlewareOptions(verifier=Verifier(), tool_scopes={TOOL: ["orders:admin"]}, needs_authorization=na))
         with pytest.raises(middleware.ToolScopeError):
-            anonymous.authorize({"name": TOOL, "headers": {"authorization": f"HelixVP {encode_helix_vp({'id': 'vp'})}"}})  # type: ignore[attr-defined]
+            anonymous.authorize({"name": TOOL, "_meta": {"org.kya-os/request-proof": {"prf": "org.kya-os/proof.v1"}}})  # type: ignore[attr-defined]
         unnamed = helixid_mcp_middleware(MCPMiddlewareOptions(validate_oauth_token=validate, required_scopes=["orders:admin"], needs_authorization=na))
         with pytest.raises(middleware.ToolScopeError):
             unnamed.authorize({"headers": {"authorization": "Bearer agent"}})  # type: ignore[attr-defined]
