@@ -25,7 +25,24 @@ from __future__ import annotations
 # Agent
 from .wallet import AgentWallet, WalletCredential
 # KYA-OS story F-1: the credential split (identity, capability attestations, delegation hops).
-from .credential_store import CredentialStore
+from .credential_store import (
+    BitstringStatusEntry,
+    CapabilityAttestation,
+    CredentialSigner,
+    CredentialStore,
+    CredentialStoreData,
+    DataIntegrityProof,
+    DelegationHop,
+    PresentedChain,
+    SignAttestationsOptions,
+    StoredCredential,
+    sign_attestation_document,
+)
+from .credentials import (
+    CAPABILITY_ATTESTATION_TYPE,
+    DELEGATION_CREDENTIAL_TYPE,
+    IDENTITY_CREDENTIAL_TYPE,
+)
 from .vp_builder import VPBuilder, VPBuilderSignOverrides
 
 # Verifier
@@ -127,6 +144,19 @@ __all__ = [
     "AgentWallet",
     "WalletCredential",
     "CredentialStore",
+    "sign_attestation_document",
+    "CredentialSigner",
+    "BitstringStatusEntry",
+    "DataIntegrityProof",
+    "StoredCredential",
+    "CapabilityAttestation",
+    "DelegationHop",
+    "CredentialStoreData",
+    "PresentedChain",
+    "SignAttestationsOptions",
+    "IDENTITY_CREDENTIAL_TYPE",
+    "CAPABILITY_ATTESTATION_TYPE",
+    "DELEGATION_CREDENTIAL_TYPE",
     "VPBuilder",
     "VPBuilderSignOverrides",
     "verify_vp",

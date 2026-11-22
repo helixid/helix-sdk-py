@@ -9,8 +9,10 @@ mcp-middleware/src/middleware.ts.
 
 Call it for every incoming tool call with the tool name, the MCP request's
 `_meta` and, over HTTP, the request headers. It identifies the caller (a
-HelixID VP, or an OAuth bearer token), checks the tool's scopes, records the
-decision, and returns the call or raises. Tool arguments are never consulted.
+KYA-OS request proof, verified in-process by the local verifier, story F-2;
+or an OAuth bearer token), checks the tool's scopes, records the decision,
+and returns the call or raises. Tool arguments are never consulted, and the
+Helix API is never asked about a credential.
 """
 
 from __future__ import annotations
@@ -22,49 +24,20 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from helix_sdk import verify_vp
-from helix_sdk.errors import HelixError, VPMissingError, VPVerificationFailedError
-from helix_sdk.vp_transport import decode_helix_vp
-
 from .credentials import extract_credential
 from .errors import (
     OAUTH_TOKEN_INVALID,
+    PROOF_INVALID,
+    PROOF_MISSING,
     TOOL_NOT_PERMITTED,
     AuthorizationServerUnavailableError,
     MCPAuthError,
+    ProofError,
     ToolScopeError,
 )
 from .oauth import AuthResult, create_oauth_validator
 from .types import MCPMiddlewareOptions, MCPToolCall
-
-# The HelixID API reports a bad credential the way the local verifier does: as
-# a typed error (VC_REVOKED, VP_EXPIRED, VP_SIGNATURE_INVALID, a target
-# service mismatch, ...), not as `valid: false`. Those are the caller's fault
-# and become a 401. Anything else from the API (our own API key refused, the
-# API down) is a server fault and is passed through unmapped.
-_CREDENTIAL_FAULT_PREFIXES = ("VP_", "VC_", "DELEGATION_", "CONSENT_GRANT_")
-_CREDENTIAL_FAULT_CODES = {
-    "DID_NOT_FOUND",
-    "INVALID_DID_FORMAT",
-    "UNSUPPORTED_DID_METHOD",
-    "SELF_SIGNED_VC_NOT_ALLOWED",
-    "MAX_DELEGATION_DEPTH_EXCEEDED",
-    "SCOPE_ESCALATION_DENIED",
-    "CREDENTIAL_NOT_FOR_THIS_AGENT",
-    "SERVICE_NOT_FOUND",
-    "VALIDATION_ERROR",
-}
-
-
-# Codes to_http_error_response() answers as the caller's fault. If the API uses
-# one of them about this server's own request, it must not reach the caller as such.
-_CALLER_FACING_CODES = {"INSUFFICIENT_SCOPE"}
-
-
-def _is_credential_fault(err: BaseException) -> bool:
-    code = getattr(err, "code", None)
-    return isinstance(code, str) and (code.startswith(_CREDENTIAL_FAULT_PREFIXES) or code in _CREDENTIAL_FAULT_CODES)
-
+from .verify_locally import LocalVerifier, LocalVerifierOptions, create_local_verifier
 
 class _AsyncCallbackError(TypeError):
     """A configuration error (an async callback behind the sync gate), never a verdict on a token."""
@@ -89,6 +62,23 @@ def _as_auth_result(value: Any) -> Optional[AuthResult]:
     return None
 
 
+def _is_local_verifier(value: Any) -> bool:
+    return callable(getattr(value, "verify_call", None))
+
+
+def _build_verifier(options: MCPMiddlewareOptions, service_did: Optional[str]) -> Any:
+    """The local verifier the gate runs: the one given, or one built from its settings."""
+    settings = options.verifier
+    if settings is None or _is_local_verifier(settings):
+        return settings
+    if not isinstance(settings, LocalVerifierOptions):
+        raise TypeError("`verifier` must be a LocalVerifier or LocalVerifierOptions")
+    catalog = settings.catalog
+    if catalog is None and options.tool_scopes is not None:
+        catalog = list(dict.fromkeys(scope for scopes in options.tool_scopes.values() for scope in scopes))
+    return create_local_verifier(replace(settings, service_did=settings.service_did or service_did, catalog=catalog))
+
+
 def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCall], MCPToolCall]:
     if options.oauth is not None and options.validate_oauth_token is not None:
         raise ValueError("Provide either `oauth` or `validate_oauth_token`, not both")
@@ -99,6 +89,8 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
         create_oauth_validator(options.oauth) if options.oauth is not None else None
     )
     service_did = options.service_did or options.expected_target_service
+    # The verifier runs in-process (story F-2): nothing here ever asks the Helix API about a credential.
+    local_verifier = _build_verifier(options, service_did)
 
     def audit(caller: Dict[str, Any], tool_name: Optional[str], denied: Optional[Dict[str, str]]) -> None:
         if options.audit_sink is None:
@@ -110,7 +102,7 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
             "authMethod": caller["authMethod"],
             "effectiveScopes": list(caller["scopes"]),
         }
-        for key in ("agentDid", "oauthSubject", "vpId"):
+        for key in ("agentDid", "oauthSubject", "level", "fresh"):
             if caller.get(key) is not None:
                 event[key] = caller[key]
         if tool_name is not None:
@@ -128,49 +120,50 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
                 options.on_audit_error(exc)
 
     def middleware(tool_call: MCPToolCall) -> MCPToolCall:
-        # Credentials come from Authorization / X-Helix-VP / _meta only; tool
-        # arguments are never consulted. Ambiguous credentials raise.
+        # Credentials come from Authorization or `_meta` only; tool arguments
+        # are never consulted. Ambiguous credentials raise.
         credential = extract_credential(tool_call.get("headers"), tool_call.get("_meta"))
+        name = tool_call.get("name")
+        tool_name = name if isinstance(name, str) else None
         if credential is None:
-            raise VPMissingError(
-                'No credentials: send Authorization: HelixVP, X-Helix-VP, MCP _meta["x-helix-vp"]'
-                + (", or Authorization: Bearer" if validate_oauth else "")
+            raise ProofError(
+                PROOF_MISSING,
+                'No credentials: send a KYA-OS request proof in _meta["org.kya-os/request-proof"]'
+                + (", or Authorization: Bearer" if validate_oauth else ""),
             )
 
         caller: Dict[str, Any]
-        if credential.kind == "vp":
-            if options.client is None:
-                raise ValueError("helixid_mcp_middleware: `client` is required to verify HelixID VPs")
-            vp = decode_helix_vp(credential.value)
-            try:
-                result = verify_vp(
-                    vp,
-                    options.client,
-                    expected_target_service=options.expected_target_service,
-                    allow_self_signed=options.allow_self_signed,
-                )
-            except Exception as exc:  # noqa: BLE001 - classified by its code, whatever its type
-                if _is_credential_fault(exc):
-                    raise VPVerificationFailedError(str(exc)) from exc
-                if getattr(exc, "code", None) in _CALLER_FACING_CODES:
-                    # About this server's own access to the API, not the caller: keep
-                    # it from being answered as the caller's 401 / 403.
-                    raise RuntimeError(f"The HelixID API refused the verification request: {exc}") from exc
-                raise
-            if not result.get("valid"):
-                error_message = result.get("error")
-                raise VPVerificationFailedError(error_message) if error_message else VPVerificationFailedError()
+        if credential.kind == "proof":
+            if local_verifier is None:
+                raise ValueError("helixid_mcp_middleware: `verifier` is required to verify KYA-OS request proofs")
+            call: Dict[str, Any] = {"name": tool_name, "input": tool_call.get("input"), "_meta": tool_call.get("_meta")}
+            if tool_call.get("request") is not None:
+                call["request"] = tool_call["request"]
+            result = local_verifier.verify_call(call)
+            if result is None:  # pragma: no cover - extract_credential found a proof, so verify_call reads one
+                raise ProofError(PROOF_MISSING, "The request carries no KYA-OS request proof")
+            if not result.ok:
+                refused = ProofError(PROOF_INVALID, f"The request proof was refused: {', '.join(result.reasons)}", result.reasons)
+                if result.proof_did is not None:
+                    audit(
+                        {"authMethod": "kyaos", "scopes": [], "agentDid": result.proof_did, "level": result.level, "fresh": result.fresh},
+                        tool_name,
+                        {"reason": ",".join(result.reasons)},
+                    )
+                raise refused
             caller = {
-                "authMethod": "helixvp",
-                "scopes": list(result.get("effectiveScopes") or []),
-                "agentDid": result.get("agentDid"),
-                "vpId": result.get("vpId"),
+                "authMethod": "kyaos",
+                "scopes": list(result.effective_scopes),
+                "agentDid": result.proof_did,
+                "level": result.level,
+                "proofAssurance": result.proof_assurance,
+                "fresh": result.fresh,
             }
         else:
             if validate_oauth is None:
                 raise MCPAuthError(OAUTH_TOKEN_INVALID, "Bearer tokens are not accepted by this server")
             try:
-                auth = _as_auth_result(_refuse_awaitable(validate_oauth(credential.value), "validate_oauth_token"))
+                auth = _as_auth_result(_refuse_awaitable(validate_oauth(credential.token), "validate_oauth_token"))
             except (MCPAuthError, AuthorizationServerUnavailableError, _AsyncCallbackError):
                 # Our own verdicts pass through; the authorization server being
                 # down is a server fault, not a bad token.
@@ -183,8 +176,6 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
 
         # Authorization. With a tool_scopes map the default is deny: an
         # unlisted tool (or a call with no tool name) never runs.
-        name = tool_call.get("name")
-        tool_name = name if isinstance(name, str) else None
         required: List[str]
         if options.tool_scopes is not None:
             if tool_name is None or tool_name not in options.tool_scopes:
@@ -202,6 +193,7 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
         audit(caller, tool_name, None)
         return tool_call
 
+    middleware.verifier = local_verifier  # type: ignore[attr-defined]
     return middleware
 
 
@@ -231,11 +223,16 @@ def _on_loop(callback: Callable[..., Any]) -> Callable[..., Any]:
 def async_helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCall], Awaitable[MCPToolCall]]:
     """The same gate for async MCP servers: runs the (blocking, network-bound)
     check in a worker thread so the event loop stays free. `validate_oauth_token`,
-    `audit_sink` and `on_audit_error` may be sync or async here."""
+    `audit_sink`, `on_audit_error` and the verifier settings'
+    `report_verification` may be sync or async here."""
     if options.oauth is not None and options.validate_oauth_token is not None:
         raise ValueError("Provide either `oauth` or `validate_oauth_token`, not both")
+    verifier = options.verifier
+    if isinstance(verifier, LocalVerifierOptions) and verifier.report_verification is not None:
+        verifier = replace(verifier, report_verification=_on_loop(verifier.report_verification))
     bridged = replace(
         options,
+        verifier=verifier,
         validate_oauth_token=_on_loop(options.validate_oauth_token) if options.validate_oauth_token else None,
         audit_sink=_on_loop(options.audit_sink) if options.audit_sink else None,
         on_audit_error=_on_loop(options.on_audit_error) if options.on_audit_error else None,
@@ -249,4 +246,5 @@ def async_helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCP
         finally:
             _LOOP.reset(token)
 
+    middleware.verifier = gate.verifier  # type: ignore[attr-defined]
     return middleware

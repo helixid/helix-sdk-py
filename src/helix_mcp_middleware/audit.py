@@ -13,8 +13,10 @@ from typing import Any, Callable, Dict, Optional
 ToolAuditEvent = Dict[str, Any]
 """One authorization decision for one tool call. Keys match the JS event and
 the API's wire format: event ('AUTHZ_GRANTED' | 'AUTHZ_DENIED'), result
-('allowed' | 'denied'), timestamp, authMethod ('helixvp' | 'oauth'),
-effectiveScopes, and when known agentDid, oauthSubject, vpId, toolName,
+('allowed' | 'denied'), timestamp, authMethod ('kyaos' | 'oauth'),
+effectiveScopes, and when known agentDid (the DID the request proof verified
+as), level and fresh (KYA-OS callers: the level the local verifier derived,
+story F-2, and whether every status was read live), oauthSubject, toolName,
 requiredScope, reason, serviceDid."""
 
 AuditSink = Callable[[ToolAuditEvent], None]
@@ -49,9 +51,11 @@ def create_helix_audit_sink(
         }
         if did:
             body["serviceDid"] = did
-        for key in ("agentDid", "vpId", "toolName", "requiredScope", "reason", "oauthSubject"):
+        for key in ("agentDid", "level", "toolName", "requiredScope", "reason", "oauthSubject"):
             if event.get(key):
                 body[key] = event[key]
+        if event.get("fresh") is not None:
+            body["fresh"] = event["fresh"]
         client = http
         if client is None:
             import requests

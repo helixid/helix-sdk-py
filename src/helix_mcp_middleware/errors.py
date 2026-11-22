@@ -4,13 +4,12 @@
 # You may obtain a copy of the License at
 #    http://www.apache.org/licenses/LICENSE-2.0
 """Errors raised by the middleware itself, ported from helix-sdk-js's
-mcp-middleware/src/errors.ts. Missing/invalid VPs and insufficient scope
-still use the helix_sdk errors (VP_MISSING, VP_VERIFICATION_FAILED,
-INSUFFICIENT_SCOPE) so existing handlers keep working."""
+mcp-middleware/src/errors.ts. Insufficient scope still uses the helix_sdk
+error (INSUFFICIENT_SCOPE) so existing handlers keep working."""
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
 from helix_sdk.errors import HelixError, InsufficientScopeError
 
@@ -26,6 +25,24 @@ class MCPAuthError(HelixError):
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(code, message, _STATUS[code])
+
+
+PROOF_MISSING = "PROOF_MISSING"
+PROOF_INVALID = "PROOF_INVALID"
+
+
+class ProofError(HelixError):
+    """A KYA-OS request proof that is absent (PROOF_MISSING), or that the local
+    verifier refused (PROOF_INVALID), story F-2. ``reasons`` carries the
+    verifier's reason codes (``nonce_replayed``, ``audience_mismatch``,
+    ``attenuation_violation``, ...), so a host can answer or log the refusal
+    without parsing the message. Always HTTP 401."""
+
+    def __init__(self, code: str, message: str, reasons: Sequence[str] = ()) -> None:
+        if code not in (PROOF_MISSING, PROOF_INVALID):
+            raise ValueError(f"ProofError code must be {PROOF_MISSING} or {PROOF_INVALID}")
+        super().__init__(code, message, 401)
+        self.reasons: Tuple[str, ...] = tuple(reasons)
 
 
 class ToolScopeError(InsufficientScopeError):

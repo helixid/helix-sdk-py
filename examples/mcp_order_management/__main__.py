@@ -8,9 +8,20 @@
 Configuration (environment), the same as the JS sample:
   PORT, HOST            listen address (default 3700 on 127.0.0.1)
   MCP_RESOURCE          public URL of the MCP endpoint (default http://localhost:$PORT/mcp); the OAuth audience
-  HELIX_API_URL         HelixID API to verify VPs and write audit events. Required whenever
-  HELIX_API_KEY         HELIX_API_KEY is set: there is deliberately no default URL.
-  SERVICE_DID           this server's DID: VPs for other services are rejected
+  HELIX_API_URL         HelixID API the audit sink writes to. Required whenever HELIX_API_KEY
+  HELIX_API_KEY         is set: there is deliberately no default URL. Never on the request path.
+  SERVICE_DID           this server's DID: the KYA-OS door (story F-2). Every tool call that carries
+                        a request proof in _meta["org.kya-os/request-proof"] (and its delegation chain
+                        in _meta["org.kya-os/delegation-chain"]) is verified in-process against this
+                        DID as audience and resource, from public DID documents, status lists and the
+                        agent's Entity Card alone. Optional:
+  KYAOS_TRUSTED_ISSUERS   comma-separated attestation issuers, or * (default: allow all)
+  KYAOS_TRUSTED_ROOTS     comma-separated DIDs the root hop may be issued by (default: any)
+  KYAOS_MAX_CHAIN_LENGTH  longest carried chain read (default 10)
+  KYAOS_CARDS_FILE        JSON file mapping agent DIDs to their Entity Cards (local config, read before
+                          the card is fetched from the agent's DID document)
+  KYAOS_ALLOW_LOOPBACK_HTTP=1  development only: read DID documents, cards and status lists over
+                          http on loopback hosts
   OAUTH_ISSUER          OAuth door, one authorization server. The issuer alone is enough: its keys are
                         read from its metadata (aud must be MCP_RESOURCE). Optional:
   OAUTH_JWKS_URI          its jwks_uri, to skip discovery
@@ -35,9 +46,9 @@ from typing import Any, Dict, List, NoReturn, Optional
 
 import uvicorn
 
-from helix_sdk import HelixClient
 from helix_mcp_middleware import (
     AuthResult,
+    LocalVerifierOptions,
     MCPMiddlewareOptions,
     OAuthIntrospectionOptions,
     OAuthIssuerOptions,
@@ -49,6 +60,7 @@ from helix_mcp_middleware import (
 )
 
 from .app import create_order_app
+from .orders import TOOL_SCOPES
 
 DEMO_TOKENS = {
     "demo-reader": AuthResult(sub="demo-reader", scopes=["orders:read"]),
@@ -180,6 +192,50 @@ def oauth_issuers_from_env(env: Dict[str, str], resource: str) -> List[OAuthIssu
     return issuers
 
 
+def did_list(env: Dict[str, str], name: str) -> Optional[List[str]]:
+    """A comma-separated list of DIDs, or None when the variable is unset or `*`."""
+    raw = (env.get(name) or "").strip()
+    if not raw or raw == "*":
+        return None
+    dids = [did.strip() for did in raw.split(",") if did.strip()]
+    if any(not did.startswith("did:") for did in dids):
+        fail(f"{name} must list DIDs")
+    return dids
+
+
+def verifier_from_env(env: Dict[str, str], service_did: str) -> LocalVerifierOptions:
+    """The local verifier's settings (story F-2), the same variables as the JS sample."""
+    max_chain_length: Optional[int] = None
+    if env.get("KYAOS_MAX_CHAIN_LENGTH"):
+        try:
+            max_chain_length = int(env["KYAOS_MAX_CHAIN_LENGTH"])
+        except ValueError:
+            max_chain_length = 0
+        if max_chain_length < 1:
+            fail("KYAOS_MAX_CHAIN_LENGTH must be a positive integer")
+    cards: Optional[Dict[str, Any]] = None
+    if env.get("KYAOS_CARDS_FILE"):
+        try:
+            with open(env["KYAOS_CARDS_FILE"], encoding="utf-8") as handle:
+                cards = json.load(handle)
+        except (OSError, ValueError) as error:
+            fail(f"KYAOS_CARDS_FILE: {error}")
+        if not isinstance(cards, dict):
+            fail("KYAOS_CARDS_FILE must hold a JSON object of agent DID to card")
+    trusted = did_list(env, "KYAOS_TRUSTED_ISSUERS")
+    return LocalVerifierOptions(
+        service_did=service_did,
+        trusted_issuers=trusted if trusted is not None else "*",
+        trusted_root_issuers=did_list(env, "KYAOS_TRUSTED_ROOTS"),
+        max_chain_length=max_chain_length,
+        cards=cards,
+        allow_loopback_http=env.get("KYAOS_ALLOW_LOOPBACK_HTTP") == "1",
+        catalog=list(dict.fromkeys(scope for scopes in TOOL_SCOPES.values() for scope in scopes)),
+        # Story A-1 connects the audit trail here; until then each verification is logged once as unrecorded.
+        log=lambda message: print(message, file=sys.stderr),
+    )
+
+
 def main() -> None:
     env = dict(os.environ)
     try:
@@ -192,7 +248,7 @@ def main() -> None:
     demo = env.get("DEMO_MODE") == "1"
 
     if api_key and not api_url:
-        # HelixClient given only an API key talks to the hosted production API.
+        # An audit sink given only an API key would talk to the hosted production API.
         fail("HELIX_API_KEY is set but HELIX_API_URL is not; set HELIX_API_URL explicitly (e.g. a local server)")
     if demo and host not in ("127.0.0.1", "localhost", "::1"):
         fail("DEMO_MODE accepts fixed tokens and is only allowed on a loopback HOST")
@@ -205,10 +261,14 @@ def main() -> None:
         service_did=service_did or None,
         on_audit_error=lambda error: print("audit write failed:", error, file=sys.stderr),
     )
-    if api_url:
-        auth.client = HelixClient(api_url, api_key=api_key) if api_key else HelixClient(api_url)
-        if api_key:
-            auth.audit_sink = create_helix_audit_sink(api_url, api_key, service_did=service_did or None)
+    if api_url and api_key:
+        # The audit sink is the only thing that talks to the Helix API, and never on the request path.
+        auth.audit_sink = create_helix_audit_sink(api_url, api_key, service_did=service_did or None)
+    if service_did:
+        # The KYA-OS door (story F-2): every request proof is verified here, in-process.
+        auth.verifier = verifier_from_env(env, service_did)
+    elif any(env.get(name) for name in ("KYAOS_TRUSTED_ISSUERS", "KYAOS_TRUSTED_ROOTS", "KYAOS_MAX_CHAIN_LENGTH", "KYAOS_CARDS_FILE")):
+        fail("KYAOS_TRUSTED_ISSUERS / KYAOS_TRUSTED_ROOTS / KYAOS_MAX_CHAIN_LENGTH / KYAOS_CARDS_FILE need SERVICE_DID")
     if demo:
         def demo_token(token: str) -> AuthResult:
             if token not in DEMO_TOKENS:
@@ -218,8 +278,8 @@ def main() -> None:
         auth.validate_oauth_token = demo_token
     elif issuers:
         auth.oauth = issuers
-    if auth.client is None and auth.validate_oauth_token is None and auth.oauth is None:
-        fail("no way to authenticate callers: set HELIX_API_URL (HelixID VPs), OAUTH_ISSUER / OAUTH_ISSUERS, or DEMO_MODE=1")
+    if auth.verifier is None and auth.validate_oauth_token is None and auth.oauth is None:
+        fail("no way to authenticate callers: set SERVICE_DID (KYA-OS request proofs), OAUTH_ISSUER / OAUTH_ISSUERS, or DEMO_MODE=1")
 
     try:
         app = create_order_app(
@@ -232,7 +292,16 @@ def main() -> None:
         fail(str(error))
 
     print(f"order-management MCP server on {resource}")
-    print(f"  HelixID VPs: {'verified via ' + api_url if auth.client else 'off (set HELIX_API_URL)'}")
+    verifier = auth.verifier
+    print(
+        "  KYA-OS proofs: "
+        + (
+            f"verified in-process for {service_did}, trusted issuers {env.get('KYAOS_TRUSTED_ISSUERS') or '*'}, "
+            f"chain length <= {env.get('KYAOS_MAX_CHAIN_LENGTH') or 10}"
+            if verifier is not None
+            else "off (set SERVICE_DID)"
+        )
+    )
     print(f"  OAuth:       {'DEMO tokens demo-reader, demo-admin' if demo else ', '.join(i.issuer for i in issuers) or 'off'}")
     print(f"  Audit:       {api_url + '/v1/audit-log/events' if auth.audit_sink else 'off (set HELIX_API_URL + HELIX_API_KEY)'}")
     uvicorn.run(app, host=host, port=port, log_level="warning")
