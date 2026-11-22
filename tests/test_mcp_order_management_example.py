@@ -218,8 +218,9 @@ def test_a_request_proof_with_its_chain_is_verified_in_process_and_the_scope_is_
     assert res.status_code == 403, res.text
     assert 'scope="orders:read"' in res.headers["www-authenticate"]
     # Story F-2 with A-1: the verified proof at its level, attributed to the agent, then the decision.
+    # Story C-C: with no bearer token to fuse its cnf, the proof's L3 is L3-minus.
     assert app.event_types == ["session.established", "proof.verified", "authorization.denied", "tool.call.denied"]
-    assert app.audit[1]["details"] == {"family": "proof", "phase": "verified", "verificationCode": "KYAOS_PROOF_L3"}
+    assert app.audit[1]["details"] == {"family": "proof", "phase": "verified", "verificationCode": "KYAOS_PROOF_L3_MINUS"}
     assert all(e["actor"] == {"kind": "pairwise_did", "did": AGENT_DID} for e in app.audit[1:])
     assert app.audit[2]["reason"] == {"code": "insufficient_scope"} and app.audit[2]["authorization"]["source"] == "delegation"
     assert AGENT_DID not in json.dumps([e.get("details") for e in app.audit])
