@@ -81,6 +81,7 @@ from helix_sdk.credentials import (
 )
 from helix_sdk.crypto.jws import EnvSigner
 from helix_sdk.did import build_did_document
+from helix_sdk.did_resolver import did_key_document
 from helix_sdk.keys import derive_public_key, public_key_to_multibase
 
 NOW = parse_date_time("2026-06-01T00:00:00Z")
@@ -93,7 +94,8 @@ class Actor:
         self.key = (seed * 64)[:64]
         self.did = f"did:key:{public_key_to_multibase(derive_public_key(self.key))}"
         self.signer = EnvSigner(self.did, env_var="K", env={"K": self.key})
-        self.document = build_did_document(self.did, derive_public_key(self.key))
+        # The W3C did:key document: its one method is did:key:z…#z…, the kid a did:key signer names by default.
+        self.document = did_key_document(self.did)
 
 
 HELIX, OWNER, USER, PARENT, AGENT, STRANGER = (Actor(seed) for seed in "123456")
@@ -213,11 +215,11 @@ class TestDataIntegrity:
 
     def test_sign_and_verify(self) -> None:
         signed = sign_data_integrity(self.document, HELIX.signer, "2026-01-01T00:00:00Z")
-        assert signed["proof"]["verificationMethod"] == f"{HELIX.did}#key-1"
+        assert signed["proof"]["verificationMethod"] == HELIX.signer.verification_method_id
         assert signed["proof"]["proofValue"].startswith("z")
         assert len(hash_data({}, {})) == 64
         verdict = verify_data_integrity(signed, resolve)
-        assert verdict.ok and verdict.details == {"issuer": HELIX.did, "verificationMethod": f"{HELIX.did}#key-1"}
+        assert verdict.ok and verdict.details == {"issuer": HELIX.did, "verificationMethod": HELIX.signer.verification_method_id}
         assert verify_data_integrity(sign_data_integrity({**self.document, "issuer": {"id": HELIX.did}}, HELIX.signer), resolve).ok
         bare = {k: v for k, v in self.document.items() if k != "@context"}
         assert verify_data_integrity(sign_data_integrity(bare, HELIX.signer), resolve).ok
@@ -617,7 +619,8 @@ class TestHelixCoreFixture:
             assert validate_credential("attestation", attestation["credential"]) == []
         owner_signed = next(a for a in fixture["attestations"] if a["signer"] == "owner")
         owner = fixture["keys"]["owner"]
-        signer = EnvSigner(owner["did"], env_var="K", env={"K": owner["private_key_hex"]})
+        # The fixture names its own kid (#key-1); pin it so the signature matches the checked-in bytes.
+        signer = EnvSigner(owner["did"], kid=owner["kid"].split("#", 1)[1], env_var="K", env={"K": owner["private_key_hex"]})
         inp = owner_signed["input"]
         store = CredentialStore()
         [signed] = store.sign_attestations([inp["capability"]], signer, subject_did=inp["subjectDid"], valid_until=inp["validUntil"], valid_from=inp["validFrom"], status_entries=[owner_signed["credential"]["credentialStatus"]], ids=[inp["id"]], created=inp["proofCreated"])
@@ -749,7 +752,7 @@ class TestSignAttestationDocument:
         document = self._document(OWNER.did)
         signed = sign_attestation_document(document, OWNER.signer, "2026-01-01T00:00:00Z")
         assert signed == sign_data_integrity(document, OWNER.signer, "2026-01-01T00:00:00Z")
-        assert signed["proof"]["verificationMethod"] == f"{OWNER.did}#key-1"
+        assert signed["proof"]["verificationMethod"] == OWNER.signer.verification_method_id
         assert "proof" not in document
         assert verify_capability_attestation(signed, resolve, subject_did=AGENT.did, now_ms=parse_date_time("2026-06-01T00:00:00Z")).ok
 

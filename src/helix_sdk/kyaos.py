@@ -28,6 +28,7 @@ from __future__ import annotations
 from .crypto.jcs import CanonicalJsonError, canonicalize, hash_json
 from .crypto.jws import (
     DEFAULT_KID_FRAGMENT,
+    default_kid_fragment,
     DEFAULT_SIGNING_KEY_ENV_VAR,
     JWS_ALG,
     DidResolver,
@@ -135,7 +136,7 @@ __all__ = [
     # jcs
     "CanonicalJsonError", "canonicalize", "hash_json",
     # jws and the Signer
-    "DEFAULT_KID_FRAGMENT", "DEFAULT_SIGNING_KEY_ENV_VAR", "JWS_ALG", "DidResolver", "EnvSigner", "JwsReasons",
+    "DEFAULT_KID_FRAGMENT", "default_kid_fragment", "DEFAULT_SIGNING_KEY_ENV_VAR", "JWS_ALG", "DidResolver", "EnvSigner", "JwsReasons",
     "JwsVerification", "Signer", "base64url_decode_strict", "base64url_encode", "public_key_hex_to_jwk",
     "read_jws_header", "select_assertion_method", "sign_jws", "verification_method_to_jwk", "verify_jws",
     "verify_jws_by_kid", "InvalidJWSError",

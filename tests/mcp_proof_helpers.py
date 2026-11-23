@@ -48,7 +48,8 @@ __all__ = [
 
 def fixture_signer(env: Mapping[str, Any], label: str) -> EnvSigner:
     key = env["keys"][label]
-    return EnvSigner(key["did"], env_var="FIXTURE_KEY", env={"FIXTURE_KEY": key["private_key_hex"]})
+    # The fixture names its own kid (its did_documents publish #key-1), so pin it rather than the did:key default.
+    return EnvSigner(key["did"], kid=key["kid"].split("#", 1)[1], env_var="FIXTURE_KEY", env={"FIXTURE_KEY": key["private_key_hex"]})
 
 
 def make_agent(did: str = "did:web:agent.helix.test") -> Dict[str, Any]:

@@ -43,6 +43,19 @@ from ..vp_crypto import base58btc_decode
 JWS_ALG = "EdDSA"
 DEFAULT_SIGNING_KEY_ENV_VAR = "HELIX_SIGNING_KEY"
 DEFAULT_KID_FRAGMENT = "key-1"
+_DID_KEY_PREFIX = "did:key:"
+
+
+def default_kid_fragment(did: str) -> str:
+    """The verification-method fragment a DID's signer names when the caller
+    gives none. A did:key document defines exactly one method,
+    ``did:key:z…#z…`` (the multibase value repeated), so a did:key signs as
+    that; ``key-1``, which build_did_document publishes for did:web and other
+    DIDs, does not exist in a did:key document and a verifier refuses it.
+    Same rule as helix-core and helix-sdk-js."""
+    if did.startswith(_DID_KEY_PREFIX) and len(did) > len(_DID_KEY_PREFIX):
+        return did[len(_DID_KEY_PREFIX):]
+    return DEFAULT_KID_FRAGMENT
 
 
 class JwsReasons:
@@ -93,12 +106,14 @@ class EnvSigner(Signer):
     def __init__(
         self,
         did: str,
-        kid: str = DEFAULT_KID_FRAGMENT,
+        kid: Optional[str] = None,
         env_var: str = DEFAULT_SIGNING_KEY_ENV_VAR,
         env: Optional[Mapping[str, str]] = None,
     ) -> None:
         if not did.startswith("did:"):
             raise ValueError("EnvSigner: did must be a DID")
+        if kid is None:
+            kid = default_kid_fragment(did)
         # The fragment alone (``key-1``, ``#key-1``) or the full verification-method
         # id the DID document publishes (``<did>#key-1``), which must be this DID's.
         fragment = kid[len(did) + 1:] if kid.startswith(f"{did}#") else kid
