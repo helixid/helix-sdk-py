@@ -258,6 +258,13 @@ from .kyaos import __all__ as _kyaos_all  # noqa: E402
 
 __all__ += _kyaos_all
 
+# Forwarding delegation context on downstream calls (story L3-D).
+from .delegation import *  # noqa: E402,F401,F403
+from .delegation import __all__ as _delegation_all  # noqa: E402
+from .types import InboundDelegationSettings  # noqa: E402
+
+__all__ += _delegation_all + ["InboundDelegationSettings"]
+
 # The /.well-known/mcp discovery document (story L1-D).
 from .well_known import (  # noqa: E402
     DEFAULT_PROOF_ALGORITHMS,

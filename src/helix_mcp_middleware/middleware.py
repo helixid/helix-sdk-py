@@ -24,8 +24,14 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from .credentials import extract_credential
+from helix_sdk.verifier import read_carried_chain, read_request_proof
+
+from .credentials import extract_credential, meta_mapping
+from .delegation.headers import has_delegation_headers
+from .delegation.inbound import verify_inbound_delegation_headers
+from .delegation.verification_cache import VerificationCache
 from .errors import (
+    CREDENTIAL_CONFLICT,
     OAUTH_TOKEN_INVALID,
     PROOF_INVALID,
     PROOF_MISSING,
@@ -63,6 +69,10 @@ class AuthorizedCaller:
     """KYA-OS callers (story C-C): True when a request proof verified; False for a chain verified without one."""
     cnf_diagnostics: Optional[List[str]] = None
     """KYA-OS callers: the ``cnf`` diagnostics (``cnf_present_but_token_unfused``)."""
+    chain: Optional[List[Any]] = None
+    """KYA-OS callers with a delegation (story L3-D): the verified chain, root first, which ``delegation_context_of`` forwards."""
+    forwarded_by: Optional[str] = None
+    """Downstream calls (story L3-D): the service that forwarded the agent's authority (the delegation proof's ``iss``)."""
 
 
 def _caller_of(caller: Dict[str, Any]) -> AuthorizedCaller:
@@ -76,6 +86,8 @@ def _caller_of(caller: Dict[str, Any]) -> AuthorizedCaller:
         fresh=caller.get("fresh"),
         proof_floor=caller.get("proofFloor"),
         cnf_diagnostics=list(caller["cnfDiagnostics"]) if caller.get("cnfDiagnostics") else None,
+        chain=list(caller["chain"]) if caller.get("chain") else None,
+        forwarded_by=caller.get("forwardedBy"),
     )
 
 class _AsyncCallbackError(TypeError):
@@ -142,6 +154,19 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
     service_did = options.service_did or options.expected_target_service
     # The verifier runs in-process (story F-2): nothing here ever asks the Helix API about a credential.
     local_verifier = _build_verifier(options, service_did)
+    # Story L3-D: downstream calls carrying KYA-OS delegation headers, verified by the same local verifier.
+    inbound_on = options.inbound_delegation is not False
+    inbound = options.inbound_delegation if inbound_on and options.inbound_delegation is not True else None
+    inbound_cache: Any = None
+    if inbound_on and local_verifier is not None and getattr(inbound, "cache", None) is not False:
+        given_cache = getattr(inbound, "cache", None)
+        status_cache = getattr(local_verifier, "status_cache", None)
+        if given_cache is not None:
+            inbound_cache = given_cache
+        elif status_cache is not None:
+            inbound_cache = VerificationCache.for_status_cache(status_cache)
+        else:
+            inbound_cache = VerificationCache()
 
     def audit(caller: Dict[str, Any], tool_name: Optional[str], denied: Optional[Dict[str, str]]) -> None:
         if options.audit_sink is None:
@@ -194,10 +219,15 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
     def authorize(tool_call: MCPToolCall) -> AuthorizedCaller:
         # Credentials come from Authorization or `_meta` only; tool arguments
         # are never consulted. Ambiguous credentials raise.
-        credential = extract_credential(tool_call.get("headers"), tool_call.get("_meta"))
         name = tool_call.get("name")
         tool_name = name if isinstance(name, str) else None
-        if credential is None:
+        forwarded = inbound_on and has_delegation_headers(tool_call.get("headers"))
+        if forwarded:
+            meta = meta_mapping(tool_call.get("_meta"))
+            if read_request_proof(meta) is not None or read_carried_chain(meta) is not None:
+                raise MCPAuthError(CREDENTIAL_CONFLICT, "Downstream delegation headers and a KYA-OS request proof or chain were both provided; send one")
+        credential = None if forwarded else extract_credential(tool_call.get("headers"), tool_call.get("_meta"))
+        if credential is None and not forwarded:
             raise ProofError(
                 PROOF_MISSING,
                 'No credentials: send a KYA-OS request proof in _meta["org.kya-os/request-proof"]'
@@ -205,7 +235,36 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
             )
 
         caller: Dict[str, Any]
-        if credential.kind == "proof":
+        if forwarded:
+            if local_verifier is None:
+                raise ValueError("helixid_mcp_middleware: `verifier` is required to verify KYA-OS delegation headers")
+            inbound_result = verify_inbound_delegation_headers(
+                tool_call.get("headers"),
+                local_verifier,
+                audience=getattr(inbound, "audience", None),
+                forwarders=getattr(inbound, "forwarders", None),
+                cache=inbound_cache,
+                live_status=minimum_level_for(level_policy, tool_name) == "L3",
+            )
+            if not inbound_result.ok:
+                if inbound_result.agent_did is not None:
+                    audit(
+                        {"authMethod": "kyaos", "scopes": [], "agentDid": inbound_result.agent_did, "level": inbound_result.level, "fresh": inbound_result.fresh},
+                        tool_name,
+                        {"reason": ",".join(inbound_result.reasons)},
+                    )
+                raise ProofError(PROOF_INVALID, f"The delegation headers were refused: {', '.join(inbound_result.reasons)}", inbound_result.reasons)
+            caller = {
+                "authMethod": "kyaos",
+                "scopes": list(inbound_result.effective_scopes),
+                "agentDid": inbound_result.agent_did,
+                "level": inbound_result.level,
+                "fresh": inbound_result.fresh,
+                "proofFloor": False,
+                "chain": inbound_result.chain,
+                "forwardedBy": inbound_result.forwarder,
+            }
+        elif credential is not None and credential.kind == "proof":
             if local_verifier is None:
                 raise ValueError("helixid_mcp_middleware: `verifier` is required to verify KYA-OS request proofs")
             # A bearer token next to a proof is its sender constraint: its cnf.jkt fuses with the proof's for L3 (section 8.6).
@@ -246,8 +305,10 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
             }
             if cnf_diagnostics:
                 caller["cnfDiagnostics"] = cnf_diagnostics
+            if isinstance(credential.chain, list) and credential.chain:
+                caller["chain"] = credential.chain
         else:
-            assert credential.token is not None
+            assert credential is not None and credential.token is not None
             auth = validate_bearer(credential.token)
             caller = {"authMethod": "oauth", "scopes": list(auth.scopes or []), "oauthSubject": auth.sub}
 

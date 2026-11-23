@@ -64,6 +64,8 @@ from helix_mcp_middleware import (
     ServeIdentityOptions,
     WellKnownMcp,
     async_helixid_mcp_middleware,
+    delegation_context_of,
+    run_with_delegation,
     audit_tool_handlers,
     build_protected_resource_metadata,
     protected_resource_metadata_url,
@@ -71,6 +73,7 @@ from helix_mcp_middleware import (
     to_http_error_response,
 )
 
+from .downstream import FORWARD_TOOL_SCOPES, DownstreamOptions, register_forward_tool
 from .orders import TOOL_SCOPES, OrderStore, create_order_store, register_order_tools
 
 MAX_BODY_BYTES = 1_000_000
@@ -156,6 +159,7 @@ def create_order_app(
     kyaos: Optional[KyaOsRuntime] = None,
     revocation_webhook: Optional[Tuple[str, Callable[[Any, Any, Any], Any]]] = None,
     well_known: Optional[WellKnownMcp] = None,
+    downstream: Optional[DownstreamOptions] = None,
 ) -> Any:
     """An ASGI app. `resource` is this server's MCP endpoint URL (MCP is
     served at its path); `auth` is everything except the scopes, which this
@@ -168,7 +172,9 @@ def create_order_app(
     document at `/.well-known/mcp` (story L1-D, from create_well_known_mcp());
     a disabled one answers 404. `revocation_webhook` (KYA-OS story L3-C) is
     `(path, asgi_app)`: the RFC 8935 receiver of Helix's revocation signals
-    (`RevocationSignalClient.asgi_webhook()`), mounted at `path`."""
+    (`RevocationSignalClient.asgi_webhook()`), mounted at `path`. `downstream`
+    (KYA-OS story L3-D) adds `forward_lookup_order`, which calls another order
+    service on the agent's behalf, forwarding its delegation."""
     url = urlsplit(resource)
     if url.scheme not in ("http", "https") or not url.hostname:
         raise ValueError(f"resource must be an http(s) URL, got {resource!r}")
@@ -179,12 +185,13 @@ def create_order_app(
     metadata = build_protected_resource_metadata(
         resource,
         authorization_servers=authorization_servers,
-        scopes_supported=list(dict.fromkeys(s for scopes in TOOL_SCOPES.values() for s in scopes)),
+        scopes_supported=list(dict.fromkeys(s for scopes in {**TOOL_SCOPES, **(FORWARD_TOOL_SCOPES if downstream else {})}.values() for s in scopes)),
         resource_name="Order Management (HelixID sample)",
     )
     served_identity = serve_identity(identity) if identity is not None else None
     # The handshake needs an identified caller, not a scope: it is listed with none (story F-2).
-    tool_scopes = {**TOOL_SCOPES, kyaos.handshake_tool_name: []} if kyaos is not None else TOOL_SCOPES
+    base_scopes = {**TOOL_SCOPES, **FORWARD_TOOL_SCOPES} if downstream is not None else TOOL_SCOPES
+    tool_scopes = {**base_scopes, kyaos.handshake_tool_name: []} if kyaos is not None else base_scopes
     # The handshake opens a session for any identified caller: it accepts every Card level (story C-C).
     tools = {**(auth.tools or {}), kyaos.handshake_tool_name: {"minimum_level": "L1"}} if kyaos is not None else auth.tools
     gate = async_helixid_mcp_middleware(replace(auth, tool_scopes=tool_scopes, required_scopes=[], tools=tools))
@@ -211,6 +218,8 @@ def create_order_app(
         # (the handshake, opened without one, runs unaudited).
         audit_tool_handlers(server)
     register_order_tools(server, store if store is not None else create_order_store())
+    if downstream is not None:
+        register_forward_tool(server, downstream)
     if kyaos is not None:
         _register_handshake(server, kyaos)
     mcp_app = server.streamable_http_app()
@@ -316,6 +325,8 @@ def create_order_app(
 
                 # KYA-OS: the proof of an allowed call is signed over the result on its way out.
                 finish: Optional[Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None
+                # Story L3-D: the delegation the allowed call carries, current while its tool runs (forwarded downstream).
+                delegation: Any = None
                 for message in [body]:
                     if not isinstance(message, dict) or message.get("method") != "tools/call":
                         continue
@@ -341,16 +352,25 @@ def create_order_app(
 
                     if kyaos is None:
                         try:
-                            await gate(tool_call)
+                            caller = await gate.authorize(tool_call)  # type: ignore[attr-defined]
                         except Exception as error:  # noqa: BLE001
                             await refuse(error)
                             return
+                        delegation = delegation_context_of(caller, correlation_id=call_audit.correlation_id if call_audit is not None else None)
                         continue
+
+                    callers: list = []
+
+                    async def authorize_and_keep(call: Dict[str, Any] = tool_call) -> Any:
+                        caller = await gate.authorize(call)  # type: ignore[attr-defined]
+                        callers.append(caller)
+                        return caller
+
 
                     try:
                         started_call = await kyaos.start(
                             {"name": name, "arguments": arguments, "_meta": meta},
-                            authorize=lambda call=tool_call: gate.authorize(call),  # type: ignore[attr-defined]
+                            authorize=authorize_and_keep,
                         )
                     except Exception as error:  # noqa: BLE001 - the proof could not be signed (its nonce store is down, say)
                         if call_audit is not None:
@@ -371,8 +391,16 @@ def create_order_app(
                     message["params"] = {**params, "arguments": started_call.arguments}
                     raw = json.dumps(body).encode("utf-8")
                     finish = started_call.finish
+                    if callers:
+                        session = started_call.session
+                        delegation = delegation_context_of(
+                            callers[-1],
+                            session_id=session.id if session is not None else None,
+                            correlation_id=call_audit.correlation_id if call_audit is not None else None,
+                        )
 
-                await handle(scope, raw, receive, send, finish, server_error)
+                with run_with_delegation(delegation):
+                    await handle(scope, raw, receive, send, finish, server_error)
         except Exception as error:  # noqa: BLE001 - not the caller's fault: a 500 (or 503), reported
             if on_server_error is not None:
                 on_server_error(error)
