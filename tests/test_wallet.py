@@ -33,7 +33,7 @@ from helix_sdk import (
     verify_signature,
 )
 from helix_sdk.errors import CredentialAlreadyInWalletError, CredentialNotForThisAgentError
-from helix_sdk.vp_crypto import hash_canonical_payload
+from helix_sdk.crypto.common import hash_canonical_payload
 
 
 def _build_agent_vc(did: str, scopes: List[str], max_delegation_depth: int = 0) -> Dict[str, Any]:
@@ -75,7 +75,7 @@ def _build_grant_vc(agent_did: str, issuer_did: str, user_did: str, scopes: List
 
 
 def _decode_proof_value(proof_value: str) -> str:
-    from helix_sdk.vp_crypto import base58btc_decode
+    from helix_sdk.crypto.common import base58btc_decode
 
     # create_ed25519_proof writes the signature as plain base58btc, with no multibase "z"
     # prefix. Do not strip a leading "z": about 1 signature in 280 happens to

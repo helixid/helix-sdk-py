@@ -38,7 +38,7 @@ import nacl.signing
 
 from ..errors import InvalidJWSError
 from ..keys import _normalize_ed25519_private_key, derive_public_key, multibase_to_public_key_hex
-from ..vp_crypto import base58btc_decode
+from .common import base58btc_decode
 
 JWS_ALG = "EdDSA"
 DEFAULT_SIGNING_KEY_ENV_VAR = "HELIX_SIGNING_KEY"

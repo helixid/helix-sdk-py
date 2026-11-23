@@ -36,7 +36,7 @@ from .card_schema import ENTITY_CARD_SCHEMA
 from .chain import evaluate_delegation_chain_rules
 from .codes import ReasonCodes
 from .request_proof import DEFAULT_PROOF_SKEW_SECONDS, MAX_PROOF_TTL_SECONDS
-from .revocation import RevocationChecker, RevocationContext, check_chain_revocation, revocation_checker_of
+from .revocation import RevocationChecker, RevocationContext, RevocationVerdict, check_chain_revocation, revocation_checker_of
 from .status import FetchStatusList, StatusListRead
 from .verify_request_proof import RequestProofOptions, verify_request_proof
 
@@ -368,6 +368,28 @@ def verify(
         if hops is not None and responsible is not None and responsible != summary.responsible_party:
             refusals.add(ReasonCodes.ROOT_NOT_RESPONSIBLE_PARTY, f"the root issuer {summary.responsible_party} is not the card's responsibleParty {responsible}")
             return _refused(refusals, summary, **proved)
+    # The card's own revocation entry (SPEC-ENTITY-CARD section 10.3; Cleanup, Harish's pick A): a
+    # revoked agent is refused. The list's keeper is the card's DID unless the configuration binds the
+    # URL (status_list_issuers) to another issuer, as a Helix card's list is bound to Helix.
+    card_fresh = True
+    card_revocation = entity_card.get("revocation") if entity_card is not None else None
+    if entity_card is not None and card_revocation is not None:
+        card_checker = _revocation_seam(seams, options)
+        if card_checker is None:
+            refusals.add(ReasonCodes.STATUS_SEAM_MISSING, "no fetch_status_list seam: the card's revocation entry cannot be read")
+            return _refused(refusals, summary, **proved)
+        entry = {"type": "BitstringStatusListEntry", "statusPurpose": "revocation", **card_revocation}
+        try:
+            card_verdict = card_checker(
+                {"issuer": entity_card["id"], "credentialStatus": entry},
+                RevocationContext(now_ms=now, scopes=_request_scopes(options, leaf_allowed_action), reads=reads, live=options.live_status),
+            )
+        except Exception as exc:  # noqa: BLE001 - a checker that raises fails closed
+            card_verdict = RevocationVerdict(True, False, ReasonCodes.STATUS_UNAVAILABLE, f"the revocation check failed: {exc}")
+        if card_verdict.revoked:
+            refusals.add(card_verdict.code or ReasonCodes.STATUS_REVOKED, f"the card's revocation entry: {card_verdict.message or 'revoked'}")
+            return _refused(refusals, summary, **proved)
+        card_fresh = card_verdict.fresh
     capabilities = CapabilityCheck()
     if entity_card is not None and isinstance(entity_card.get("capabilities"), list) and entity_card["capabilities"]:
         assert seams.resolve_did is not None
@@ -388,7 +410,7 @@ def verify(
     # 8. Authority and level (story F-1 point 4; section 9.4): the proof floor holds only when a proof verified.
     catalog = options.catalog if options.catalog is not None else leaf_allowed_action
     effective_scopes = derive_effective_scopes(capabilities.verified, leaf_allowed_action, catalog)
-    fresh = chain_fresh and capabilities.fresh
+    fresh = chain_fresh and capabilities.fresh and card_fresh
     proof_floor = proof_did is not None
     level = derive_conformance_level({"verified": capabilities.verified, "unverified": capabilities.unverified}, proof_floor, fresh)
     return VerifierResult(

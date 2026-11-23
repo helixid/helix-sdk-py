@@ -140,8 +140,8 @@ class FixtureLists:
             "validUntil": listed["valid_until"],
             "credentialSubject": {"id": f"{url}#list", "type": "BitstringStatusList", "statusPurpose": listed["status_purpose"], "encodedList": encoded_bits(16, self.revoked.get(url, []))},
         }
-        # The fixture documents publish #key-1 for these did:keys: sign under the fixture's own kid.
-        signer = EnvSigner(listed["issuer"], kid="key-1", env_var="K", env={"K": key["private_key_hex"]})
+        # The fixture documents publish each did:key's W3C method (#<multibase>), the EnvSigner default.
+        signer = EnvSigner(listed["issuer"], env_var="K", env={"K": key["private_key_hex"]})
         return sign_data_integrity(document, signer, created="2026-01-01T00:00:00Z")
 
     def revoke(self, url: str, index: int) -> None:
@@ -324,7 +324,7 @@ def test_a_bad_signature_or_unknown_issuer_is_ignored_and_reported_and_revokes_n
     stranger = fixture_signer(world["env"], "stranger")
     foreign = sign_revocation_signal(world["chain"][0]["id"], stranger, iat=NOW_MS // 1000)
     assert client.handle(foreign, "webhook").reason == "signal_unknown_issuer"
-    forged_signer = EnvSigner(helix.did, kid="key-1", env_var="K", env={"K": world["env"]["keys"]["stranger"]["private_key_hex"]})
+    forged_signer = EnvSigner(helix.did, env_var="K", env={"K": world["env"]["keys"]["stranger"]["private_key_hex"]})
     forged = sign_revocation_signal(world["chain"][0]["id"], forged_signer, iat=NOW_MS // 1000)
     assert client.handle(forged).reason == "signal_bad_signature"
     assert len(logged) == 2

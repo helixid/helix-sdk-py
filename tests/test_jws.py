@@ -47,7 +47,7 @@ from helix_sdk.crypto.jws import (
 from helix_sdk.did import build_did_document
 from helix_sdk.errors import InvalidJWSError
 from helix_sdk.keys import derive_public_key, generate_key_pair, public_key_to_multibase
-from helix_sdk.vp_crypto import base58btc_encode
+from helix_sdk.crypto.common import base58btc_encode
 
 DID = "did:web:agent.helix.test"
 KEYS = generate_key_pair()

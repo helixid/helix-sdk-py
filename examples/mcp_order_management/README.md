@@ -57,7 +57,11 @@ signed, wrong-purpose or out-of-range list reads as revoked. Lists and verdicts 
 `KYAOS_HIGH_PRIVILEGE_SCOPES` / `KYAOS_HIGH_PRIVILEGE_TTL`, `KYAOS_MAX_STALE_SECONDS`, `KYAOS_STATUS_LIST_ISSUERS`), in
 Redis with `KYAOS_REDIS_URL`, in the same keys as the JS sample, so JS and Python instances can share it.
 `KYAOS_REVOCATION_EVENTS_URL` and/or `KYAOS_REVOCATION_WEBHOOK_PATH`, with `KYAOS_SIGNAL_ISSUERS`, drop a cached verdict
-the moment Helix signals the revocation. `KYAOS_VERIFICATION_LOG=1` prints each verification and signal as one JSON line
+the moment Helix signals the revocation. A HelixID-hosted agent's card names its revocation entry on the Helix
+issuer's list, which counts only when bound to the Helix issuer (SPEC-ENTITY-CARD section 10.3; otherwise every such
+agent is refused with `status_list_mismatch`): bind its exact URL, e.g.
+`KYAOS_STATUS_LIST_ISSUERS='{"did:web:api.helixid.dev":["https://api.helixid.dev/v1/status-list/helix-status-list-1"]}'`.
+`KYAOS_VERIFICATION_LOG=1` prints each verification and signal as one JSON line
 (a path appends them there). Unlike the JS sample, `KYAOS_REDIS_URL` backs only the status cache here: the Python
 middleware has no shared replay store yet (story L2-A).
 

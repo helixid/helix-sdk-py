@@ -619,7 +619,7 @@ class TestHelixCoreFixture:
             assert validate_credential("attestation", attestation["credential"]) == []
         owner_signed = next(a for a in fixture["attestations"] if a["signer"] == "owner")
         owner = fixture["keys"]["owner"]
-        # The fixture names its own kid (#key-1); pin it so the signature matches the checked-in bytes.
+        # The fixture names its own kid (#<multibase>); sign under it so the signature matches the checked-in bytes.
         signer = EnvSigner(owner["did"], kid=owner["kid"].split("#", 1)[1], env_var="K", env={"K": owner["private_key_hex"]})
         inp = owner_signed["input"]
         store = CredentialStore()

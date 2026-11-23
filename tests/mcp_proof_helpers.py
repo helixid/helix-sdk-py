@@ -48,7 +48,7 @@ __all__ = [
 
 def fixture_signer(env: Mapping[str, Any], label: str) -> EnvSigner:
     key = env["keys"][label]
-    # The fixture names its own kid (its did_documents publish #key-1), so pin it rather than the did:key default.
+    # The fixture names its own kid (its did_documents publish the W3C #<multibase> method); sign under it.
     return EnvSigner(key["did"], kid=key["kid"].split("#", 1)[1], env_var="FIXTURE_KEY", env={"FIXTURE_KEY": key["private_key_hex"]})
 
 

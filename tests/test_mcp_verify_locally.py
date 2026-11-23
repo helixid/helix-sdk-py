@@ -380,7 +380,8 @@ def test_refuses_every_refused_chain_and_status_fixture_with_its_reasons_and_nev
         fixture_verifier_options(service, env=env, cards={agent: env["cards"]["attested"]}, resolve_card=lambda did: lookups.append(did))
     )
     mw = gate(verifier=verifier, required_scopes=[])
-    skip = {"root_not_responsible_party", "card_malformed", "card_subject_mismatch", "card_unresolvable"}
+    # Cases about the case's own card: this gate always presents the configured attested card.
+    skip = {"root_not_responsible_party", "card_malformed", "card_subject_mismatch", "card_unresolvable", "revoked_card", "card_list_not_kept_by_card"}
     cases = [
         case
         for case in [*load_cases()["chain"], *load_cases()["status"]]
