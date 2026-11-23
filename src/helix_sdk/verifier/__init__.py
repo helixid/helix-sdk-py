@@ -41,6 +41,17 @@ from .resolve import (
     ed25519_keys_of,
     public_key_of_did_key,
 )
+from .rotation import (
+    DID_DOCUMENT_STALE,
+    MemoryRotationSequenceStore,
+    RotationSequenceGuard,
+    RotationSequenceStore,
+    StaleDidDocumentError,
+    guarded_resolver,
+    project_jwks,
+    read_jwks,
+    rotation_sequence_of,
+)
 from .keeper import NO_STATUS_CONFIGURATION, StatusConfiguration, keeper, may_omit_list_id, mistaken_binding, status_configuration
 from .revocation import (
     ChainRevocationResult,
@@ -222,4 +233,14 @@ __all__ = [
     "StatusListHttpFetch",
     "verify_status_list_proof",
     "window_problems",
+    # Story C-E: DID document versioning and the jwks.json projection.
+    "DID_DOCUMENT_STALE",
+    "MemoryRotationSequenceStore",
+    "RotationSequenceGuard",
+    "RotationSequenceStore",
+    "StaleDidDocumentError",
+    "guarded_resolver",
+    "project_jwks",
+    "read_jwks",
+    "rotation_sequence_of",
 ]

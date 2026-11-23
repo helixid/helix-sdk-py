@@ -37,6 +37,7 @@ import nacl.exceptions
 import nacl.signing
 
 from ..errors import InvalidJWSError
+from ..key_validity import KeyValidityReasons, key_validity_problem, proof_time
 from ..keys import _normalize_ed25519_private_key, derive_public_key, multibase_to_public_key_hex
 from .common import base58btc_decode
 
@@ -77,6 +78,10 @@ class JwsReasons:
     KEY_AMBIGUOUS = "jws_key_ambiguous"
     KEY_FOREIGN_CONTROLLER = "jws_key_foreign_controller"
     KEY_UNSUPPORTED = "jws_key_unsupported"
+    # Story C-E: the key's validity (revoked, superseded at iat, malformed members).
+    KEY_REVOKED = "jws_key_revoked"
+    KEY_SUPERSEDED = "jws_key_superseded"
+    KEY_VALIDITY_MALFORMED = "jws_key_validity_malformed"
 
 
 JwsPayload = Union[bytes, bytearray, str, Dict[str, Any], List[Any]]
@@ -390,9 +395,13 @@ def verify_jws_by_kid(
     resolve_did: DidResolver,
     expected_kid: Optional[str] = None,
     expected_did: Optional[str] = None,
+    at: Optional[int] = None,
+    now: Optional[int] = None,
 ) -> JwsVerification:
     """Reads ``kid``, resolves its DID through ``resolve_did``, picks the
-    assertion method ``kid`` names, then verifies as verify_jws does."""
+    assertion method ``kid`` names, then verifies as verify_jws does. Story
+    C-E: the key must be valid when the JWS was made, ``at`` (epoch ms),
+    default the payload's ``iat``, else ``now``."""
     parsed = _parse_jws(jws)
     if expected_did is not None and expected_did != parsed.did:
         raise InvalidJWSError(JwsReasons.KID_DID_MISMATCH, "JWS kid belongs to a DID other than the expected signer")
@@ -402,4 +411,16 @@ def verify_jws_by_kid(
     method = select_assertion_method(document, parsed.did, parsed.kid)
     jwk = dict(verification_method_to_jwk(method))
     jwk["kid"] = parsed.kid
-    return verify_jws(jws, jwk, expected_kid=expected_kid, expected_did=parsed.did)
+    verified = verify_jws(jws, jwk, expected_kid=expected_kid, expected_did=parsed.did)
+    iat = verified.payload.get("iat") if isinstance(verified.payload, Mapping) else None
+    problem = key_validity_problem(method, at if at is not None else proof_time(iat), now)
+    if problem is not None:
+        raise InvalidJWSError(_JWS_KEY_VALIDITY_REASONS[problem.reason], problem.message)
+    return verified
+
+
+_JWS_KEY_VALIDITY_REASONS = {
+    KeyValidityReasons.KEY_REVOKED: JwsReasons.KEY_REVOKED,
+    KeyValidityReasons.KEY_SUPERSEDED: JwsReasons.KEY_SUPERSEDED,
+    KeyValidityReasons.KEY_VALIDITY_MALFORMED: JwsReasons.KEY_VALIDITY_MALFORMED,
+}

@@ -152,7 +152,7 @@ class TestSharedFixtures:
 
 class TestReasonCodes:
     def test_the_set_is_the_javascript_set(self) -> None:
-        assert len(ALL_REASON_CODES) == len(set(ALL_REASON_CODES)) == 49
+        assert len(ALL_REASON_CODES) == len(set(ALL_REASON_CODES)) == 53
         assert ReasonCodes.STATUS_LIST_PROOF_INVALID == "status_list_proof_invalid"
         assert ReasonCodes.STATUS_LIST_MALFORMED == "status_list_malformed"
         assert ReasonCodes.NONCE_SEAM_MISSING == "nonce_seam_missing"

@@ -52,6 +52,7 @@ from helix_sdk.verifier import (
     VerifierResult,
     VerifierSeams,
     create_did_keys_resolver,
+    RotationSequenceGuard,
     create_did_resolver,
     create_revocation_checker,
     create_status_list_fetcher,
@@ -112,6 +113,10 @@ class LocalVerifierOptions:
     """Development only: also read ``http:`` URLs on loopback hosts (a did:web on ``127.0.0.1``, say)."""
     resolve_did: Optional[Callable[[str], Any]] = None
     """A DID resolver of the host's own, in place of the built-in did:key / did:web one."""
+    rotation_sequence_store: Any = None
+    """Story C-E point 2: where the default resolver keeps the highest DID document ``rotationSequence`` it
+    has seen, refusing a lower one. Default: in memory for this verifier; pass a ``RedisRotationSequenceStore``
+    (next to the nonce store) so every instance refuses the same replay."""
     resolve_did_keys: Optional[Callable[[str], Any]] = None
     """Default: every Ed25519 key the resolved document publishes."""
     fetch_status_list: Optional[Callable[[str], Any]] = None
@@ -261,7 +266,8 @@ class LocalVerifier:
                 return host_fetch(target)
 
         # A URL that is not read is refused inside fetch_json; the verifier reports the DID unresolved.
-        resolve_did = options.resolve_did or create_did_resolver(fetch_json)
+        guard = RotationSequenceGuard(options.rotation_sequence_store) if options.rotation_sequence_store is not None else None
+        resolve_did = options.resolve_did or create_did_resolver(fetch_json, sequence_guard=guard)
         resolve_did_keys = options.resolve_did_keys or create_did_keys_resolver(resolve_did)
 
         # Every list's proof is verified, by its issuer's assertionMethod key, before any bit is read (story L3-C point 2).

@@ -150,6 +150,7 @@ from helix_mcp_middleware import (
     ServeIdentityOptions,
     OAuthIssuerOptions,
     RedisStatusCacheStore,
+    RedisRotationSequenceStore,
     RevocationSignalClient,
     SignalReport,
     WellKnownMcp,
@@ -570,6 +571,8 @@ def verifier_from_env(env: Dict[str, str], service_did: str, kyaos: Optional[Kya
         allow_loopback_http=env.get("KYAOS_ALLOW_LOOPBACK_HTTP") == "1",
         catalog=list(dict.fromkeys(scope for scopes in TOOL_SCOPES.values() for scope in scopes)),
         status_cache=status_cache_from_env(env, redis),
+        # Story C-E: in multi-instance mode the last-seen DID document version is shared too.
+        rotation_sequence_store=RedisRotationSequenceStore(redis) if redis is not None else None,
         status_list_issuers=json_object_from_env(env, "KYAOS_STATUS_LIST_ISSUERS"),
         report_verification=(lambda report: log_event("verification", report)) if log_event is not None else None,
         # One replay store for the handshake, the response proofs and the request proofs.

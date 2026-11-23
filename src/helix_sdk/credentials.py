@@ -42,6 +42,7 @@ import nacl.signing
 from .crypto.jcs import canonicalize
 from .crypto.jws import Signer, base64url_decode_strict, select_assertion_method, verification_method_to_jwk
 from .errors import InvalidJWSError
+from .key_validity import key_validity_problem, proof_time
 from .crypto.common import base58btc_decode, base58btc_encode
 
 VC_V2_CONTEXT = "https://www.w3.org/ns/credentials/v2"
@@ -455,6 +456,10 @@ class ProofReasons:
     DID_UNRESOLVED = "did_unresolved"
     KEY_REJECTED = "key_rejected"
     SIGNATURE_INVALID = "signature_invalid"
+    # Story C-E: the key's validity at the proof's created.
+    KEY_REVOKED = "key_revoked"
+    KEY_SUPERSEDED = "key_superseded"
+    KEY_VALIDITY_MALFORMED = "key_validity_malformed"
 
 
 @dataclass(frozen=True)
@@ -526,7 +531,7 @@ def _is_prefix(whole: List[Any], prefix: List[Any]) -> bool:
     return len(prefix) <= len(whole) and all(canonicalize(a) == canonicalize(b) for a, b in zip(prefix, whole))
 
 
-def verify_data_integrity(document: Mapping[str, Any], resolve_did: DidResolver, proof_purpose: str = "assertionMethod") -> Verdict:
+def verify_data_integrity(document: Mapping[str, Any], resolve_did: DidResolver, proof_purpose: str = "assertionMethod", now: Optional[int] = None) -> Verdict:
     """The one ``eddsa-jcs-2022`` proof on ``document`` against the issuer's assertion key. Never raises for bad input."""
     proof = document.get("proof")
     if not isinstance(proof, Mapping):
@@ -570,6 +575,10 @@ def verify_data_integrity(document: Mapping[str, Any], resolve_did: DidResolver,
         public_key = base64url_decode_strict(verification_method_to_jwk(method)["x"])
     except InvalidJWSError as exc:
         return _refused(ProofReasons.KEY_REJECTED, f"{exc.reason}: {exc}")
+    # Story C-E point 3: the key the kid names must have been valid at ``created``.
+    validity = key_validity_problem(method, proof_time(proof.get("created")), now)
+    if validity is not None:
+        return _refused(validity.reason, validity.message)
     try:
         data = hash_data(config, unsecured)
     except Exception as exc:  # noqa: BLE001 - a document with no canonical form
@@ -766,6 +775,32 @@ def build_delegation_hop(
     credential["credentialSubject"] = subject
     credential["credentialStatus"] = dict(status_entry)
     return sign_data_integrity(credential, signer, proof_created)
+
+
+def reissue_hop(
+    hop: Mapping[str, Any],
+    signer: Signer,
+    status_entry: Mapping[str, Any],
+    *,
+    id: Optional[str] = None,
+    proof_created: Optional[str] = None,
+) -> Dict[str, Any]:
+    """KYA-OS story C-E point 4: a self-custody issuer reissues its hop for a
+    delegate's new key (``hopReissue.pendingIssuers``): the same grant (parent,
+    target, actions, caveats, window), a new id and ``status_entry`` on the
+    issuer's own list, signed again by ``signer``, the hop's issuer. Nothing
+    goes to Helix. Mirrors helix-sdk-js ``reissueHop``."""
+    subject = hop.get("credentialSubject")
+    if not isinstance(subject, Mapping):
+        raise ValueError("reissue_hop: the hop has no credentialSubject")
+    if issuer_of(hop.get("issuer")) != signer.did:
+        raise ValueError(f"reissue_hop: {signer.did} is not the issuer of this hop")
+    capability_id = id or f"urn:zcap:{uuid.uuid4()}"
+    kept = {key: value for key, value in hop.items() if key not in ("proof", "credentialStatus", "id")}
+    entry = dict(status_entry)
+    entry.setdefault("id", f"{entry.get('statusListCredential')}#{entry.get('statusListIndex')}")
+    unsigned = {**kept, "id": capability_id, "credentialSubject": {**subject, "id": capability_id}, "credentialStatus": entry}
+    return sign_data_integrity(unsigned, signer, proof_created)
 
 
 # -- verifiers -----------------------------------------------------------------
