@@ -123,8 +123,8 @@ def verify_inbound_delegation_headers(
 ) -> InboundDelegationResult:
     """Verifies the delegation headers of one downstream call with ``verifier``
     (this service's LocalVerifier). Never raises for a bad request: every
-    refusal is a reason. ``forwarders`` is ``"*"`` or a list of DIDs whose own
-    resource this service honours as a chain's target (default none)."""
+    refusal is a reason. ``forwarders`` is ``"*"`` (the default) or a list of DIDs whose own
+    resource this service honours as a chain's target; ``[]`` accepts none."""
     result = InboundDelegationResult(ok=False)
 
     def refuse(reason: str, message: str) -> InboundDelegationResult:
@@ -180,7 +180,8 @@ def verify_inbound_delegation_headers(
         return refuse(InboundDelegationReasons.CHAIN_MISMATCH, "delegation_chain is not the credential's chain string")
 
     own_resource = resource or verifier.service_did
-    accepted = forwarders == "*" or (forwarders is not None and not isinstance(forwarders, str) and forwarder in forwarders)
+    # Default "*" (Harish, 2026-11-23): any forwarder, for the authority granted at that forwarder; [] accepts none.
+    accepted = forwarders is None or forwarders == "*" or (not isinstance(forwarders, str) and forwarder in forwarders)
     if invocation_target is None or (invocation_target != own_resource and not (invocation_target == forwarder and accepted)):
         return refuse(InboundDelegationReasons.TARGET_NOT_ACCEPTED, f"the chain targets {invocation_target}, which this service does not accept from {forwarder}")
     leaf_invoker = _invoker_of(chain[-1])
