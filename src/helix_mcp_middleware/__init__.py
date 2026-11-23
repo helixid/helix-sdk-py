@@ -32,6 +32,9 @@ HelixID, mirroring helix-sdk-js's mcp-middleware package.
 - TrustedIssuers / DEFAULT_TRUSTED_ISSUERS ("*"), is_trusted_issuer(),
   attestation_trust(): which issuers' capability attestations count (KYA-OS
   story C-B).
+- serve_identity() / resolve_server_card() (KYA-OS story C-A): the service's
+  own did.json and card.json from its origin, the server.json projection
+  under _meta["org.kya-os/card"], and its reverse.
 - create_kyaos() (KYA-OS story L2-A): the `_kyaos_handshake` tool, sessions,
   a replay store (MemoryNonceStore, RedisNonceStore, DynamoNonceStore) and a
   server-signed detached proof on every tool call outcome at
@@ -71,6 +74,7 @@ from .audit_delivery import (
 )
 from .credentials import DEFAULT_TRUSTED_ISSUERS, ExtractedCredential, TrustedIssuers, extract_credential
 from .errors import PROOF_INVALID, PROOF_MISSING, AuthorizationServerUnavailableError, MCPAuthError, ProofError, ToolScopeError
+from .identity import ServedIdentity, ServeIdentityOptions, resolve_server_card, serve_identity
 from .metadata import (
     HttpErrorResponse,
     build_protected_resource_metadata,
@@ -169,6 +173,10 @@ __all__ = [
     "ToolAuditEvent",
     "ToolCallAudit",
     "OAUTH_SUBJECT_KEY_ID",
+    "serve_identity",
+    "resolve_server_card",
+    "ServeIdentityOptions",
+    "ServedIdentity",
     "create_local_verifier",
     "LocalVerifier",
     "LocalVerifierOptions",

@@ -61,11 +61,13 @@ from helix_mcp_middleware import (
     KyaOsRuntime,
     McpAuditTrail,
     MCPMiddlewareOptions,
+    ServeIdentityOptions,
     WellKnownMcp,
     async_helixid_mcp_middleware,
     audit_tool_handlers,
     build_protected_resource_metadata,
     protected_resource_metadata_url,
+    serve_identity,
     to_http_error_response,
 )
 
@@ -150,6 +152,7 @@ def create_order_app(
     store: Optional[OrderStore] = None,
     on_server_error: Optional[Callable[[BaseException], None]] = None,
     audit: Optional[McpAuditTrail] = None,
+    identity: Optional[ServeIdentityOptions] = None,
     kyaos: Optional[KyaOsRuntime] = None,
     revocation_webhook: Optional[Tuple[str, Callable[[Any, Any, Any], Any]]] = None,
     well_known: Optional[WellKnownMcp] = None,
@@ -158,11 +161,12 @@ def create_order_app(
     served at its path); `auth` is everything except the scopes, which this
     sample fixes in TOOL_SCOPES. `audit` records each tool call as typed
     events (pair it with `auth.audit_sink = audit.tool_audit_sink()`);
-    `kyaos` turns on the KYA-OS layer (story L2-A): the handshake tool,
-    sessions, the replay store and a server-signed proof on every tool call
-    outcome. `well_known` serves the KYA-OS discovery document at
-    `/.well-known/mcp` (story L1-D, from create_well_known_mcp()); a disabled
-    one answers 404. `revocation_webhook` (KYA-OS story L3-C) is
+    `identity` (KYA-OS story C-A) serves this server's own did.json and
+    card.json from its origin. `kyaos` turns on the KYA-OS layer (story
+    L2-A): the handshake tool, sessions, the replay store and a server-signed
+    proof on every tool call outcome. `well_known` serves the KYA-OS discovery
+    document at `/.well-known/mcp` (story L1-D, from create_well_known_mcp());
+    a disabled one answers 404. `revocation_webhook` (KYA-OS story L3-C) is
     `(path, asgi_app)`: the RFC 8935 receiver of Helix's revocation signals
     (`RevocationSignalClient.asgi_webhook()`), mounted at `path`."""
     url = urlsplit(resource)
@@ -178,6 +182,7 @@ def create_order_app(
         scopes_supported=list(dict.fromkeys(s for scopes in TOOL_SCOPES.values() for s in scopes)),
         resource_name="Order Management (HelixID sample)",
     )
+    served_identity = serve_identity(identity) if identity is not None else None
     # The handshake needs an identified caller, not a scope: it is listed with none (story F-2).
     tool_scopes = {**TOOL_SCOPES, kyaos.handshake_tool_name: []} if kyaos is not None else TOOL_SCOPES
     gate = async_helixid_mcp_middleware(replace(auth, tool_scopes=tool_scopes, required_scopes=[]))
@@ -231,6 +236,8 @@ def create_order_app(
             return
         if revocation_webhook is not None and path == revocation_webhook[0]:
             await revocation_webhook[1](scope, receive, send)
+            return
+        if served_identity is not None and await served_identity.handle(scope, receive, send):
             return
         if path != mcp_path:
             await respond(404, {"error": "not_found"})

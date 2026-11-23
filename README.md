@@ -16,8 +16,8 @@ construction, DID resolution, and status checks are all API calls made through
 
 **Agents hold no keys.** Agent self-custody has been retired: the server
 generates an agent's keypair during onboarding and holds the private key, so
-onboarding, presenting and delegating are all API calls
-(`onboard_agent()`, `sign_vp()`, `delegate_authority()`).
+onboarding and presenting are API calls
+(`onboard_agent()`, `sign_vp()`).
 
 ## Documentation
 
@@ -325,31 +325,39 @@ See `examples/`:
   through `sign_vp()`, verifies it, exercises `check_scope()`/`require_scope()`,
   then revokes the VC and shows the next verification attempt fail with
   `VC_REVOKED`.
-- `agent_delegation_demo.py` -- onboards a delegator and a sub-agent, delegates
-  a scope subset with `delegate_authority()`, has the sub-agent present the
-  delegated credential, and shows a further delegation being refused because
-  the sub-agent has no delegation authority of its own.
 
-Both require a running `helix-api` instance:
+It requires a running `helix-api` instance:
 
 ```bash
 HELIX_API_URL=http://127.0.0.1:3579 \
 HELIX_ADMIN_API_KEY=your-admin-key \
-python examples/agent_delegation_demo.py
+python examples/verify_vp_demo.py
 ```
-
-The TypeScript side has since been migrated too: `helixid`'s
-`examples/delegation-demo.ts` and its live integration test
-(`tests/live/agent-delegation.live.integration.test.ts`) both use
-`delegateAuthority()` -- the server signs on the delegator's behalf, since no
-caller holds an agent's key any more. `delegate_authority()` here is the
-Python equivalent.
 
 ## CLI
 
-There is no Python CLI. Platform-operator workflows (DID/wallet/status-list/
-VC lifecycle) are covered by `helix-sdk-js`'s `cli` package -- the
-CLI has a single canonical implementation rather than one per SDK language.
+Platform-operator workflows (DID/wallet/status-list/VC lifecycle) are covered
+by `helix-sdk-js`'s `cli` package -- the CLI has a single canonical
+implementation rather than one per SDK language.
+
+The one exception is custody (KYA-OS story F-3): `helix-custody init`,
+`helix-custody activate` and `helix-custody custody take` (`take` alone also
+works; or `python -m helix_sdk.custody`) do and print what `helix init`,
+`helix activate` and `helix custody take` do, with the same options, for
+Python-only hosts. `--json` prints the result as JSON instead. They exit 0
+when the command ran, an agent still waiting for its documents included, and
+1 with the error on stderr. The same steps are functions: `helix_init`,
+`activate_agent`, `change_to_self_custody`.
+
+With own hosting you do not have to run `activate`: Helix re-checks an agent
+waiting for its documents in the background and activates it once they are
+live.
+
+A self-custody agent's key is generated on its host and never sent. A
+custodial agent signs through `HelixCustodialSigner`, which calls the Helix
+API. Both are Signers, so `helix_sdk.verifier.sign_request_proof` and `sign_jws` work
+the same with either. Custodial agents are labelled `custody: helix` and are
+not counted in KYA-OS conformance claims; their proofs still verify.
 
 ## Testing
 
