@@ -296,7 +296,7 @@ def test_request_proof_through_any_signer_is_the_same_and_verifies() -> None:
 # --------------------------------------------------------------- helix_init
 
 
-def init_api(did: str, did_hosting: str, origin: str, status: str) -> FakeApi:
+def init_api(did: str, did_hosting: str, origin: str, status: str, activated_card: Optional[Dict[str, Any]] = None) -> FakeApi:
     kid = f"{did}#key-1"
     nonce = "cd" * 32
 
@@ -316,7 +316,11 @@ def init_api(did: str, did_hosting: str, origin: str, status: str) -> FakeApi:
         {
             "POST /v1/agents/enroll/challenge": lambda body: {"did": did, "kid": kid, "nonce": nonce, "keyCustody": "self", "didHosting": did_hosting, "name": "Bot", "didDocumentUrl": f"{origin}/did.json", "cardUrl": f"{origin}/card.json"},
             "POST /v1/agents/enroll": enroll,
-            f"POST /v1/agents/{did}/activate": lambda body: {"did": did, "status": "active", "vcId": "vc:2"} if body.get("enrollmentToken") == "enroll:t" else (403, {"error": {"code": "ADMIN_AUTH_REQUIRED", "message": "no"}}),
+            f"POST /v1/agents/{did}/activate": lambda body: (
+                {"did": did, "status": "active", "vcId": "vc:2", **({"documents": {"card": activated_card, "didDocumentUrl": f"{origin}/did.json", "cardUrl": f"{origin}/card.json"}} if activated_card else {})}
+                if body.get("enrollmentToken") == "enroll:t"
+                else (403, {"error": {"code": "ADMIN_AUTH_REQUIRED", "message": "no"}})
+            ),
         }
     )
 
@@ -361,6 +365,45 @@ def test_helix_init_on_own_hosting_then_activate(tmp_path: Path) -> None:
     api.assert_no_private_material_sent()
     later = helix_init("https://helix.example", "enroll:t", str(tmp_path / "again"), did=did, http=init_api(did, "own", origin, "pending_resolution"), activate=False)
     assert later.status == "pending_resolution" and later.resolution is None
+
+
+def test_activation_rewrites_card_json_with_the_card_helix_returns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """F-3 parity: on activation the card comes back with the agent's attestations, for the owner to republish."""
+    did = "did:web:owner.example:agents:carded"
+    origin = "https://owner.example/agents/carded"
+    carded = {"id": did, "entityType": "agent", "name": "Bot", "capabilities": [{"name": "orders:read", "attestations": [{"vc": {"id": "att:1"}}]}], "responsibleParty": "did:web:helix.example"}
+    api = init_api(did, "own", origin, "pending_resolution", activated_card=carded)
+    served: Dict[str, Any] = {}
+
+    def fetch_json(url: str) -> Any:
+        if url not in served:
+            raise RuntimeError(f"404 {url}")
+        return served[url]
+
+    pending = helix_init("https://helix.example", "enroll:t", str(tmp_path), did=did, http=api, fetch_json=fetch_json, generate_key=fixed_key)
+    assert pending.card_updated is False
+    served[f"{origin}/did.json"] = json.loads((tmp_path / "did.json").read_text())
+    served[f"{origin}/card.json"] = json.loads((tmp_path / "card.json").read_text())
+    active = activate_agent("https://helix.example", "enroll:t", str(tmp_path), http=api, fetch_json=fetch_json)
+    assert (active.status, active.card_updated) == ("active", True)
+    assert json.loads((tmp_path / "card.json").read_text()) == carded
+
+    # The command line says where to republish it, and --json carries the flag.
+    import helix_sdk.custody as custody_module
+
+    out_dir = tmp_path / "cli"
+    cli_api = init_api(did, "own", origin, "pending_resolution", activated_card=carded)
+    monkeypatch.setattr(custody_module, "_requests_call", cli_api)
+    code, _, _ = _run("init", "--token", "enroll:t", "--out", str(out_dir), "--api-url", "https://h", "--did", did, "--no-activate")
+    assert code == 0
+    documents = json.loads((out_dir / "did.json").read_text(encoding="utf-8"))
+    card = json.loads((out_dir / "card.json").read_text(encoding="utf-8"))
+    monkeypatch.setattr(custody_module, "resolve_entity_card", lambda did, fetch_json=None: type("R", (), {"did_document": documents, "card": card})())
+    code, out, _ = _run("activate", "--token", "enroll:t", "--out", str(out_dir), "--api-url", "https://h")
+    assert code == 0
+    assert out == f"\u2713 Agent active: {did}\n\ncard.json now carries the attestations Helix issued; republish it:\n  {out_dir / 'card.json'}  ->  {origin}/card.json\n"
+    code, out, _ = _run("activate", "--token", "enroll:t", "--out", str(out_dir), "--api-url", "https://h", "--json")
+    assert json.loads(out)["cardUpdated"] is True
 
 
 def test_check_own_hosting_against_the_registered_key() -> None:
