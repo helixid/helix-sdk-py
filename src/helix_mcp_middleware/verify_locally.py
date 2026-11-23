@@ -318,7 +318,8 @@ class LocalVerifier:
         """Verifies one tool call (``name``, ``input``, ``_meta``, optional ``request``) from its
         ``_meta``; None when it carries neither a request proof nor a chain. ``token_cnf_jkt`` is
         the bearer token's ``cnf.jkt`` for the L3 fusion; ``require_proof=False`` (story C-C) lets
-        a chain without a proof verify, at L2 at most."""
+        a chain without a proof verify, at L2 at most; ``live_status=True`` reads every status list
+        live, past the status cache (the guard sets it for a tool whose minimum level is L3, story L3-C)."""
         meta = meta_mapping(call.get("_meta"))
         proof = read_request_proof(meta)
         chain = read_carried_chain(meta)
@@ -330,6 +331,8 @@ class LocalVerifier:
             overrides["token_cnf_jkt"] = call["token_cnf_jkt"]
         if call.get("require_proof") is not None:
             overrides["require_proof"] = call["require_proof"]
+        if call.get("live_status") is True:
+            overrides["live_status"] = True
         result = self.verify(proof, chain=chain, request=request_of(call), **overrides)
         entry: VerificationReport = {
             "timestamp": datetime.fromtimestamp(self._clock() / 1000, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),

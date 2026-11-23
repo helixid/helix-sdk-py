@@ -293,9 +293,9 @@ class Setup:
         self.cache = None if cache_options is None else StatusCache(clock=lambda: self.now, **cache_options)
         self.checker = create_revocation_checker(create_status_list_fetcher(self.fetch, resolve_did_key), cache=self.cache, **extra)
 
-    def check(self, index: int, scopes: Tuple[str, ...] = (), **overrides: Any) -> RevocationVerdict:
+    def check(self, index: int, scopes: Tuple[str, ...] = (), live: bool = False, **overrides: Any) -> RevocationVerdict:
         credential = {"id": f"urn:uuid:cred-{index}", "issuer": ISSUER.did, "credentialStatus": entry_for(URL_A, index), **overrides}
-        return self.checker(credential, RevocationContext(now_ms=self.now, scopes=scopes))
+        return self.checker(credential, RevocationContext(now_ms=self.now, scopes=scopes, live=live))
 
 
 def test_clear_bit_live_and_fresh_set_bit_revoked() -> None:
@@ -349,6 +349,22 @@ def test_cached_reads_are_not_fresh_and_ttl_ends_them() -> None:
     assert len(setup.fetch.calls) == 1
     setup.now += 121_000
     assert setup.check(1) == RevocationVerdict(False, True)
+
+
+def test_live_requests_read_past_the_cache_and_refresh_it() -> None:
+    setup = Setup({URL_A: signed_list(URL_A, ISSUER)}, {"status_cache_ttl": 120})
+    assert setup.check(3) == RevocationVerdict(False, True)
+    assert setup.check(3) == RevocationVerdict(False, False)
+    # The list changes: a live request sees it at once, while the cache still says "clear".
+    setup.fetch.bodies[URL_A] = signed_list(URL_A, ISSUER, bits=bits_with(16, (3,)))
+    verdict = setup.check(3, live=True)
+    assert (verdict.revoked, verdict.fresh, verdict.code) == (True, False, ReasonCodes.STATUS_REVOKED)
+    assert setup.check(4, live=True) == RevocationVerdict(False, True)
+    assert len(setup.fetch.calls) == 3
+    # The live reads refreshed the cache: a cached request now reads the new verdict and list.
+    assert setup.check(3).code == ReasonCodes.STATUS_REVOKED
+    assert setup.check(5) == RevocationVerdict(False, False)
+    assert len(setup.fetch.calls) == 3
 
 
 def test_high_privilege_ttl_and_live_reads_within_one_verification() -> None:

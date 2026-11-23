@@ -96,6 +96,10 @@ class VerifierOptions:
     """Default True: a call without a request proof is refused ``proof_missing``. False (story C-C):
     a call carrying a chain and no proof is verified on the chain alone, with the proof floor
     unmet, so its level is at most L2."""
+    live_status: bool = False
+    """Read every status list live, past the status cache (story L3-C with C-C's levels): a call to
+    a tool whose minimum Card level is L3 needs fresh revocation status, which a cached read is not.
+    Default False: the cache serves, and a cached read is not fresh, so at most L2."""
 
     @classmethod
     def from_dict(cls, options: Mapping[str, Any]) -> "VerifierOptions":
@@ -113,6 +117,7 @@ class VerifierOptions:
             "action": "action",
             "tokenCnfJkt": "token_cnf_jkt",
             "requireProof": "require_proof",
+            "liveStatus": "live_status",
         }
         return cls(**{names[key]: value for key, value in options.items() if key in names})
 
@@ -330,7 +335,7 @@ def verify(
             refusals.add(ReasonCodes.STATUS_SEAM_MISSING, "no fetch_status_list seam: the hops' status cannot be read")
             return _refused(refusals, summary, **proved)
         # Root to leaf, stopping at the first revoked or unresolvable hop (section 6.5 cascade, story L3-C point 4).
-        revocation = check_chain_revocation(hops, checker, RevocationContext(now_ms=now, scopes=_request_scopes(options, evaluation.allowed_action), reads=reads))
+        revocation = check_chain_revocation(hops, checker, RevocationContext(now_ms=now, scopes=_request_scopes(options, evaluation.allowed_action), reads=reads, live=options.live_status))
         if revocation.revoked:
             refusals.add(revocation.code or ReasonCodes.STATUS_REVOKED, f"hop {revocation.index}: {revocation.message or 'revoked'}")
             return _refused(refusals, summary, **proved)
@@ -377,6 +382,7 @@ def verify(
             check_revocation=_revocation_seam(seams, options),
             scopes=_request_scopes(options, leaf_allowed_action),
             reads=reads,
+            live_status=options.live_status,
         )
 
     # 8. Authority and level (story F-1 point 4; section 9.4): the proof floor holds only when a proof verified.

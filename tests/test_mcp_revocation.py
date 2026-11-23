@@ -24,6 +24,9 @@ from helix_sdk.verifier import MemoryNonceStore, MemoryStatusCacheStore, Revocat
 
 from helix_mcp_middleware import (
     LocalVerifierOptions,
+    MCPMiddlewareOptions,
+    ProofError,
+    helixid_mcp_middleware,
     RedisStatusCacheStore,
     ResolutionRefusedError,
     RevocationSignalClient,
@@ -234,6 +237,63 @@ def test_revoke_a_parent_hop_refused_on_both_instances_once_the_signal_reaches_o
     for verifier in (a, b):
         result = present(world, verifier, NOW_MS)
         assert (result.ok, list(result.reasons)) == (False, ["status_revoked"])
+
+
+def _guarded(world: Dict[str, Any], verifier: Any) -> Callable[[str], Any]:
+    """A guard whose tools demand L3 by default, with ``list_orders`` set to L2; returns ``authorize`` by tool name."""
+    gate = helixid_mcp_middleware(MCPMiddlewareOptions(verifier=verifier, tools={"list_orders": {"minimum_level": "L2"}}))
+
+    def at(name: str) -> Any:
+        meta = proof_meta(fixture_signer(world["env"], "agent"), world["service"], name, CALL_INPUT, world["chain"], now_ms=NOW_MS)
+        return gate.authorize({"name": name, "input": CALL_INPUT, "_meta": meta})  # type: ignore[attr-defined]
+
+    return at
+
+
+@needs_fixtures
+def test_a_tool_that_demands_l3_reads_its_lists_live_on_every_call_and_a_tool_set_to_l2_uses_the_cache(world: Dict[str, Any]) -> None:
+    lists = FixtureLists(world["env"])
+    verifier = instance(world, lists, MemoryStatusCacheStore(lambda: NOW_MS), lambda: NOW_MS)
+    at = _guarded(world, verifier)
+    first = at("lookup_order")
+    assert (first.level, first.fresh) == ("L3", True)
+    asked = len(lists.asked)
+    # The default minimum is L3: the same call again, inside the TTL, reads every list live and stays L3.
+    again = at("lookup_order")
+    assert (again.level, again.fresh) == ("L3", True)
+    assert len(lists.asked) > asked
+    asked = len(lists.asked)
+    # A tool set to L2 takes the cached verdicts: no list is read, and the call is L2, not fresh.
+    cached = at("list_orders")
+    assert (cached.level, cached.fresh) == ("L2", False)
+    assert len(lists.asked) == asked
+    # The root hop is revoked. The L3 tool sees it at once (live), and its live read refreshed the cache for the L2 tool.
+    root = world["chain"][0]
+    lists.revoke(root["credentialStatus"]["statusListCredential"], int(root["credentialStatus"]["statusListIndex"]))
+    for name in ("lookup_order", "list_orders"):
+        with pytest.raises(ProofError) as refused:
+            at(name)
+        assert list(refused.value.reasons) == ["status_revoked"]
+
+
+@needs_fixtures
+def test_without_a_live_read_an_l2_tool_keeps_the_cached_verdict_until_the_signal_drops_it(world: Dict[str, Any]) -> None:
+    lists = FixtureLists(world["env"])
+    verifier = instance(world, lists, MemoryStatusCacheStore(lambda: NOW_MS), lambda: NOW_MS)
+    at = _guarded(world, verifier)
+    first = at("list_orders")
+    assert (first.level, first.fresh) == ("L3", True)
+    root = world["chain"][0]
+    lists.revoke(root["credentialStatus"]["statusListCredential"], int(root["credentialStatus"]["statusListIndex"]))
+    # Inside the TTL, with no signal, the L2 tool still reads the cached "not revoked".
+    cached = at("list_orders")
+    assert (cached.level, cached.fresh) == ("L2", False)
+    helix = world["helix"]
+    client = create_revocation_signal_client(verifier, trusted_issuers=[helix.did], resolve_did=world["resolve_did"], clock=lambda: NOW_MS)
+    assert client.handle(sign_revocation_signal(root["id"], helix, iat=NOW_MS // 1000)).accepted
+    with pytest.raises(ProofError) as refused:
+        at("list_orders")
+    assert list(refused.value.reasons) == ["status_revoked"]
 
 
 @needs_fixtures

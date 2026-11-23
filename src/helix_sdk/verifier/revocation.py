@@ -42,6 +42,9 @@ class RevocationContext:
     root: Optional[Mapping[str, Any]] = None
     #: The lists read live during this one verification, by URL.
     reads: Optional[Dict[str, StatusListRead]] = None
+    #: Read every list live, past any cached verdict or list: a request that must be fresh (a tool
+    #: whose minimum Card level is L3). A live read still refreshes the cache for other requests.
+    live: bool = False
 
 
 #: ``checker(credential, context)``: never raises for a bad list; every failure is ``revoked=True``.
@@ -91,7 +94,7 @@ def create_revocation_checker(
             if cache is not None and isinstance(credential_id, str) and credential_id
             else None
         )
-        if verdict_key is not None:
+        if verdict_key is not None and not context.live:
             cached = cache.get_verdict(verdict_key, context.scopes)  # type: ignore[union-attr]
             if cached is not None:
                 if cached.revoked:
@@ -99,7 +102,7 @@ def create_revocation_checker(
                 return RevocationVerdict(False, False)
 
         read = (context.reads or {}).get(url)
-        if read is None and cache is not None:
+        if read is None and cache is not None and not context.live:
             read = cache.get_list(url, context.scopes)
         if read is None:
             try:

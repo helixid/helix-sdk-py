@@ -58,6 +58,7 @@ def verify_capability_attestation(
     check_revocation: Optional[RevocationChecker] = None,
     scopes: Sequence[str] = (),
     reads: Optional[Dict[str, StatusListRead]] = None,
+    live_status: bool = False,
 ) -> Verdict:
     """Schema, subject, capability, trusted issuer, window, proof and status, in that order; never raises."""
     violations = validate_credential("attestation", value)
@@ -80,7 +81,7 @@ def verify_capability_attestation(
     if checker is None:
         return _refused(ReasonCodes.STATUS_SEAM_MISSING, "no fetch_status_list seam to read the attestation status with")
     try:
-        status = checker(value, RevocationContext(now_ms=now_ms, scopes=scopes, reads=reads))
+        status = checker(value, RevocationContext(now_ms=now_ms, scopes=scopes, reads=reads, live=live_status))
     except Exception as exc:  # noqa: BLE001 - a checker that raises fails closed
         return _refused(ReasonCodes.STATUS_UNAVAILABLE, f"the revocation check failed: {exc}")
     if status.revoked:
@@ -100,6 +101,7 @@ def check_capabilities(
     check_revocation: Optional[RevocationChecker] = None,
     scopes: Sequence[str] = (),
     reads: Optional[Dict[str, StatusListRead]] = None,
+    live_status: bool = False,
 ) -> CapabilityCheck:
     """Verified (at least one attestation holds) versus unverified capabilities of a card, with freshness."""
     check = CapabilityCheck()
@@ -121,6 +123,7 @@ def check_capabilities(
                 check_revocation=check_revocation,
                 scopes=scopes,
                 reads=reads,
+                live_status=live_status,
             )
             if verdict.ok:
                 holds = True
