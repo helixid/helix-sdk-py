@@ -56,7 +56,7 @@ pip install -e .
 
 ## Cross-language parity
 
-The local-signing primitives (`keys.py`, `vp_crypto.py`, `proof.py`) are
+The local-signing primitives (`keys.py`, `crypto/common.py`, `proof.py`) are
 verified **byte-for-byte** against the same
 `fixtures/golden-vectors/*.json` fixtures that `helix-sdk-js` and
 `helix-core` assert against -- same private key, same payload, same

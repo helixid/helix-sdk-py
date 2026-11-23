@@ -25,7 +25,7 @@ import pytest
 
 from helix_sdk.keys import derive_public_key
 from helix_sdk.proof import create_ed25519_proof, verify_ed25519_proof
-from helix_sdk.vp_crypto import base58btc_encode, hash_canonical_payload, sign_bytes, to_canonical_json
+from helix_sdk.crypto.common import base58btc_encode, hash_canonical_payload, sign_bytes, to_canonical_json
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "golden-vectors"
 
