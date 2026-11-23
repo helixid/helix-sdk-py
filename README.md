@@ -86,6 +86,50 @@ the detached JWS, the `cnf` fusion (`L3` with a token `cnf`, `L3-minus` without)
 `python -m helix_sdk.conformance [vectors_dir]` runs the KYA-OS vector categories `signed-proof`, `delegation-chain`,
 `status-list`, `did-key`, `did-web`, `card-proof` and `entity-card` through `helix_sdk.conformance.HelixConformanceAdapter`.
 
+## Status lists and revocation (KYA-OS story L3-C)
+
+`helix_sdk.verifier` reads status lists as SPEC.md §6.6 says, exactly as helix-sdk-js does:
+
+- `read_bitstring_status_list` / `read_status_list_2021` verify the list's own proof (`eddsa-jcs-2022`, or the §6.2
+  `Ed25519Signature2020`) by its issuer's `assertionMethod` key before decoding any bit; `create_status_list_fetcher`
+  fetches through the host's (Safe)fetch. Unreachable, malformed, unsigned, badly signed, wrong-purpose and out-of-range
+  lists read as revoked.
+- `create_revocation_checker` (the `check_revocation` seam, fail-closed) applies the keeper rules and caches lists and
+  verdicts in a `StatusCache` (`status_cache_ttl`, `high_privilege_scopes` at most 60 s, `max_stale_seconds`,
+  `invalidate(credential_id)`); a cached read is `fresh=False`, which demotes a Card L3 request to L2. Its Redis keys and
+  JSON match the JavaScript cache, so both can share one store. `check_chain_revocation` walks a chain root to leaf.
+- `verify_revocation_signal` checks Helix's revocation SET (RFC 8417): a trusted issuer and its signature, one credential.
+- The conformance `status-list` category runs through these production readers, both list formats.
+
+`helix_mcp_middleware` uses them the way `@helixid/mcp-middleware` does:
+
+- `create_local_verifier` reads every list through `create_status_list_fetcher` and a fail-closed revocation checker,
+  and exposes `status_cache`. Options: `status_cache` (a `StatusCache`, or a dict of its options), `status_list_issuers`,
+  `check_revocation`. The default fetch is `create_resolution_fetch`: https only, a host written as an IP must be public
+  unicast, same-origin redirects, 5 s, 1 MiB. Pass your SafeFetch as `fetch` to pin the connection too.
+- `RedisStatusCacheStore` shares the cache between instances (any client with redis-py's `get`/`set(px=)`/`delete`/`incr`).
+- `RevocationSignalClient` / `create_revocation_signal_client(verifier, trusted_issuers, ...)` receive Helix's SETs:
+  over SSE by default (one outbound connection on a background thread, reconnecting with backoff and `Last-Event-ID`),
+  or pushed (RFC 8935) through `asgi_webhook()` or the framework-neutral `handle_push()` (202, or 400 `{err, description}`).
+  A valid SET calls `status_cache.invalidate(credential_id)`; a bad or foreign one is ignored and reported through
+  `on_signal`.
+
+```python
+from helix_mcp_middleware import RedisStatusCacheStore, create_local_verifier, create_revocation_signal_client
+
+verifier = create_local_verifier(
+    service_did="did:web:mcp.example.com",
+    status_cache={"store": RedisStatusCacheStore(redis.Redis()), "status_cache_ttl": 300, "high_privilege_scopes": ["orders:admin"]},
+)
+signals = create_revocation_signal_client(
+    verifier,
+    ["did:web:api.helixid.example"],  # the Helix issuer whose SETs are honoured
+    events_url="https://api.helixid.example/v1/events/revocations",
+    on_signal=lambda report: audit(report.to_dict()),
+)
+signals.start()  # or mount signals.asgi_webhook() at the URL registered with Helix
+```
+
 ## Packages in this repo
 
 - **`helix_sdk`** -- core SDK (see Quick example below).

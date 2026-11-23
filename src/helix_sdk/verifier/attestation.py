@@ -27,7 +27,8 @@ from ..credentials import (
     window_verdict,
 )
 from .codes import ReasonCodes
-from .status import FetchStatusList, check_status_entry
+from .revocation import RevocationChecker, RevocationContext, revocation_checker_of
+from .status import FetchStatusList, StatusListRead
 
 __all__ = ["CapabilityCheck", "verify_capability_attestation", "check_capabilities", "capability_name"]
 
@@ -54,6 +55,10 @@ def verify_capability_attestation(
     trusted_issuers: TrustedIssuers = TRUST_ALL_ISSUERS,
     max_clock_skew_ms: Any = None,
     fetch_status_list: Optional[FetchStatusList] = None,
+    check_revocation: Optional[RevocationChecker] = None,
+    scopes: Sequence[str] = (),
+    reads: Optional[Dict[str, StatusListRead]] = None,
+    live_status: bool = False,
 ) -> Verdict:
     """Schema, subject, capability, trusted issuer, window, proof and status, in that order; never raises."""
     violations = validate_credential("attestation", value)
@@ -72,15 +77,15 @@ def verify_capability_attestation(
     proof = verify_data_integrity(value, resolve_did)
     if not proof.ok:
         return proof
-    if fetch_status_list is None:
+    checker = check_revocation or (revocation_checker_of(fetch_status_list, max_clock_skew_ms) if fetch_status_list is not None else None)
+    if checker is None:
         return _refused(ReasonCodes.STATUS_SEAM_MISSING, "no fetch_status_list seam to read the attestation status with")
     try:
-        read = fetch_status_list(value["credentialStatus"]["statusListCredential"])
-    except Exception as exc:  # noqa: BLE001 - a seam that cannot answer fails closed
-        return _refused(ReasonCodes.STATUS_UNAVAILABLE, f"status list could not be read: {exc}")
-    status = check_status_entry(value["credentialStatus"], value["issuer"], read, now_ms=now_ms, max_clock_skew_ms=max_clock_skew_ms)
-    if not status.ok:
-        return _refused(status.code or ReasonCodes.STATUS_UNAVAILABLE, status.message or "")
+        status = checker(value, RevocationContext(now_ms=now_ms, scopes=scopes, reads=reads, live=live_status))
+    except Exception as exc:  # noqa: BLE001 - a checker that raises fails closed
+        return _refused(ReasonCodes.STATUS_UNAVAILABLE, f"the revocation check failed: {exc}")
+    if status.revoked:
+        return _refused(status.code or ReasonCodes.STATUS_REVOKED, status.message or "revoked")
     return Verdict(True, details={"capability": subject["capability"], "issuer": value["issuer"], "fresh": status.fresh})
 
 
@@ -93,6 +98,10 @@ def check_capabilities(
     trusted_issuers: TrustedIssuers = TRUST_ALL_ISSUERS,
     max_clock_skew_ms: Any = None,
     fetch_status_list: Optional[FetchStatusList] = None,
+    check_revocation: Optional[RevocationChecker] = None,
+    scopes: Sequence[str] = (),
+    reads: Optional[Dict[str, StatusListRead]] = None,
+    live_status: bool = False,
 ) -> CapabilityCheck:
     """Verified (at least one attestation holds) versus unverified capabilities of a card, with freshness."""
     check = CapabilityCheck()
@@ -111,6 +120,10 @@ def check_capabilities(
                 trusted_issuers=trusted_issuers,
                 max_clock_skew_ms=max_clock_skew_ms,
                 fetch_status_list=fetch_status_list,
+                check_revocation=check_revocation,
+                scopes=scopes,
+                reads=reads,
+                live_status=live_status,
             )
             if verdict.ok:
                 holds = True
