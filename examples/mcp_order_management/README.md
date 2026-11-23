@@ -72,6 +72,23 @@ handed, body intact, to the transport. `initialize` and `tools/list` are not gat
 each one before it is registered, so it runs under the tool call `begin_tool_call` opened for the request (the JS
 sample's `auditToolHandlers`).
 
+## Minimum Card level (story C-C)
+
+Every tool demands Card level `L3` by default: a fresh request proof on the call from a fully attested agent whose
+status was read live. A chain sent without a proof verifies at `L2` at most; a proof with no token `cnf` to fuse is
+`L3-minus`, which meets `L3` unless told otherwise. A call below its tool's minimum is a 401
+`insufficient_user_authentication` with `derivedLevel` and `requiredLevel` in the body. With `SERVICE_DID` set:
+
+| Variable | Values | Default |
+|---|---|---|
+| `KYAOS_MINIMUM_LEVEL` | `L1`, `L2`, `L3` | `L3` |
+| `KYAOS_TOOL_LEVELS` | `tool=level,...`, e.g. `lookup_order=L2` | none |
+| `KYAOS_L3_MINUS_SATISFIES_L3` | `0`, `1` | `1` |
+
+A level that does not exist is refused at startup, never read as a lower bar. The `_kyaos_handshake` tool takes `L1`.
+A bearer token sent with a request proof is the proof's sender constraint: when its `cnf.jkt` matches the proof's
+`cnf.jkt` and the signing key, the call is `L3` (SPEC-ENTITY-CARD section 8.6).
+
 ## KYA-OS session and response proof (story L2-A)
 
 Set `SERVICE_SIGNING_KEY` (the Ed25519 private key, hex, that `SERVICE_DID`'s document lists as `key-1`) and the

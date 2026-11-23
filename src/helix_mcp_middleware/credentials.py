@@ -1,8 +1,9 @@
 """Finds the caller's credential, ported from helix-sdk-js's
 mcp-middleware/src/credentials.ts: a KYA-OS request proof (with the chain the
-request carries) in ``_meta``, or an OAuth bearer token. Story F-2 retired the
-Helix VP (``Authorization: HelixVP``, ``X-Helix-VP``, ``_meta["x-helix-vp"]``)
-with no backward compatibility: those are no longer read."""
+request carries) in ``_meta``, or an OAuth bearer token. A bearer token next to
+a proof is the proof's sender constraint, fused through ``cnf.jkt`` (story C-C,
+SPEC-ENTITY-CARD.md section 8.6). The Helix VP is retired with no backward
+compatibility: its carriers are no longer read."""
 
 from __future__ import annotations
 
@@ -28,13 +29,15 @@ _AUTH = re.compile(r"^(\S+)\s+(\S+)$")
 @dataclass(frozen=True)
 class ExtractedCredential:
     kind: str
-    """'proof' (a KYA-OS request proof, with the carried chain) or 'oauth' (a bearer token)."""
+    """'proof' (a KYA-OS request proof and/or a carried chain) or 'oauth' (a bearer token alone)."""
     token: Optional[str] = None
     """The bearer token, for 'oauth'."""
     proof: Any = None
-    """The request proof as carried, for 'proof'."""
+    """The request proof as carried, for 'proof'; None for a chain sent without one (story C-C)."""
     chain: Any = None
     """The carried delegation chain, when the request has one."""
+    bearer: Optional[str] = None
+    """For 'proof': a bearer token sent with the proof, its sender constraint (``cnf`` fusion, section 8.6)."""
 
 
 def _header_values(headers: Any, name: str) -> List[str]:
@@ -74,8 +77,11 @@ def extract_credential(headers: Any = None, meta: Any = None) -> Optional[Extrac
     present), with the carried chain at ``_meta["org.kya-os/delegation-chain"]``;
     or ``Authorization: Bearer <token>`` for OAuth. Tool arguments are never read.
 
-    Ambiguity is rejected, never resolved by picking one: two Authorization
-    headers, or a proof together with a bearer token, raise CREDENTIAL_CONFLICT."""
+    A proof with a bearer token is one credential: the token is the proof's
+    sender constraint (``bearer``). A chain without a proof is a KYA-OS
+    credential too (it verifies at L2 at most, story C-C). Ambiguity is
+    rejected, never resolved by picking one: two Authorization headers, or a
+    chain without a proof together with a bearer token, raise CREDENTIAL_CONFLICT."""
     bearer: Optional[str] = None
     authorization = _header_values(headers, "authorization")
     if len(authorization) > 1:
@@ -90,12 +96,13 @@ def extract_credential(headers: Any = None, meta: Any = None) -> Optional[Extrac
 
     fields = meta_mapping(meta)
     proof = read_request_proof(fields)
-    if proof is not None and bearer is not None:
+    chain = read_carried_chain(fields)
+    if proof is None and chain is not None and bearer is not None:
         raise MCPAuthError(
-            CREDENTIAL_CONFLICT, "Both a KYA-OS request proof and an OAuth bearer token were provided; send exactly one"
+            CREDENTIAL_CONFLICT, "A delegation chain without a request proof and an OAuth bearer token were both provided; send one"
         )
-    if proof is not None:
-        return ExtractedCredential("proof", proof=proof, chain=read_carried_chain(fields))
+    if proof is not None or chain is not None:
+        return ExtractedCredential("proof", proof=proof, chain=chain, bearer=bearer)
     if bearer is not None:
         return ExtractedCredential("oauth", token=bearer)
     return None

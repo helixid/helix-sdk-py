@@ -64,6 +64,8 @@ _MAPPED: Dict[str, Tuple[int, str]] = {
     # KYA-OS request proofs (story F-2): absent, or refused by the local verifier.
     _errors.PROOF_MISSING: (401, ""),
     _errors.PROOF_INVALID: (401, "invalid_token"),
+    # Story C-C: a verified call below its tool's minimum Card level (RFC 9470's step-up error).
+    _errors.PROOF_LEVEL_INSUFFICIENT: (401, "insufficient_user_authentication"),
     _errors.OAUTH_TOKEN_INVALID: (401, "invalid_token"),
     _errors.CREDENTIAL_CONFLICT: (400, "invalid_request"),
     "INSUFFICIENT_SCOPE": (403, "insufficient_scope"),
@@ -118,6 +120,7 @@ def to_http_error_response(
         body={
             "error": name or "unauthorized",
             "error_description": message,
+            **{key: value for key, value in (("derivedLevel", getattr(error, "derived_level", None)), ("requiredLevel", getattr(error, "required_level", None))) if isinstance(value, str)},
             **(dict(getattr(error, "challenge", None) or {}) if code == "NEEDS_AUTHORIZATION" else {}),
             **({"_meta": {"org.kya-os/response-proof": dict(proof)}} if proof is not None else {}),
         },

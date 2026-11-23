@@ -186,7 +186,8 @@ class StubVerifier:
         ok = not self.reasons
         return SimpleNamespace(
             ok=ok, effective_scopes=self.scopes if ok else [], proof_did=self.agent, level="L2" if ok else "L0",
-            fresh=ok, reasons=self.reasons, proof_assurance="proof",
+            fresh=ok, reasons=self.reasons, proof_assurance="proof", agent_did=self.agent if ok else None,
+            proof_floor=ok, warnings=[],
         )
 
 
@@ -195,6 +196,8 @@ def verifying(scopes: Sequence[str], agent: Optional[str] = "did:agent", reasons
 
 
 def gate(**options: Any) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
+    # Levels are not the subject here (story C-C's gate is in test_mcp_levels.py): every level is accepted.
+    options.setdefault("minimum_level", "L1")
     return helixid_mcp_middleware(MCPMiddlewareOptions(**options))
 
 
@@ -236,7 +239,8 @@ class TestCredentials:
     def test_conflicts_are_rejected_never_resolved(self) -> None:
         mw = gate(verifier=verifying([]), validate_oauth_token=lambda t: {"sub": "u", "scopes": []})
         for call in (
-            {"headers": {"authorization": "Bearer tok"}, "_meta": PROOF_META},
+            # A proof with a bearer token is one credential (cnf fusion, story C-C); a chain without a proof is not.
+            {"headers": {"authorization": "Bearer tok"}, "_meta": {"org.kya-os/delegation-chain": [{"hop": 1}]}},
             {"headers": {"authorization": ["Bearer a", "Bearer b"]}},
             {"headers": {"authorization": "Bearer"}},
         ):
@@ -1107,7 +1111,7 @@ class TestAudit:
         assert events[3]["correlationId"] == "explicit" and events[3]["actor"] == pairwise_did("did:key:b")
 
 def test_async_wrapper_runs_the_same_gate() -> None:
-    mw = async_helixid_mcp_middleware(MCPMiddlewareOptions(verifier=verifying(["read"]), tool_scopes={"q": ["read"]}))
+    mw = async_helixid_mcp_middleware(MCPMiddlewareOptions(minimum_level="L1", verifier=verifying(["read"]), tool_scopes={"q": ["read"]}))
     assert asyncio.run(mw({"name": "q", "_meta": PROOF_META}))["name"] == "q"
     with pytest.raises(HelixError) as excinfo:
         asyncio.run(mw({"name": "nope", "_meta": PROOF_META}))
@@ -1300,7 +1304,7 @@ class TestAsyncCallbacks:
 
         async def run() -> None:
             seen["loop_thread"] = threading.get_ident()
-            mw = async_helixid_mcp_middleware(MCPMiddlewareOptions(verifier=verifier, validate_oauth_token=validate, audit_sink=sink, tool_scopes={"q": ["read"]}))
+            mw = async_helixid_mcp_middleware(MCPMiddlewareOptions(minimum_level="L1", verifier=verifier, validate_oauth_token=validate, audit_sink=sink, tool_scopes={"q": ["read"]}))
             await mw({"name": "q", "headers": {"authorization": "Bearer tok"}})
             await mw({"name": "q", "_meta": PROOF_META})
 

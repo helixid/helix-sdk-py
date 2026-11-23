@@ -59,6 +59,13 @@ class MCPMiddlewareOptions:
     """Called when `audit_sink` raises. Audit failures never block a tool call."""
     service_did: Optional[str] = None
     """This server's DID: the proof audience, included in audit events; defaults to `expected_target_service`."""
+    minimum_level: Optional[str] = None
+    """Story C-C: the Card level every tool demands, ``L1``, ``L2`` or ``L3``; default ``L3``.
+    Checked after the scopes; a call below it raises LevelError (PROOF_LEVEL_INSUFFICIENT)."""
+    tools: Optional[Dict[str, Any]] = None
+    """Story C-C: per-tool settings, ``{"lookup_order": {"minimum_level": "L2"}}``."""
+    l3_minus_satisfies_l3: Optional[bool] = None
+    """Story C-C: whether L3-minus (a proof with no token ``cnf`` to fuse) meets an ``L3`` minimum; default True."""
     needs_authorization: Optional["NeedsAuthorization"] = None
     """KYA-OS story L3-E: answers a call whose delegation is missing or does
     not cover the tool's scopes with a signed `needs_authorization` challenge

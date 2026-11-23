@@ -12,7 +12,10 @@ HelixID, mirroring helix-sdk-js's mcp-middleware package.
   `_meta["org.kya-os/request-proof"]`, with the delegation chain at
   `_meta["org.kya-os/delegation-chain"]`), verified in-process by the local
   verifier, or an OAuth 2.1 bearer token; enforces per-tool scopes (deny by
-  default) and records each decision.
+  default), then the tool's minimum Card level (story C-C: ``minimum_level``,
+  ``tools[name]["minimum_level"]``, ``l3_minus_satisfies_l3``; a call below it
+  raises LevelError), and records each decision. A bearer token sent with a
+  proof is the proof's sender constraint (``cnf`` fusion, L3).
 - create_local_verifier() (story F-2): the local verifier the gate runs, from
   the presented proof and chain, public DID documents, status lists and
   cards, a local replay store and local config. The Helix API is never asked.
@@ -73,7 +76,27 @@ from .audit_delivery import (
     run_audited_tool,
 )
 from .credentials import DEFAULT_TRUSTED_ISSUERS, ExtractedCredential, TrustedIssuers, extract_credential
-from .errors import PROOF_INVALID, PROOF_MISSING, AuthorizationServerUnavailableError, MCPAuthError, ProofError, ToolScopeError
+from .errors import (
+    PROOF_INVALID,
+    PROOF_LEVEL_INSUFFICIENT,
+    PROOF_MISSING,
+    AuthorizationServerUnavailableError,
+    LevelError,
+    MCPAuthError,
+    ProofError,
+    ToolScopeError,
+)
+from .level import (
+    DEFAULT_MINIMUM_LEVEL,
+    DERIVED_LEVELS,
+    MINIMUM_LEVELS,
+    LevelPolicy,
+    assert_level_policy,
+    derive_conformance_level,
+    derived_level_of,
+    meets_minimum_level,
+    minimum_level_for,
+)
 from .identity import ServedIdentity, ServeIdentityOptions, resolve_server_card, serve_identity
 from .metadata import (
     HttpErrorResponse,
@@ -86,6 +109,7 @@ from .oauth import (
     AuthResult,
     OAuthIntrospectionOptions,
     OAuthIssuerOptions,
+    cnf_jkt_of,
     create_introspection_validator,
     create_jwt_validator,
     create_oauth_validator,
@@ -119,9 +143,11 @@ from .verify_locally import (
     VerificationReport,
     card_endpoint_of,
     create_local_verifier,
+    request_of,
     resolution_url,
     unrecorded_reporter,
 )
+from .verify_request_proof import verify_request_proof
 
 __all__ = [
     "AUDIT_META_KEY",
@@ -156,6 +182,20 @@ __all__ = [
     "ProofError",
     "PROOF_MISSING",
     "PROOF_INVALID",
+    "PROOF_LEVEL_INSUFFICIENT",
+    "LevelError",
+    "LevelPolicy",
+    "MINIMUM_LEVELS",
+    "DERIVED_LEVELS",
+    "DEFAULT_MINIMUM_LEVEL",
+    "assert_level_policy",
+    "derive_conformance_level",
+    "derived_level_of",
+    "meets_minimum_level",
+    "minimum_level_for",
+    "cnf_jkt_of",
+    "request_of",
+    "verify_request_proof",
     "ToolScopeError",
     "AuthorizationServerUnavailableError",
     "to_http_error_response",

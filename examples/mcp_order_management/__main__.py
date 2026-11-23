@@ -49,6 +49,9 @@ Configuration (environment), the same as the JS sample:
   KYAOS_REDIS_URL             also the status cache's Redis, whatever KYAOS_NONCE_STORE says: lists and
                               verdicts shared by every instance, JS or Python (pip install 'helixid-sdk-py[redis]');
                               without it the cache is in memory and covers this instance only
+  KYAOS_MINIMUM_LEVEL     story C-C: the Card level every tool demands, L1, L2 or L3 (default L3)
+  KYAOS_TOOL_LEVELS       per-tool minimums, tool=level,... (e.g. lookup_order=L2); the handshake takes L1
+  KYAOS_L3_MINUS_SATISFIES_L3=0  refuse L3-minus (a proof with no token cnf to fuse) for L3 tools (default 1)
   OAUTH_ISSUER          OAuth door, one authorization server. The issuer alone is enough: its keys are
                         read from its metadata (aud must be MCP_RESOURCE). Optional:
   OAUTH_JWKS_URI          its jwks_uri, to skip discovery
@@ -109,6 +112,7 @@ import json
 import os
 import re
 import sys
+from dataclasses import replace
 from typing import Any, Callable, Dict, List, NoReturn, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -151,6 +155,7 @@ from helix_mcp_middleware import (
 from helix_sdk.verifier import StatusCache
 
 from .app import create_order_app
+from .levels import LEVEL_VARIABLES, describe_level_settings, read_level_settings
 from .demo_authorizer import demo_retry_authorizer
 from .orders import TOOL_SCOPES
 
@@ -674,13 +679,20 @@ def main() -> None:
     kyaos = kyaos_from_env(env, resource, service_did)
     signals: Optional[RevocationSignalClient] = None
     webhook_path: Optional[str] = None
+    levels: Dict[str, Any] = {}
     if service_did:
         # The KYA-OS door (story F-2): every request proof is verified here, in-process.
         local = create_local_verifier(verifier_from_env(env, service_did, kyaos))
         auth.verifier = local
         signals, webhook_path = revocation_signals_from_env(env, local, event_logger(env))
-    elif any(env.get(name) for name in ("KYAOS_TRUSTED_ISSUERS", "KYAOS_TRUSTED_ROOTS", "KYAOS_MAX_CHAIN_LENGTH", "KYAOS_CARDS_FILE", *L3C_SETTINGS)):
-        fail("KYAOS_TRUSTED_ISSUERS / KYAOS_TRUSTED_ROOTS / KYAOS_MAX_CHAIN_LENGTH / KYAOS_CARDS_FILE and the revocation settings need SERVICE_DID")
+        # Story C-C: the minimum Card level, per tool.
+        try:
+            levels = read_level_settings(env, list(TOOL_SCOPES))
+        except ValueError as error:
+            fail(str(error))
+        auth = replace(auth, **levels)
+    elif any(env.get(name) for name in ("KYAOS_TRUSTED_ISSUERS", "KYAOS_TRUSTED_ROOTS", "KYAOS_MAX_CHAIN_LENGTH", "KYAOS_CARDS_FILE", *L3C_SETTINGS, *LEVEL_VARIABLES)):
+        fail("KYAOS_TRUSTED_ISSUERS / KYAOS_TRUSTED_ROOTS / KYAOS_MAX_CHAIN_LENGTH / KYAOS_CARDS_FILE / KYAOS_*_LEVEL(S) and the revocation settings need SERVICE_DID")
     if demo:
         def demo_token(token: str) -> AuthResult:
             if token not in DEMO_TOKENS:
@@ -718,7 +730,7 @@ def main() -> None:
         "  KYA-OS proofs: "
         + (
             f"verified in-process for {service_did}, trusted issuers {env.get('KYAOS_TRUSTED_ISSUERS') or '*'}, "
-            f"chain length <= {env.get('KYAOS_MAX_CHAIN_LENGTH') or 10}"
+            f"chain length <= {env.get('KYAOS_MAX_CHAIN_LENGTH') or 10}, {describe_level_settings(levels)}"
             if auth.verifier is not None
             else "off (set SERVICE_DID)"
         )

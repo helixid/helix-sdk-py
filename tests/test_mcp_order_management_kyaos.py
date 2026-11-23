@@ -400,7 +400,8 @@ class TestWithTheTypedAuditTrail:
         assert sink.events[1]["details"]["verificationCode"].startswith("KYAOS_PROOF")
         assert sink.events[2]["reason"] == {"code": "insufficient_scope"}
 
-    def test_records_a_refused_request_proof_as_proof_rejected(self) -> None:
+    def test_records_a_replayed_request_proof_as_a_denied_call_never_attributed(self) -> None:
+        """Story C-C: the §11.2 order checks the nonce before the signature, so a replay names no verified DID."""
         instance = App(audited=True)
         with instance.http:
             args = {"orderId": "ORD-1001"}
@@ -410,9 +411,9 @@ class TestWithTheTypedAuditTrail:
             res = instance.call("lookup_order", args, None, meta)
         assert res.status_code == 401
         sink = instance.audit_sink
-        assert sink.event_types == ["session.established", "proof.rejected", "tool.call.denied"]
-        assert sink.events[1]["outcome"] == "denied" and sink.events[1]["actor"] == {"kind": "pairwise_did", "did": AGENT}
-        assert sink.events[2]["reason"] == {"code": "proof_invalid"}
+        assert sink.event_types == ["session.established", "tool.call.denied"]
+        assert sink.events[1]["outcome"] == "denied" and sink.events[1]["reason"] == {"code": "proof_invalid"}
+        assert "actor" not in sink.events[1]
 
     def test_records_a_denied_call_by_its_code_and_still_answers_with_the_denied_proof(self) -> None:
         instance = App(audited=True)

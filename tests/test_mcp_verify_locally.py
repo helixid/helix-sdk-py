@@ -199,7 +199,8 @@ def test_reports_every_verification_and_survives_a_hook_that_raises_or_is_async(
     verifier.verify_call({"name": "t", "_meta": proof_meta(SIGNER, SERVICE, "t")})
     assert reports[0] == {
         "timestamp": "2026-06-01T00:00:00.000Z", "serviceDid": SERVICE, "toolName": "t", "agentDid": AGENT, "ok": True,
-        "level": "L1", "proofAssurance": "L3-minus", "effectiveScopes": [], "reasons": [], "fresh": True, "chainDepth": 0,
+        "level": "L1", "proofAssurance": "L3-minus", "proofFloor": True, "l3Minus": False, "cnfDiagnostics": [],
+        "effectiveScopes": [], "reasons": [], "fresh": True, "chainDepth": 0,
     }
     errors: List[BaseException] = []
 
@@ -235,6 +236,8 @@ AGENT_OWN = make_agent()
 
 
 def gate(**options: Any) -> Any:
+    # Levels are not the subject here (story C-C's gate is in test_mcp_levels.py): every level is accepted.
+    options.setdefault("minimum_level", "L1")
     return helixid_mcp_middleware(MCPMiddlewareOptions(**options))
 
 
@@ -294,12 +297,17 @@ def test_audits_a_granted_proof_and_a_refused_one_whose_signer_was_identified() 
     mw = gate(verifier=own_verifier(), audit_sink=events.append, service_did=SERVICE)
     meta = proof_meta(AGENT_OWN["signer"], SERVICE, "t")
     mw({"name": "t", "_meta": meta})
-    refusal(lambda: mw({"name": "t", "_meta": meta}))
+    # Section 11.2 refuses a replay before the signature (story C-C): no principal is proven, so it is not audited.
+    assert refusal(lambda: mw({"name": "t", "_meta": meta})).reasons == ("nonce_replayed",)
+    # A proof that verified, under a chain that does not: the refusal names the proven signer.
+    broken_chain = proof_meta(AGENT_OWN["signer"], SERVICE, "t", chain=[{"type": ["VerifiableCredential"]}])
+    refusal(lambda: mw({"name": "t", "_meta": broken_chain}))
     assert len(events) == 2
-    assert {k: events[0][k] for k in ("event", "authMethod", "agentDid", "level", "fresh", "serviceDid")} == {
+    assert {k: events[0][k] for k in ("event", "authMethod", "agentDid", "level", "fresh", "serviceDid", "proofAssurance", "l3Minus")} == {
         "event": "AUTHZ_GRANTED", "authMethod": "kyaos", "agentDid": AGENT_OWN["did"], "level": "L1", "fresh": True, "serviceDid": SERVICE,
+        "proofAssurance": "L3-minus", "l3Minus": False,
     }
-    assert (events[1]["event"], events[1]["agentDid"], events[1]["reason"]) == ("AUTHZ_DENIED", AGENT_OWN["did"], "nonce_replayed")
+    assert (events[1]["event"], events[1]["agentDid"]) == ("AUTHZ_DENIED", AGENT_OWN["did"]) and events[1]["reason"]
 
 
 def test_builds_the_verifier_from_settings_with_the_service_did_and_the_tool_scopes_as_the_catalog() -> None:
@@ -322,7 +330,7 @@ def test_the_async_gate_awaits_an_async_report_hook_on_the_loop() -> None:
         reports.append(entry)
 
     options = fixture_verifier_options(SERVICE, documents={AGENT_OWN["did"]: AGENT_OWN["document"]}, report_verification=report)
-    mw = async_helixid_mcp_middleware(MCPMiddlewareOptions(verifier=options, required_scopes=[]))
+    mw = async_helixid_mcp_middleware(MCPMiddlewareOptions(minimum_level="L1", verifier=options, required_scopes=[]))
     call = {"name": "t", "_meta": proof_meta(AGENT_OWN["signer"], SERVICE, "t")}
     assert asyncio.run(mw(call)) is call
     assert [r["ok"] for r in reports] == [True]
@@ -417,12 +425,12 @@ def test_the_helix_audit_sink_records_a_kyaos_caller_at_its_level_and_refuses_an
         )
 
 
-def test_a_proof_error_carries_one_of_the_two_proof_codes() -> None:
+def test_a_proof_error_carries_one_of_the_three_proof_codes() -> None:
     from helix_mcp_middleware import PROOF_INVALID
 
     err = ProofError(PROOF_INVALID, "refused", ["nonce_replayed"])
     assert (err.code, err.reasons) == ("PROOF_INVALID", ("nonce_replayed",))
-    with pytest.raises(ValueError, match="PROOF_MISSING or PROOF_INVALID"):
+    with pytest.raises(ValueError, match="PROOF_MISSING, PROOF_INVALID or PROOF_LEVEL_INSUFFICIENT"):
         ProofError("VP_MISSING", "x")
 
 
@@ -446,7 +454,7 @@ def test_an_async_replay_store_is_awaited_on_the_async_gates_loop_and_refuses_a_
 
     store = _AsyncStore()
     options = fixture_verifier_options(SERVICE, documents={AGENT_OWN["did"]: AGENT_OWN["document"]}, nonce_store=store)
-    mw = async_helixid_mcp_middleware(MCPMiddlewareOptions(verifier=options, required_scopes=[]))
+    mw = async_helixid_mcp_middleware(MCPMiddlewareOptions(minimum_level="L1", verifier=options, required_scopes=[]))
     call = {"name": "t", "_meta": proof_meta(AGENT_OWN["signer"], SERVICE, "t")}
 
     async def twice() -> Any:

@@ -15,27 +15,26 @@ assumed by analogy.
 
 Usage:
 
-    from helix_sdk import HelixClient
-    from helix_crewai import helix_id_crewai_tool
+    from helix_sdk import kyaos
+    from helix_crewai import helix_id_crewai_tool, sign_current_request
 
-    client = HelixClient("https://api.example.com", admin_api_key=os.environ["HELIX_ADMIN_API_KEY"])
-    protected_tool = helix_id_crewai_tool(
-        my_orders_tool,
-        client,
-        agent_did="did:key:z...",
-        target_service="https://api.example.com/v1/tools/orders",
-    )
+    signer = kyaos.EnvSigner(did="did:web:agent.example.com")   # the agent's own key, from HELIX_SIGNING_KEY
+    protected_tool = helix_id_crewai_tool(my_orders_tool, signer=signer, audience="did:web:orders.example.com", chain=hops)
     crew = Crew(agents=[...], tasks=[...], tools=[protected_tool])
+
+    # inside my_orders_tool._run: the MCP request it sends, signed for this one call
+    request = sign_current_request({"name": "lookup_order", "arguments": {"orderId": order_id}})
 """
 
 from __future__ import annotations
 
 from .middleware import helix_id_crewai_tool
 from .scope_filter import filter_crewai_tools_by_scope
-from helix_sdk.tool_vp import current_helix_vp_headers
+from helix_sdk.tool_signing import RequestSigner, sign_current_request
 
 __all__ = [
     "helix_id_crewai_tool",
-    "current_helix_vp_headers",
+    "sign_current_request",
+    "RequestSigner",
     "filter_crewai_tools_by_scope",
 ]

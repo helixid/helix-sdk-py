@@ -69,7 +69,8 @@ KYA_OS_CARD_SERVICE_TYPE = "KyaOsEntityCard"
 VerificationReport = Dict[str, Any]
 """What ``report_verification`` receives for every local verification. Keys
 match the JS report: timestamp, serviceDid, toolName, agentDid, ok, level,
-proofAssurance, effectiveScopes, reasons, fresh, chainDepth."""
+proofAssurance, proofFloor, l3Minus, cnfDiagnostics (story C-C),
+effectiveScopes, reasons, fresh, chainDepth."""
 
 ReportVerification = Callable[[VerificationReport], Any]
 
@@ -219,6 +220,22 @@ class _ReplaySeam:
         return _settle(self._store.insert(nonce, agent_did, expires_at_ms / 1000)) is True
 
 
+def request_of(call: Mapping[str, Any]) -> Dict[str, Any]:
+    """The JSON-RPC request the proof's ``requestHash`` covers: ``call["request"]`` as received,
+    else ``tools/call`` rebuilt from ``name``, ``input`` and ``_meta``."""
+    request = call.get("request")
+    if request is not None:
+        return request  # type: ignore[no-any-return]
+    params: Dict[str, Any] = {}
+    if call.get("name") is not None:
+        params["name"] = call["name"]
+    if call.get("input") is not None:
+        params["arguments"] = call["input"]
+    if call.get("_meta") is not None:
+        params["_meta"] = dict(meta_mapping(call["_meta"]))
+    return {"method": "tools/call", "params": params}
+
+
 class LocalVerifier:
     """Verifies tool calls in-process. Build it with :func:`create_local_verifier`."""
 
@@ -298,31 +315,33 @@ class LocalVerifier:
         return verify(proof, self.seams, VerifierOptions(**{**self._base, **overrides}), chain=chain, request=request, card=card)
 
     def verify_call(self, call: Mapping[str, Any]) -> Optional[VerifierResult]:
-        """Verifies one tool call (``name``, ``input``, ``_meta``, optional ``request``) from its ``_meta``; None when it carries no request proof."""
+        """Verifies one tool call (``name``, ``input``, ``_meta``, optional ``request``) from its
+        ``_meta``; None when it carries neither a request proof nor a chain. ``token_cnf_jkt`` is
+        the bearer token's ``cnf.jkt`` for the L3 fusion; ``require_proof=False`` (story C-C) lets
+        a chain without a proof verify, at L2 at most."""
         meta = meta_mapping(call.get("_meta"))
         proof = read_request_proof(meta)
-        if proof is None:
+        chain = read_carried_chain(meta)
+        if proof is None and chain is None:
             return None
         name = call.get("name")
-        request = call.get("request")
-        if request is None:
-            params: Dict[str, Any] = {}
-            if name is not None:
-                params["name"] = name
-            if call.get("input") is not None:
-                params["arguments"] = call["input"]
-            if call.get("_meta") is not None:
-                params["_meta"] = dict(meta)
-            request = {"method": "tools/call", "params": params}
-        result = self.verify(proof, chain=read_carried_chain(meta), request=request)
+        overrides: Dict[str, Any] = {}
+        if call.get("token_cnf_jkt") is not None:
+            overrides["token_cnf_jkt"] = call["token_cnf_jkt"]
+        if call.get("require_proof") is not None:
+            overrides["require_proof"] = call["require_proof"]
+        result = self.verify(proof, chain=chain, request=request_of(call), **overrides)
         entry: VerificationReport = {
             "timestamp": datetime.fromtimestamp(self._clock() / 1000, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
             "serviceDid": self.service_did,
             "toolName": name if isinstance(name, str) else None,
-            "agentDid": result.proof_did,
+            "agentDid": result.agent_did if result.agent_did is not None else result.proof_did,
             "ok": result.ok,
             "level": result.level,
             "proofAssurance": result.proof_assurance,
+            "proofFloor": result.proof_floor,
+            "l3Minus": result.level == "L3" and result.proof_assurance == "L3-minus",
+            "cnfDiagnostics": [warning for warning in result.warnings if warning.startswith("cnf_")],
             "effectiveScopes": list(result.effective_scopes),
             "reasons": list(result.reasons),
             "fresh": result.fresh,

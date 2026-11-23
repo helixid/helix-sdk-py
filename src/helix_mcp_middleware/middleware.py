@@ -10,8 +10,8 @@ mcp-middleware/src/middleware.ts.
 Call it for every incoming tool call with the tool name, the MCP request's
 `_meta` and, over HTTP, the request headers. It identifies the caller (a
 KYA-OS request proof, verified in-process by the local verifier, story F-2;
-or an OAuth bearer token), checks the tool's scopes, records the decision,
-and returns the call or raises. Tool arguments are never consulted, and the
+or an OAuth bearer token), checks the tool's scopes and then its minimum Card
+level (story C-C), records the decision, and returns the call or raises. Tool arguments are never consulted, and the
 Helix API is never asked about a credential.
 """
 
@@ -31,12 +31,14 @@ from .errors import (
     PROOF_MISSING,
     TOOL_NOT_PERMITTED,
     AuthorizationServerUnavailableError,
+    LevelError,
     MCPAuthError,
     ProofError,
     ToolScopeError,
 )
+from .level import LevelPolicy, assert_level_policy, derived_level_of, meets_minimum_level, minimum_level_for
+from .oauth import AuthResult, cnf_jkt_of, create_oauth_validator
 from .needs_authorization_guard import challenge_for, resume_retry
-from .oauth import AuthResult, create_oauth_validator
 from .types import MCPMiddlewareOptions, MCPToolCall
 from .verify_locally import LocalVerifier, LocalVerifierOptions, create_local_verifier
 
@@ -57,6 +59,10 @@ class AuthorizedCaller:
     proof_assurance: Optional[str] = None
     fresh: Optional[bool] = None
     """KYA-OS callers: whether every status the level relies on was read live."""
+    proof_floor: Optional[bool] = None
+    """KYA-OS callers (story C-C): True when a request proof verified; False for a chain verified without one."""
+    cnf_diagnostics: Optional[List[str]] = None
+    """KYA-OS callers: the ``cnf`` diagnostics (``cnf_present_but_token_unfused``)."""
 
 
 def _caller_of(caller: Dict[str, Any]) -> AuthorizedCaller:
@@ -68,6 +74,8 @@ def _caller_of(caller: Dict[str, Any]) -> AuthorizedCaller:
         level=caller.get("level"),
         proof_assurance=caller.get("proofAssurance"),
         fresh=caller.get("fresh"),
+        proof_floor=caller.get("proofFloor"),
+        cnf_diagnostics=list(caller["cnfDiagnostics"]) if caller.get("cnfDiagnostics") else None,
     )
 
 class _AsyncCallbackError(TypeError):
@@ -89,7 +97,9 @@ def _as_auth_result(value: Any) -> Optional[AuthResult]:
     if isinstance(value, AuthResult):
         return value
     if isinstance(value, dict):
-        return AuthResult(sub=value.get("sub"), scopes=value.get("scopes") or [], client_id=value.get("client_id"))  # type: ignore[arg-type]
+        claims = value.get("claims")
+        cnf_jkt = value.get("cnf_jkt") or value.get("cnfJkt") or cnf_jkt_of(claims)
+        return AuthResult(sub=value.get("sub"), scopes=value.get("scopes") or [], client_id=value.get("client_id"), claims=claims, cnf_jkt=cnf_jkt)  # type: ignore[arg-type]
     return None
 
 
@@ -125,6 +135,10 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
     validate_oauth = options.validate_oauth_token or (
         create_oauth_validator(options.oauth) if options.oauth is not None else None
     )
+    # Story C-C: the minimum Card level per tool, checked after the scopes. A typo in a level raises here, never lowers a bar.
+    level_policy = LevelPolicy(options.minimum_level, options.tools, options.l3_minus_satisfies_l3)
+    assert_level_policy(level_policy)
+    l3_minus_satisfies_l3 = options.l3_minus_satisfies_l3 if options.l3_minus_satisfies_l3 is not None else True
     service_did = options.service_did or options.expected_target_service
     # The verifier runs in-process (story F-2): nothing here ever asks the Helix API about a credential.
     local_verifier = _build_verifier(options, service_did)
@@ -139,9 +153,15 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
             "authMethod": caller["authMethod"],
             "effectiveScopes": list(caller["scopes"]),
         }
-        for key in ("agentDid", "oauthSubject", "level", "fresh"):
+        for key in ("agentDid", "oauthSubject", "level", "fresh", "proofAssurance"):
             if caller.get(key) is not None:
                 event[key] = caller[key]
+        if caller["authMethod"] == "kyaos" and caller.get("level") is not None:
+            event["l3Minus"] = caller["level"] == "L3" and caller.get("proofAssurance") == "L3-minus"
+        if caller.get("cnfDiagnostics"):
+            event["cnfDiagnostics"] = list(caller["cnfDiagnostics"])
+        if denied and denied.get("requiredLevel") is not None:
+            event["requiredLevel"] = denied["requiredLevel"]
         if tool_name is not None:
             event["toolName"] = tool_name
         if denied:
@@ -155,6 +175,21 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
         except Exception as exc:  # noqa: BLE001 - a failing sink never blocks a call
             if options.on_audit_error is not None:
                 options.on_audit_error(exc)
+
+    def validate_bearer(token: str) -> AuthResult:
+        if validate_oauth is None:
+            raise MCPAuthError(OAUTH_TOKEN_INVALID, "Bearer tokens are not accepted by this server")
+        try:
+            auth = _as_auth_result(_refuse_awaitable(validate_oauth(token), "validate_oauth_token"))
+        except (MCPAuthError, AuthorizationServerUnavailableError, _AsyncCallbackError):
+            # Our own verdicts pass through; the authorization server being
+            # down is a server fault, not a bad token.
+            raise
+        except Exception:  # noqa: BLE001 - anything else came from a custom callback and means "rejected"
+            raise MCPAuthError(OAUTH_TOKEN_INVALID, "The access token was rejected") from None
+        if auth is None or not isinstance(auth.sub, str) or not auth.sub:
+            raise MCPAuthError(OAUTH_TOKEN_INVALID, "The access token has no subject")
+        return auth
 
     def authorize(tool_call: MCPToolCall) -> AuthorizedCaller:
         # Credentials come from Authorization or `_meta` only; tool arguments
@@ -173,9 +208,17 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
         if credential.kind == "proof":
             if local_verifier is None:
                 raise ValueError("helixid_mcp_middleware: `verifier` is required to verify KYA-OS request proofs")
-            call: Dict[str, Any] = {"name": tool_name, "input": tool_call.get("input"), "_meta": tool_call.get("_meta")}
+            # A bearer token next to a proof is its sender constraint: its cnf.jkt fuses with the proof's for L3 (section 8.6).
+            token_cnf_jkt: Optional[str] = None
+            if credential.bearer is not None:
+                bearer_auth = validate_bearer(credential.bearer)
+                token_cnf_jkt = bearer_auth.cnf_jkt or cnf_jkt_of(bearer_auth.claims)
+            # A chain may come without a proof (story C-C): it verifies, at most at L2, and the level check below decides.
+            call: Dict[str, Any] = {"name": tool_name, "input": tool_call.get("input"), "_meta": tool_call.get("_meta"), "require_proof": False}
             if tool_call.get("request") is not None:
                 call["request"] = tool_call["request"]
+            if token_cnf_jkt is not None:
+                call["token_cnf_jkt"] = token_cnf_jkt
             result = local_verifier.verify_call(call)
             if result is None:  # pragma: no cover - extract_credential found a proof, so verify_call reads one
                 raise ProofError(PROOF_MISSING, "The request carries no KYA-OS request proof")
@@ -188,27 +231,21 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
                         {"reason": ",".join(result.reasons)},
                     )
                 raise refused
+            cnf_diagnostics = [warning for warning in result.warnings if warning.startswith("cnf_")]
             caller = {
                 "authMethod": "kyaos",
                 "scopes": list(result.effective_scopes),
-                "agentDid": result.proof_did,
+                "agentDid": result.agent_did,
                 "level": result.level,
                 "proofAssurance": result.proof_assurance,
                 "fresh": result.fresh,
+                "proofFloor": result.proof_floor,
             }
+            if cnf_diagnostics:
+                caller["cnfDiagnostics"] = cnf_diagnostics
         else:
-            if validate_oauth is None:
-                raise MCPAuthError(OAUTH_TOKEN_INVALID, "Bearer tokens are not accepted by this server")
-            try:
-                auth = _as_auth_result(_refuse_awaitable(validate_oauth(credential.token), "validate_oauth_token"))
-            except (MCPAuthError, AuthorizationServerUnavailableError, _AsyncCallbackError):
-                # Our own verdicts pass through; the authorization server being
-                # down is a server fault, not a bad token.
-                raise
-            except Exception:  # noqa: BLE001 - anything else came from a custom callback and means "rejected"
-                raise MCPAuthError(OAUTH_TOKEN_INVALID, "The access token was rejected") from None
-            if auth is None or not isinstance(auth.sub, str) or not auth.sub:
-                raise MCPAuthError(OAUTH_TOKEN_INVALID, "The access token has no subject")
+            assert credential.token is not None
+            auth = validate_bearer(credential.token)
             caller = {"authMethod": "oauth", "scopes": list(auth.scopes or []), "oauthSubject": auth.sub}
 
         # Authorization. With a tool_scopes map the default is deny: an
@@ -234,6 +271,14 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
                 raise challenge
             audit(caller, tool_name, {"scope": missing, "reason": "insufficient scope"})
             raise ToolScopeError(missing, required)
+
+        # The level, after the scopes (story C-C): how sure we are the caller is that agent right now.
+        if caller["authMethod"] == "kyaos":
+            required_level = minimum_level_for(level_policy, tool_name)
+            derived = derived_level_of(caller.get("level") or "L1", caller.get("proofAssurance"))
+            if not meets_minimum_level(derived, required_level, l3_minus_satisfies_l3):
+                audit(caller, tool_name, {"reason": f"level_insufficient: {derived} < {required_level}", "requiredLevel": required_level})
+                raise LevelError(derived, required_level)
 
         audit(caller, tool_name, None)
         return _caller_of(caller)

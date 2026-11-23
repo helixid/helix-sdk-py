@@ -10,9 +10,11 @@ surface (see src/index.ts there).
 SDK-API-only architecture (the SDK-API-only design): every SDK,
 in every language, depends only on the HelixID API -- never on a shared
 "core" package -- except for private-key operations that must stay local:
-keygen, sign, canonical-hash, VPBuilder.sign(). verify_vp(), delegation-VC
-building, DID resolution, and status checks are all API calls made through
-HelixClient.
+keygen, sign, canonical-hash. Delegation-VC building, DID resolution, and
+status checks are API calls made through HelixClient. The Helix VP is gone
+(KYA-OS story C-C): an agent signs each request itself
+(kyaos.with_request_proof), and a service verifies it in-process
+(helix_sdk.verifier.verify, or helix_mcp_middleware).
 
 Agent self-custody has been retired: onboarding (HelixClient.onboard_agent())
 is server-side keygen now, no local keypair, no wallet file. AgentWallet and
@@ -43,11 +45,7 @@ from .credentials import (
     DELEGATION_CREDENTIAL_TYPE,
     IDENTITY_CREDENTIAL_TYPE,
 )
-from .vp_builder import VPBuilder, VPBuilderSignOverrides
 
-# Verifier
-from .verify import verify_vp
-from .scope import check_scope, require_scope
 from .session_manager import SessionManager, SessionClaims, DelegationLink
 
 # Enrollment / issuer API operations
@@ -192,7 +190,6 @@ from .errors import (  # noqa: F401
     VCNotYetValidError,
     VCSignatureInvalidError,
     SelfSignedVCNotAllowedError,
-    VPMissingError,
     VPExpiredError,
     VPVerificationFailedError,
     VPSignatureInvalidError,
@@ -207,26 +204,10 @@ from .errors import (  # noqa: F401
     InsufficientScopeError,
 )
 from . import codes  # noqa: F401
-from .vp_transport import (
-    HELIX_VP_HEADER,
-    HELIX_VP_META_KEY,
-    encode_helix_vp,
-    decode_helix_vp,
-    helix_vp_headers,
-    read_helix_vp_header,
-    read_helix_vp_meta,
-)
 
 __version__ = "2.1.0"  # x-release-please-version
 
 __all__ = [
-    "HELIX_VP_HEADER",
-    "HELIX_VP_META_KEY",
-    "encode_helix_vp",
-    "decode_helix_vp",
-    "helix_vp_headers",
-    "read_helix_vp_header",
-    "read_helix_vp_meta",
     "AgentWallet",
     "WalletCredential",
     "CredentialStore",
@@ -243,11 +224,6 @@ __all__ = [
     "IDENTITY_CREDENTIAL_TYPE",
     "CAPABILITY_ATTESTATION_TYPE",
     "DELEGATION_CREDENTIAL_TYPE",
-    "VPBuilder",
-    "VPBuilderSignOverrides",
-    "verify_vp",
-    "check_scope",
-    "require_scope",
     "SessionManager",
     "SessionClaims",
     "DelegationLink",

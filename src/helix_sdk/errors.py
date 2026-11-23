@@ -295,11 +295,6 @@ class InsufficientScopeError(HelixError):
         super().__init__(codes.INSUFFICIENT_SCOPE, f"Required scope: {required_scope}", 403)
 
 
-class VPMissingError(HelixError):
-    def __init__(self, message: str = 'No Verifiable Presentation in the X-Helix-VP header or MCP _meta["x-helix-vp"]') -> None:
-        super().__init__(codes.VP_MISSING, message, 401)
-
-
 class VPNotFoundError(HelixError):
     def __init__(self, message: str = "VP not found") -> None:
         super().__init__(codes.VP_NOT_FOUND, message, 404)
@@ -657,7 +652,6 @@ _CODE_TO_ERROR = {
     codes.VC_NOT_YET_VALID: VCNotYetValidError,
     codes.VC_SIGNATURE_INVALID: VCSignatureInvalidError,
     codes.SELF_SIGNED_VC_NOT_ALLOWED: SelfSignedVCNotAllowedError,
-    codes.VP_MISSING: VPMissingError,
     codes.VP_EXPIRED: VPExpiredError,
     codes.VP_VERIFICATION_FAILED: VPVerificationFailedError,
     codes.VP_SIGNATURE_INVALID: VPSignatureInvalidError,
