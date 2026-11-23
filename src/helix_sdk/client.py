@@ -22,7 +22,6 @@ from urllib.parse import quote, urlencode
 
 from . import jwt as helix_jwt
 from . import keys
-from .agent_key import agent_key_registration
 from .errors import SDKOnlyModeNoAPIError
 from .http_adapter import HttpAdapter
 
@@ -168,7 +167,7 @@ class HelixClient:
     # -- Service Providers ---------------------------------------------------
     # Services hold no keys: the server mints the service DID, keeps its key,
     # and signs consent grants on the service's behalf -- the same custody
-    # model as agents (onboard_agent / delegate_authority).
+    # model as agents (onboard_agent).
 
     def create_service(
         self,
@@ -295,21 +294,6 @@ class HelixClient:
 
     # -- Onboarding ------------------------------------------------------------
 
-    def register_agent_key(
-        self, agent_did: str, public_key: Union[str, bytes, Dict[str, Any]], kid: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """Registers the public half of a key the agent generated itself (KYA-OS
-        story L1-A, generate_agent_key()): POST /v1/agents/{did}/keys with the
-        public JWK and the verification-method fragment, nothing else. The body
-        is checked for private material before it is sent (self-custody
-        invariant: no API request from the SDK ever carries a private key).
-        Helix republishes the agent's did:web document with the key as
-        ``<did>#<kid>``, the ``kid`` every JWS the agent signs must carry.
-        Returns {did, kid, didKey, didDocument}."""
-        self._assert_api_configured()
-        body = agent_key_registration(public_key, kid)
-        return self._http_required().post(f"/v1/agents/{quote(agent_did, safe='')}/keys", body)
-
     def onboard_agent(self, enrollment_token: str, domains: Optional[List[str]] = None) -> Dict[str, Any]:
         """Onboards an agent in one call -- agent self-custody has been
         retired. The server generates and holds the private key itself; no
@@ -323,40 +307,6 @@ class HelixClient:
             {"enrollmentToken": enrollment_token, "domains": domains or []},
         )
 
-    def delegate_authority(
-        self,
-        did: str,
-        to: str,
-        scopes: List[str],
-        expires_in: int,
-        vc_id: Optional[str] = None,
-        revoke_existing: bool = False,
-    ) -> Dict[str, Any]:
-        """Delegates a slice of a server-custody agent's authority to another
-        DID -- the custodial counterpart to a wallet-based delegate(), which
-        needed the delegator's own private key and so has nothing legitimate
-        to call since agent self-custody was retired. The caller never holds
-        the delegator's key: this is an API call that authorizes HelixID to
-        sign on the delegator's behalf, not a local signature.
-
-        Two modes: enterprise (self._api_key set) hits
-        the account-scoped custodial route; core/OSS hits the admin-key-gated
-        route. Auth is the adapter's job either way. Pass vc_id to pin which
-        of the delegator's active credentials to delegate from.
-
-        Same rule as every stored credential: delegating the same scopes
-        again refreshes the earlier delegation, other scopes stand beside
-        it, `revoke_existing` clears the others."""
-        self._assert_api_configured()
-        body: Dict[str, Any] = {"to": to, "scopes": scopes, "expiresIn": expires_in}
-        if vc_id is not None:
-            body["vcId"] = vc_id
-        if revoke_existing:
-            body["revokeExisting"] = True
-
-        route = "custodial-agents" if self._api_key else "agents"
-        result = self._http_required().post(f"/v1/{route}/{quote(did, safe='')}/delegate", body)
-        return result["delegatedVC"]
 
     def request_user_challenge(self, user_did: str) -> Dict[str, Any]:
         return self._http_required().post("/v1/challenges", {"did": user_did, "purpose": "user_verification"})
