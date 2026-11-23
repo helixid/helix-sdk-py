@@ -19,7 +19,7 @@ from verifier_harness import fixture_seams, have_verifier_fixtures, load_cases, 
 pytestmark = pytest.mark.skipif(not have_verifier_fixtures(), reason="helix-core verifier fixtures not found")
 
 
-def _run(**seams: Any) -> Any:
+def _run(with_chain: bool = True, **seams: Any) -> Any:
     env = load_environment()
     case = next(c for c in load_cases()["status"] if c["name"] == "live_card")
     base = fixture_seams(env, case["seams"], case["now"])
@@ -28,7 +28,7 @@ def _run(**seams: Any) -> Any:
         inputs.get("proof"),
         dataclasses.replace(base, **seams),
         VerifierOptions.from_dict(case["options"]),
-        chain=inputs.get("chain"),
+        chain=inputs.get("chain") if with_chain else None,
         request=inputs.get("request"),
         card=inputs.get("card"),
     ), inputs["card"]
@@ -47,8 +47,9 @@ def test_is_read_through_the_revocation_seam_and_stays_fresh_when_read_live() ->
 
 
 def test_refuses_with_no_seam_a_throwing_checker_and_a_verdict_with_no_code() -> None:
-    result, card = _run(fetch_status_list=None, check_revocation=None)
-    assert result.reasons[0] == ReasonCodes.STATUS_SEAM_MISSING
+    # No chain, so the card's own entry is the first status read.
+    result, card = _run(with_chain=False, fetch_status_list=None, check_revocation=None)
+    assert (result.reasons[0], result.messages[0]) == (ReasonCodes.STATUS_SEAM_MISSING, "no fetch_status_list seam: the card's revocation entry cannot be read")
 
     def throwing(credential: Dict[str, Any], _context: Any) -> RevocationVerdict:
         if credential["issuer"] == card["id"]:
@@ -63,3 +64,26 @@ def test_refuses_with_no_seam_a_throwing_checker_and_a_verdict_with_no_code() ->
 
     result, _ = _run(check_revocation=bare)
     assert (result.reasons[0], result.messages[0]) == (ReasonCodes.STATUS_REVOKED, "the card's revocation entry: revoked")
+
+
+def test_is_read_live_when_the_tool_demands_it() -> None:
+    env = load_environment()
+    case = next(c for c in load_cases()["status"] if c["name"] == "live_card")
+    card = case["input"]["card"]
+    contexts: List[Any] = []
+
+    def check(credential: Dict[str, Any], context: Any) -> RevocationVerdict:
+        if credential["issuer"] == card["id"]:
+            contexts.append(context)
+        return RevocationVerdict(False, True)
+
+    options = VerifierOptions.from_dict({**case["options"], "liveStatus": True})
+    result = verify(
+        case["input"].get("proof"),
+        dataclasses.replace(fixture_seams(env, case["seams"], case["now"]), check_revocation=check),
+        options,
+        chain=case["input"].get("chain"),
+        request=case["input"].get("request"),
+        card=card,
+    )
+    assert result.ok and [c.live for c in contexts] == [True]

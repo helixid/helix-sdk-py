@@ -75,3 +75,9 @@ class TestProof:
             "proofValue": base58btc_encode(bytes.fromhex(vector["signature_hex"])),
         }
         assert verify_ed25519_proof(vector["input"], proof, vector["public_key_hex"])
+
+
+def test_base58btc_keeps_leading_zero_bytes_as_ones() -> None:
+    # Each leading zero byte is a leading "1" (the alphabet's zero), whatever the data.
+    assert base58btc_encode(b"\x00\x00\x01") == "112"
+    assert base58btc_encode(b"") == ""
