@@ -182,7 +182,9 @@ def create_order_app(
     served_identity = serve_identity(identity) if identity is not None else None
     # The handshake needs an identified caller, not a scope: it is listed with none (story F-2).
     tool_scopes = {**TOOL_SCOPES, kyaos.handshake_tool_name: []} if kyaos is not None else TOOL_SCOPES
-    gate = async_helixid_mcp_middleware(replace(auth, tool_scopes=tool_scopes, required_scopes=[]))
+    # The handshake opens a session for any identified caller: it accepts every Card level (story C-C).
+    tools = {**(auth.tools or {}), kyaos.handshake_tool_name: {"minimum_level": "L1"}} if kyaos is not None else auth.tools
+    gate = async_helixid_mcp_middleware(replace(auth, tool_scopes=tool_scopes, required_scopes=[], tools=tools))
 
     server = FastMCP(
         "order-management",

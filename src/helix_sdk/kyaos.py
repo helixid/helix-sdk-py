@@ -7,13 +7,16 @@
 KYA-OS primitives in one namespace, the Python twin of helix-sdk-js's
 ``import { kyaos } from '@helixid/sdk-js'`` (stories rule 24): RFC 8785
 canonical JSON and hashing (L1-B), EdDSA JWS and the Signer (L1-C), the
-session handshake and the detached response proof (L2-A), the signed
-needs_authorization challenge and the resume retry (L3-E), and reading a
-server's ``/.well-known/mcp`` discovery document (L1-D).
+session handshake and the detached response proof (L2-A), the per-request
+holder-of-key proof and the carried chain (C-C), the local verifier (F-2,
+C-C) as ``kyaos.verifier``, the signed needs_authorization challenge and the
+resume retry (L3-E), and reading a server's ``/.well-known/mcp`` discovery
+document (L1-D).
 
     from helix_sdk import kyaos
     request = kyaos.create_handshake_request(audience="did:web:mcp.example.com")
     kyaos.verify_response_proof(result, server_did, resolve_did, request=sent)
+    sent = kyaos.with_request_proof({"name": "lookup_order", "arguments": args}, signer, audience=service_did)
 
 The modules behind it stay importable on their own (``helix_sdk.crypto.jcs``,
 ``helix_sdk.crypto.jws``, ``helix_sdk.handshake``, ``helix_sdk.response_proof``,
@@ -65,6 +68,17 @@ from .handshake import (
     is_valid_nonce,
     validate_handshake_format,
     within_skew,
+)
+from . import verifier
+from .request_proof import (
+    DELEGATION_CHAIN_META_KEY,
+    ProofCall,
+    RequestProofError,
+    attach_chain,
+    mint_request_proof,
+    request_hash_content_digest,
+    to_proof_request,
+    with_request_proof,
 )
 from .discovery import (
     WELL_KNOWN_MCP_INVALID,
@@ -137,6 +151,11 @@ __all__ = [
     "covered_request", "covered_response", "hash_request", "hash_response", "is_control_argument",
     "outcome_has_response", "proof_claims", "proof_payload", "read_response_proof", "strip_control_arguments",
     "validate_proof_meta", "verify_detached_proof", "verify_response_proof", "wire_json", "ResponseProofError",
+    # the request proof and the carried chain (C-C)
+    "DELEGATION_CHAIN_META_KEY", "ProofCall", "RequestProofError", "attach_chain", "mint_request_proof",
+    "request_hash_content_digest", "to_proof_request", "with_request_proof",
+    # the local verifier (F-2, C-C)
+    "verifier",
     # needs_authorization and resume (L3-E)
     "DELEGATION_CONTROL_ARGUMENT", "DISPLAY_HINTS", "NEEDS_AUTHORIZATION", "RESUME_CONTROL_ARGUMENT", "ChallengeReasons",
     "HandledChallenge", "NeedsAuthorizationChallenge", "RetriedCall", "find_challenge", "handle_needs_authorization",

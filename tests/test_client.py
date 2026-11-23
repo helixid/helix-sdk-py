@@ -6,8 +6,10 @@
 """
 HelixClient tests against a stubbed HTTP layer.
 
-With agent self-custody retired, onboard_agent()/sign_vp() are the whole
-agent-side surface: the server holds the key, and the client only shapes requests and unwraps responses. These pin
+With agent self-custody retired, onboard_agent() is the custodial
+agent-side surface: the server holds the key, and the client only shapes
+requests and unwraps responses. sign_vp()/verify_vp() are gone with the
+Helix VP (KYA-OS story C-C), delegate_authority() with F-1's follow-up. These pin
 the routes, auth headers, and bodies for both core (admin key) and
 enterprise (account API key) modes, plus how API errors surface. No network
 access or running helix-api instance needed.
@@ -93,7 +95,6 @@ class TestSdkOnlyMode:
         "call",
         [
             lambda c: c.onboard_agent("token"),
-            lambda c: c.sign_vp(AGENT_DID, "orders"),
             lambda c: c.list_vcs(),
         ],
     )
@@ -115,16 +116,9 @@ class TestCoreMode:
         assert call.json == {"enrollmentToken": "enroll-token", "domains": ["https://agent.example.com"]}
         assert call.headers["x-admin-api-key"] == "admin"
 
-    def test_sign_vp_hits_the_admin_route_with_optional_fields(self, http) -> None:
-        http.respond(200, {"signedVP": {"id": "vp-1"}})
+    def test_the_helix_vp_methods_are_gone(self) -> None:
         client = HelixClient(BASE_URL, admin_api_key="admin")
-
-        vp = client.sign_vp(AGENT_DID, "orders", user_did="did:web:user")
-
-        assert vp == {"id": "vp-1"}
-        call = http.calls[0]
-        assert call.url == f"{BASE_URL}/v1/agents/did%3Aweb%3Ahelix.test%3Aagents%3Aa1/vp"
-        assert call.json == {"targetService": "orders", "userDid": "did:web:user"}
+        assert not hasattr(client, "sign_vp") and not hasattr(client, "verify_vp")
 
     def test_create_service_posts_to_v1_services(self, http) -> None:
         http.respond(201, {"serviceDid": "did:web:helix.test:services:s1", "serviceName": "orders"})
@@ -199,10 +193,6 @@ class TestCoreMode:
         assert "serviceDid=did%3Aweb%3Ahelix.test%3Aservices%3As1" in call.url
         assert f"agentDid={AGENT_DID.replace(':', '%3A')}" in call.url
 
-    def test_sign_vp_omits_unset_optional_fields(self, http) -> None:
-        http.respond(200, {"signedVP": {"id": "vp-1"}})
-        HelixClient(BASE_URL, admin_api_key="admin").sign_vp(AGENT_DID, "orders")
-        assert http.calls[0].json == {"targetService": "orders"}
 
     @pytest.mark.parametrize(
         "code, error_type",
@@ -259,21 +249,9 @@ class TestCoreMode:
 
 class TestEnterpriseMode:
     def test_api_key_alone_defaults_to_the_hosted_api(self, http) -> None:
-        http.respond(200, {"signedVP": {"id": "vp-1"}})
-        HelixClient(api_key="hak_test").sign_vp(AGENT_DID, "orders")
-        assert http.calls[0].url.startswith("https://api.helixid.dev/v1/custodial-agents/")
-
-    def test_sign_vp_uses_the_custodial_route_and_bearer_token(self, http) -> None:
-        http.respond(200, {"signedVP": {"id": "vp-1"}})
-        client = HelixClient(BASE_URL, api_key="hak_test")
-
-        vp = client.sign_vp(AGENT_DID, "orders")
-
-        assert vp == {"id": "vp-1"}
-        call = http.calls[0]
-        assert call.url == f"{BASE_URL}/v1/custodial-agents/did%3Aweb%3Ahelix.test%3Aagents%3Aa1/vp"
-        assert call.headers["authorization"] == "Bearer hak_test"
-        assert call.json == {"targetService": "orders"}
+        http.respond(200, [])
+        HelixClient(api_key="hak_test").list_vcs(subject_did=AGENT_DID)
+        assert http.calls[0].url.startswith("https://api.helixid.dev/v1/")
 
     def test_every_call_carries_the_bearer_token_not_an_admin_header(self, http) -> None:
         # The grant route and the VC lifecycle routes used to go out with no
@@ -310,7 +288,7 @@ class TestEnterpriseMode:
     @pytest.mark.parametrize(
         "method",
         [
-            lambda c: c.sign_vp(AGENT_DID, "orders"),
+            lambda c: c.list_vcs(subject_did=AGENT_DID),
         ],
     )
     def test_custodial_route_errors_are_mapped(self, http, method) -> None:
@@ -321,7 +299,7 @@ class TestEnterpriseMode:
     @pytest.mark.parametrize(
         "method",
         [
-            lambda c: c.sign_vp(AGENT_DID, "orders"),
+            lambda c: c.list_vcs(subject_did=AGENT_DID),
         ],
     )
     def test_custodial_route_error_without_json_is_internal(self, http, method) -> None:

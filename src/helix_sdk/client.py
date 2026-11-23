@@ -167,7 +167,7 @@ class HelixClient:
     # -- Service Providers ---------------------------------------------------
     # Services hold no keys: the server mints the service DID, keeps its key,
     # and signs consent grants on the service's behalf -- the same custody
-    # model as agents (onboard_agent / sign_vp).
+    # model as agents (onboard_agent).
 
     def create_service(
         self,
@@ -206,9 +206,8 @@ class HelixClient:
         One grant per (user, agent, service, scope set): consenting again to
         exactly the scopes an active grant carries refreshes that grant; a
         different scope set is a new grant beside the existing ones, unless
-        `revoke_existing` asks for those to be revoked too. sign_vp() finds
-        and presents every active grant for the triple, so the caller need
-        not hold the returned VC. Revoke one with revoke_vc().
+        `revoke_existing` asks for those to be revoked too. Revoke one with
+        revoke_vc().
 
         `scopes` may only hold scopes the agent was onboarded with (plus
         `accept-terms`); see get_agent_scopes(). `allow_delegation` says
@@ -284,25 +283,7 @@ class HelixClient:
 
         return CallbackAuditSink(lambda entry: self.record_audit_event(entry.event))
 
-    # -- Verification -------------------------------------------------------
-
-    def verify_vp(
-        self,
-        vp: Dict[str, Any],
-        expected_target_service: Optional[str] = None,
-        allow_self_signed: Optional[bool] = None,
-    ) -> Dict[str, Any]:
-        """Verifies a VP via POST /v1/vp/verify. Signature check,
-        delegation-chain walk, expiry, target service, and revocation all
-        happen server-side, with VP_VERIFIED/VP_REJECTED audit logging
-        handled there too -- there is no local fallback, by design (see
-        the SDK-API-only design)."""
-        body: Dict[str, Any] = {"signedVP": vp}
-        if expected_target_service is not None:
-            body["expectedTargetService"] = expected_target_service
-        if allow_self_signed is not None:
-            body["allowSelfSigned"] = allow_self_signed
-        return self._http_required().post("/v1/vp/verify", body)
+    # -- Sessions ------------------------------------------------------------
 
     def fetch_session_public_key(self) -> str:
         response = self._http_required().get("/v1/sessions/public-key")
@@ -326,36 +307,6 @@ class HelixClient:
             {"enrollmentToken": enrollment_token, "domains": domains or []},
         )
 
-    def sign_vp(
-        self,
-        did: str,
-        target_service: str,
-        user_did: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Signs a VP on behalf of a server-custody agent -- the caller
-        never has, and never can have, the private key, so this is an API
-        call instead of local VPBuilder signing. The server picks the
-        credentials from the DIDs alone: every active HelixAgentCredential
-        the agent holds (its own, plus any delegated to it).
-
-        `target_service` is the DID of the service the VP is for. With a
-        `user_did` the agent is acting on that user's behalf, and the server
-        attaches every active DelegationGrantCredential that service issued
-        to this agent for that user; none at all raises
-        CONSENT_GRANT_NOT_FOUND, meaning the user has not consented yet.
-
-        Enterprise mode (self._api_key set): custodial signing is
-        account-scoped, so this targets /v1/custodial-agents/:did/vp instead
-        of core's admin-key-gated /v1/agents/:did/vp. The bearer token itself
-        is sent by HttpAdapter, like every other call."""
-        self._assert_api_configured()
-        body: Dict[str, Any] = {"targetService": target_service}
-        if user_did is not None:
-            body["userDid"] = user_did
-
-        route = "custodial-agents" if self._api_key else "agents"
-        result = self._http_required().post(f"/v1/{route}/{quote(did, safe='')}/vp", body)
-        return result["signedVP"]
 
     def request_user_challenge(self, user_did: str) -> Dict[str, Any]:
         return self._http_required().post("/v1/challenges", {"did": user_did, "purpose": "user_verification"})

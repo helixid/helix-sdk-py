@@ -51,7 +51,10 @@ agentDid (the DID the request proof verified as), level and fresh (KYA-OS
 callers: the level the local verifier derived, story F-2, and whether every
 status was read live), oauthSubject (never recorded as such), toolName,
 requiredScope, reason, serviceDid; ``correlationId`` defaults to the current
-``begin_tool_call()``."""
+``begin_tool_call()``. Story C-C adds, for KYA-OS callers, proofAssurance
+('L3' | 'L3-minus'), l3Minus (an L3 resting on an unfused proof),
+cnfDiagnostics (``cnf_present_but_token_unfused``) and, on a level refusal,
+requiredLevel; the typed events carry them only in the verification code."""
 
 AuditSink = Callable[[ToolAuditEvent], None]
 """Receives every decision for an identified caller, before the tool runs."""
@@ -71,9 +74,27 @@ _GUARD_REASONS = frozenset({"tool is not in toolScopes", "insufficient scope", "
 
 
 def _kyaos_verification_code(event: ToolAuditEvent) -> str:
-    """``KYAOS_PROOF_<level>``, with ``_CACHED`` when the verifier did not read every status live (story F-2)."""
+    """``KYAOS_PROOF_<level>``, with ``_CACHED`` when the verifier did not read
+    every status live (story F-2). Story C-C: an L3 that rests on an unfused
+    proof is ``L3_MINUS``, and the ``cnf`` diagnostic
+    ``cnf_present_but_token_unfused`` adds ``_CNF_UNFUSED``; the code is the
+    only place A-1's events carry them."""
     level = event.get("level")
-    return "KYAOS_PROOF" + (f"_{level}" if isinstance(level, str) else "") + ("_CACHED" if event.get("fresh") is False else "")
+    l3_minus = event.get("l3Minus")
+    if l3_minus is None:
+        l3_minus = level == "L3" and event.get("proofAssurance") == "L3-minus"
+    code = "KYAOS_PROOF"
+    if isinstance(level, str):
+        code += "_L3_MINUS" if l3_minus else f"_{level}"
+    if event.get("fresh") is False:
+        code += "_CACHED"
+    if "cnf_present_but_token_unfused" in (event.get("cnfDiagnostics") or []):
+        code += "_CNF_UNFUSED"
+    return code
+
+
+#: Story C-C: the reason code of a call refused because its derived level is below the tool's minimum.
+LEVEL_INSUFFICIENT_REASON = "proof_level_insufficient"
 
 
 class ToolCallAudit:
@@ -287,7 +308,10 @@ class McpAuditTrail:
         then ``authorization.approved`` or ``authorization.denied`` (reason
         ``needs_authorization`` for an L3-E challenge); a request proof the
         verifier refused is ``proof.rejected`` by its first reason code, and
-        nothing else. An OAuth caller: only the authorization event, with the
+        nothing else. Story C-C: the verification code also names L3-minus and
+        an unfused ``cnf``, and a call below the tool's minimum level is
+        ``proof.verified`` then ``authorization.denied`` with reason
+        ``proof_level_insufficient``. An OAuth caller: only the authorization event, with the
         subject as a keyed commitment."""
 
         def sink(event: ToolAuditEvent) -> None:
@@ -307,7 +331,8 @@ class McpAuditTrail:
             allowed = event.get("result") == "allowed"
             kyaos = event.get("authMethod") == "kyaos"
             reason = event.get("reason") if isinstance(event.get("reason"), str) else None
-            if kyaos and not allowed and scope_id is None and reason is not None and reason not in _GUARD_REASONS:
+            level_refused = kyaos and not allowed and event.get("requiredLevel") is not None
+            if kyaos and not allowed and not level_refused and scope_id is None and reason is not None and reason not in _GUARD_REASONS:
                 # The local verifier refused the request proof: its reasons are codes, the first one names the refusal.
                 self.proof("rejected", "denied", reason_code=reason.split(",")[0].strip() or "proof_invalid", context=base)
                 return
@@ -324,9 +349,11 @@ class McpAuditTrail:
                 self.authorization(
                     "denied",
                     "denied",
-                    # KYA-OS story L3-E: a signed needs_authorization challenge keeps its reason.
+                    # KYA-OS story L3-E: a signed needs_authorization challenge keeps its reason; story C-C: a level refusal is its own code.
                     reason_code=(
-                        "needs_authorization"
+                        LEVEL_INSUFFICIENT_REASON
+                        if level_refused
+                        else "needs_authorization"
                         if event.get("reason") == "needs_authorization"
                         else "insufficient_scope" if scope_id is not None else "tool_not_permitted"
                     ),

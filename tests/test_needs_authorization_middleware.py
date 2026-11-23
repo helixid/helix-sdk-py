@@ -349,7 +349,7 @@ class TestGate:
             """A verified proof whose principal the local verifier did not name (story F-2): nothing to bind the token to."""
 
             def verify_call(self, call: Any) -> Any:
-                return SimpleNamespace(ok=True, effective_scopes=["orders:read"], proof_did=None, level="L1", proof_assurance=None, fresh=True, reasons=[])
+                return SimpleNamespace(ok=True, effective_scopes=["orders:read"], proof_did=None, agent_did=None, level="L1", proof_assurance=None, fresh=True, reasons=[], proof_floor=True, warnings=[])
 
         anonymous = helixid_mcp_middleware(MCPMiddlewareOptions(verifier=Verifier(), tool_scopes={TOOL: ["orders:admin"]}, needs_authorization=na))
         with pytest.raises(middleware.ToolScopeError):

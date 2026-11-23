@@ -52,6 +52,15 @@ from .status import (
     parse_status_list_index,
     read_status_bit,
 )
+from .verify_request_proof import (
+    CNF_PRESENT_BUT_TOKEN_UNFUSED,
+    PROOF_ASSURANCES,
+    RequestProofOptions,
+    RequestProofSeams,
+    RequestProofVerification,
+    verify_request_proof,
+)
+from ..credentials import derive_conformance_level
 from .verify import (
     ChainSummary,
     MemoryNonceStore,
@@ -65,6 +74,13 @@ from .verify import (
 
 __all__ = [
     "ALL_REASON_CODES",
+    "CNF_PRESENT_BUT_TOKEN_UNFUSED",
+    "PROOF_ASSURANCES",
+    "RequestProofOptions",
+    "RequestProofSeams",
+    "RequestProofVerification",
+    "derive_conformance_level",
+    "verify_request_proof",
     "CapabilityCheck",
     "ChainRules",
     "ChainSummary",
