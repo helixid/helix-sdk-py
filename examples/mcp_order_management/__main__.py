@@ -34,7 +34,8 @@ Configuration (environment), the same as the JS sample:
                           http on loopback hosts
   Revocation (story L3-C): every status list's proof is verified before a bit is read; lists and
   verdicts are cached (in KYAOS_REDIS_URL when set, shared by every instance, JS or Python):
-  KYAOS_STATUS_CACHE_TTL      seconds a list or verdict is cached (default 300)
+  KYAOS_STATUS_CACHE_TTL      seconds a list or verdict is cached (default 300), for tools at L2 or below;
+                              a tool that demands L3 reads its lists live every call
   KYAOS_HIGH_PRIVILEGE_SCOPES comma-separated scopes whose reads are cached at most
   KYAOS_HIGH_PRIVILEGE_TTL      seconds (default 60, at most 60)
   KYAOS_MAX_STALE_SECONDS     seconds a list may be served past its validUntil from the cache (default 60)
