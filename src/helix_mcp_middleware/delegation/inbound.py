@@ -206,7 +206,8 @@ def verify_inbound_delegation_headers(
             cache.set(chain, verification)
     result.verification = verification
     if not verification.ok:
-        refuse(verification.reasons[0] if verification.reasons else "chain_invalid", "the chain was refused")
+        # A refused verification always names its reasons: they are the refusal.
+        refuse("chain_invalid", "the chain was refused")
         result.reasons, result.messages = list(verification.reasons), list(verification.messages)
         return result
 
