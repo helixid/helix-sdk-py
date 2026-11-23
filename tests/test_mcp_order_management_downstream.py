@@ -12,7 +12,7 @@ import copy
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -109,7 +109,7 @@ def _world() -> Dict[str, Any]:
     return {"env": env, "chain": chain, "cards": {did("agent"): card}, "A": did("service")}
 
 
-def _forward(world: Dict[str, Any], forwarders: List[str]) -> Any:
+def _forward(world: Dict[str, Any], forwarders: Optional[List[str]] = None) -> Any:
     env, A = world["env"], world["A"]
     b_doc = build_did_document(B_DID, derive_public_key("11" * 32))
     b_options = MCPMiddlewareOptions(
@@ -156,6 +156,13 @@ def test_b_answers_the_agents_lookup_and_a_audits_the_attachment() -> None:
     assert attached["resource"] == {"kind": "public_did", "did": "did:web:b.helix.test"}
     assert attached["actor"] == {"kind": "pairwise_did", "did": world["env"]["keys"]["agent"]["did"]}
     assert world["chain"][0]["id"] in attached["action"]["name"]
+
+
+def test_by_default_b_accepts_the_forward_of_any_service() -> None:
+    response, _ = _forward(_world())
+    result = response.json()["result"]
+    assert not result.get("isError")
+    assert json.loads(result["content"][0]["text"])["downstreamStatus"] == 200
 
 
 def test_b_refuses_when_it_does_not_accept_as_forwards() -> None:

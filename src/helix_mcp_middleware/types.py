@@ -35,7 +35,7 @@ class InboundDelegationSettings:
     audience: Union[None, str, Sequence[str]] = None
     """This service's host(s), as forwarders name it in the proof's ``aud``; default the host of a did:web service DID."""
     forwarders: Union[None, str, Sequence[str]] = None
-    """Forwarding services whose own resource is honoured as a chain's target: ``"*"`` or DIDs. Default none."""
+    """Forwarding services whose own resource is honoured as a chain's target: ``"*"`` (default) or DIDs; ``[]`` for none."""
     cache: Any = None
     """The chain verdict cache (a VerificationCache); default one as long-lived as the verifier's status cache; ``False`` for none."""
 
