@@ -4,4 +4,6 @@
 # You may obtain a copy of the License at
 #    http://www.apache.org/licenses/LICENSE-2.0
 """KYA-OS crypto primitives: one module per primitive, imported by module path
-(``from helix_sdk.crypto.jcs import hash_json``)."""
+(``from helix_sdk.crypto.jcs import hash_json``), and ``common``: the generic
+helpers (canonical JSON, Ed25519 over hash bytes, base58btc) the proofs, JWS
+keys and DID resolution share."""

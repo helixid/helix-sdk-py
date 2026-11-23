@@ -56,7 +56,7 @@ pip install -e .
 
 ## Cross-language parity
 
-The local-signing primitives (`keys.py`, `vp_crypto.py`, `proof.py`) are
+The local-signing primitives (`keys.py`, `crypto/common.py`, `proof.py`) are
 verified **byte-for-byte** against the same
 `fixtures/golden-vectors/*.json` fixtures that `helix-sdk-js` and
 `helix-core` assert against -- same private key, same payload, same
@@ -107,6 +107,10 @@ the detached JWS, the `cnf` fusion (`L3` with a token `cnf`, `L3-minus` without)
   and exposes `status_cache`. Options: `status_cache` (a `StatusCache`, or a dict of its options), `status_list_issuers`,
   `check_revocation`. The default fetch is `create_resolution_fetch`: https only, a host written as an IP must be public
   unicast, same-origin redirects, 5 s, 1 MiB. Pass your SafeFetch as `fetch` to pin the connection too.
+- An agent card's own `revocation` entry is read too (SPEC-ENTITY-CARD section 10.3), with the card's DID as the
+  default keeper: a set bit refuses the call (`status_revoked`), a list the card's DID does not keep with no
+  `status_list_issuers` binding for its URL refuses it (`status_list_mismatch`). A HelixID-hosted agent's entry is on
+  the Helix issuer's list, so bind that exact URL to the Helix issuer (not its origin: per-issuer lists share it).
 - `RedisStatusCacheStore` shares the cache between instances (any client with redis-py's `get`/`set(px=)`/`delete`/`incr`).
 - `RevocationSignalClient` / `create_revocation_signal_client(verifier, trusted_issuers, ...)` receive Helix's SETs:
   over SSE by default (one outbound connection on a background thread, reconnecting with backoff and `Last-Event-ID`),
@@ -119,6 +123,8 @@ from helix_mcp_middleware import RedisStatusCacheStore, create_local_verifier, c
 
 verifier = create_local_verifier(
     service_did="did:web:mcp.example.com",
+    # A HelixID-hosted agent's card names its revocation entry on the Helix issuer's list (section 10.3).
+    status_list_issuers={"did:web:api.helixid.example": ["https://api.helixid.example/v1/status-list/helix-status-list-1"]},
     status_cache={"store": RedisStatusCacheStore(redis.Redis()), "status_cache_ttl": 300, "high_privilege_scopes": ["orders:admin"]},
 )
 signals = create_revocation_signal_client(

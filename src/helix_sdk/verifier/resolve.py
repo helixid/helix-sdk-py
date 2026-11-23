@@ -19,7 +19,7 @@ from urllib.parse import unquote_to_bytes
 from urllib.request import Request, urlopen
 
 from ..crypto.jws import base64url_decode_strict, base64url_encode, verification_method_to_jwk
-from ..vp_crypto import base58btc_decode
+from ..crypto.common import base58btc_decode
 
 _ED25519_MULTICODEC = b"\xed\x01"
 _ED25519_KEY_LENGTH = 32

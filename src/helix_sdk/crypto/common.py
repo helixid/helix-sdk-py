@@ -4,13 +4,15 @@
 # You may obtain a copy of the License at
 #    http://www.apache.org/licenses/LICENSE-2.0
 """
-Canonical JSON, SHA-256 hashing, and Ed25519 sign/verify over hash bytes,
-ported from helix-sdk-js's src/core/vp-crypto.ts.
+Generic crypto helpers shared across the SDK: canonical JSON, SHA-256
+hashing, Ed25519 sign/verify over hash bytes, and base58btc. Ported from
+helix-sdk-js's src/core/vp-crypto.ts (renamed here from vp_crypto: the Helix
+VP and VPBuilder are gone since KYA-OS story C-C, and these helpers never
+were VP-specific).
 
 toCanonicalJson/hashCanonicalPayload/signBytes are local-signing
 carveouts from the SDK-API-only design, used by linked-data proofs, JWS
-keys and DID resolution. (The module name is historical: the Helix VP and
-VPBuilder are gone, KYA-OS story C-C.)
+keys and DID resolution.
 
 Verified byte-for-byte against fixtures/golden-vectors/canonical-json.json
 and signing.json -- see tests/test_golden_vectors.py. json.dumps with
@@ -51,7 +53,7 @@ def hash_canonical_payload(payload: Any) -> bytes:
 
 def sign_bytes(hash_bytes: bytes, private_key_hex: str) -> str:
     # Local import to avoid a circular import with keys.py at module load time.
-    from .keys import _normalize_ed25519_private_key
+    from ..keys import _normalize_ed25519_private_key
 
     signing_key = nacl.signing.SigningKey(_normalize_ed25519_private_key(private_key_hex))
     return signing_key.sign(hash_bytes).signature.hex()

@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Mapping, MutableMapping, Optional
 
-from . import vp_crypto
+from .crypto import common as crypto_common
 
 
 def create_ed25519_proof(
@@ -28,14 +28,14 @@ def create_ed25519_proof(
     deterministic golden-vector reproduction, mirroring the JS
     `createdAt?: Date` parameter exactly.
     """
-    signature_hex = vp_crypto.sign_bytes(vp_crypto.hash_canonical_payload(payload), private_key_hex)
+    signature_hex = crypto_common.sign_bytes(crypto_common.hash_canonical_payload(payload), private_key_hex)
     created = created_at if created_at is not None else datetime.now(timezone.utc)
     return {
         "type": "Ed25519Signature2020",
         "created": _to_iso_z(created),
         "verificationMethod": verification_method,
         "proofPurpose": "assertionMethod",
-        "proofValue": vp_crypto.base58btc_encode(bytes.fromhex(signature_hex)),
+        "proofValue": crypto_common.base58btc_encode(bytes.fromhex(signature_hex)),
     }
 
 
@@ -51,11 +51,11 @@ def verify_ed25519_proof(
 
     def verify_proof_value(proof_value: str) -> bool:
         try:
-            decoded = vp_crypto.base58btc_decode(proof_value)
+            decoded = crypto_common.base58btc_decode(proof_value)
         except ValueError:
             return False
-        return vp_crypto.verify_signature(
-            vp_crypto.hash_canonical_payload(payload), decoded.hex(), public_key_hex
+        return crypto_common.verify_signature(
+            crypto_common.hash_canonical_payload(payload), decoded.hex(), public_key_hex
         )
 
     proof_value = proof.get("proofValue", "")

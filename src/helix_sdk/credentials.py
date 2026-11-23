@@ -42,7 +42,7 @@ import nacl.signing
 from .crypto.jcs import canonicalize
 from .crypto.jws import Signer, base64url_decode_strict, select_assertion_method, verification_method_to_jwk
 from .errors import InvalidJWSError
-from .vp_crypto import base58btc_decode, base58btc_encode
+from .crypto.common import base58btc_decode, base58btc_encode
 
 VC_V2_CONTEXT = "https://www.w3.org/ns/credentials/v2"
 ZCAP_CONTEXT = "https://w3id.org/security/zcap/v1"
