@@ -48,7 +48,7 @@ from urllib.parse import quote
 import nacl.signing
 
 from .agent_key import AgentKey, assert_no_private_material, generate_agent_key, to_public_key_jwk
-from .crypto.jws import DEFAULT_KID_FRAGMENT, DEFAULT_SIGNING_KEY_ENV_VAR, EnvSigner, Signer
+from .crypto.jws import DEFAULT_KID_FRAGMENT, DEFAULT_SIGNING_KEY_ENV_VAR, EnvSigner, Signer, default_kid_fragment
 from .entity_card import FetchJson, own_did_web_problem, resolve_entity_card, same_did
 from .keys import _normalize_ed25519_private_key
 
@@ -158,6 +158,7 @@ __all__ = [
     "CUSTODY_LABEL_HELIX",
     "CUSTODY_LABEL_SELF",
     "DEFAULT_KID_FRAGMENT",
+    "default_kid_fragment",
     "DEFAULT_SIGNING_KEY_ENV_VAR",
     "INIT_FILES",
     "ChangeCustodyResult",
@@ -226,8 +227,11 @@ def rotation_proof_message(did: str, kid: str, issued_at: str) -> bytes:
     return _message([ROTATION_PROOF_PREFIX, did, kid, issued_at])
 
 
-def kid_fragment(did: str, kid: str = DEFAULT_KID_FRAGMENT) -> str:
-    """``kid`` as a fragment: ``key-1``, ``#key-1`` or ``<did>#key-1`` (which must be this DID's)."""
+def kid_fragment(did: str, kid: Optional[str] = None) -> str:
+    """``kid`` as a fragment: ``key-1``, ``#key-1`` or ``<did>#key-1`` (which must be this DID's).
+    Default ``default_kid_fragment(did)``: the multibase value for a did:key, else ``key-1``."""
+    if kid is None:
+        kid = default_kid_fragment(did)
     fragment = kid[len(did) + 1:] if kid.startswith(f"{did}#") else kid
     fragment = fragment[1:] if fragment.startswith("#") else fragment
     if not fragment or "#" in fragment:
@@ -400,7 +404,7 @@ class HelixCustodialSigner(Signer):
         self,
         did: str,
         api_url: Optional[str] = None,
-        kid: str = DEFAULT_KID_FRAGMENT,
+        kid: Optional[str] = None,
         subject: str = "agent",
         admin_api_key: Optional[str] = None,
         api_key: Optional[str] = None,
