@@ -44,6 +44,7 @@ from .credentials import (
     CAPABILITY_ATTESTATION_TYPE,
     DELEGATION_CREDENTIAL_TYPE,
     IDENTITY_CREDENTIAL_TYPE,
+    reissue_hop,
 )
 
 from .session_manager import SessionManager, SessionClaims, DelegationLink
@@ -272,6 +273,7 @@ __all__ = [
     "activate_agent",
     "change_to_self_custody",
     "rotate_key",
+    "reissue_hop",
     "check_own_hosting",
     "helix_init",
     "rotation_proof",

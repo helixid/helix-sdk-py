@@ -777,6 +777,32 @@ def build_delegation_hop(
     return sign_data_integrity(credential, signer, proof_created)
 
 
+def reissue_hop(
+    hop: Mapping[str, Any],
+    signer: Signer,
+    status_entry: Mapping[str, Any],
+    *,
+    id: Optional[str] = None,
+    proof_created: Optional[str] = None,
+) -> Dict[str, Any]:
+    """KYA-OS story C-E point 4: a self-custody issuer reissues its hop for a
+    delegate's new key (``hopReissue.pendingIssuers``): the same grant (parent,
+    target, actions, caveats, window), a new id and ``status_entry`` on the
+    issuer's own list, signed again by ``signer``, the hop's issuer. Nothing
+    goes to Helix. Mirrors helix-sdk-js ``reissueHop``."""
+    subject = hop.get("credentialSubject")
+    if not isinstance(subject, Mapping):
+        raise ValueError("reissue_hop: the hop has no credentialSubject")
+    if issuer_of(hop.get("issuer")) != signer.did:
+        raise ValueError(f"reissue_hop: {signer.did} is not the issuer of this hop")
+    capability_id = id or f"urn:zcap:{uuid.uuid4()}"
+    kept = {key: value for key, value in hop.items() if key not in ("proof", "credentialStatus", "id")}
+    entry = dict(status_entry)
+    entry.setdefault("id", f"{entry.get('statusListCredential')}#{entry.get('statusListIndex')}")
+    unsigned = {**kept, "id": capability_id, "credentialSubject": {**subject, "id": capability_id}, "credentialStatus": entry}
+    return sign_data_integrity(unsigned, signer, proof_created)
+
+
 # -- verifiers -----------------------------------------------------------------
 
 
