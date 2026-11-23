@@ -54,7 +54,7 @@ Configuration (environment), the same as the JS sample:
                               on, and a line in KYAOS_VERIFICATION_LOG)
   KYAOS_DELEGATION_ADVISORY   1: also send the advisory KYA-OS-Delegation-Chain / KYA-OS-Granted-Scopes
   KYAOS_FORWARDERS            the services whose forwarded chains this server honours (their own resource as
-                              the chain's target): * or comma-separated DIDs; default none
+                              the chain's target): * (default), comma-separated DIDs, or none
   KYAOS_DELEGATION_AUDIENCE   this server's host(s), as forwarders name it in the proof's aud; default the
                               host of a did:web SERVICE_DID
   KYAOS_REDIS_URL             also the status cache's Redis, whatever KYAOS_NONCE_STORE says: lists and
@@ -733,7 +733,8 @@ def main() -> None:
             fail(str(error))
         auth = replace(auth, **levels)
         # Story L3-D: downstream calls forwarding an agent's delegation, verified by the same verifier.
-        forwarders = "*" if (env.get("KYAOS_FORWARDERS") or "").strip() == "*" else did_list(env, "KYAOS_FORWARDERS")
+        setting = (env.get("KYAOS_FORWARDERS") or "").strip().lower()
+        forwarders = [] if setting == "none" else "*" if setting == "*" else did_list(env, "KYAOS_FORWARDERS")
         audience = [host.strip() for host in (env.get("KYAOS_DELEGATION_AUDIENCE") or "").split(",") if host.strip()]
         auth.inbound_delegation = InboundDelegationSettings(forwarders=forwarders, audience=audience or None)
     elif any(
@@ -812,7 +813,11 @@ def main() -> None:
         print("  KYA-OS:      off (set SERVICE_SIGNING_KEY)")
     print(f"  Discovery:   {describe_well_known(well_known, well_known_off)}")
     inbound = auth.inbound_delegation if isinstance(auth.inbound_delegation, InboundDelegationSettings) else None
-    accepted = "none" if inbound is None or inbound.forwarders is None else "any service" if inbound.forwarders == "*" else ", ".join(inbound.forwarders)
+    accepted = (
+        "any service"
+        if inbound is None or inbound.forwarders is None or inbound.forwarders == "*"
+        else "none" if not inbound.forwarders else ", ".join(inbound.forwarders)
+    )
     outbound = f"forward_lookup_order to {downstream.url}{' (advisory headers on)' if downstream.advisory_headers else ''}" if downstream else "off (set KYAOS_DOWNSTREAM_URL)"
     print(f"  Downstream:  {outbound}; forwards accepted from {accepted}")
     sys.stdout.flush()

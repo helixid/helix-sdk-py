@@ -207,7 +207,11 @@ class TestForwarding:
         with pytest.raises(ProofError) as missing:
             gate({"name": "lookup_order", "headers": {}})
         assert missing.value.code == "PROOF_MISSING"
-        refused = verify_inbound_delegation_headers(self.sent(), self.verifier_b())
+        # The default accepts any forwarder for the authority granted at that forwarder (Harish, 2026-11-23) ...
+        assert verify_inbound_delegation_headers(self.sent(), self.verifier_b()).ok
+        # ... and still binds it: a stranger cannot carry a chain granted at A.
+        assert verify_inbound_delegation_headers(self.forwarded(signer=fixture_signer(self.env, "stranger")), self.verifier_b()).reasons == ["delegation_target_not_accepted"]
+        refused = verify_inbound_delegation_headers(self.sent(), self.verifier_b(), forwarders=[])
         assert (refused.ok, refused.reasons, refused.level, refused.effective_scopes) == (False, ["delegation_target_not_accepted"], "L1", [])
 
     def test_tampered_advisory_headers_change_nothing(self) -> None:
