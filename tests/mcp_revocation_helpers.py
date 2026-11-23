@@ -22,8 +22,9 @@ class ListIssuer:
         pair = generate_key_pair()
         self.did = did
         self.private_key = pair.private_key
+        # A stand-in key for any DID, published as #key-1 in a document of our own; sign under that kid.
         self.document: Dict[str, Any] = dict(build_did_document(did, pair.public_key))
-        self.signer = EnvSigner(did, env_var="K", env={"K": pair.private_key})
+        self.signer = EnvSigner(did, kid="key-1", env_var="K", env={"K": pair.private_key})
 
 
 def encoded_bits(length: int, set_bits: Sequence[int] = ()) -> str:
@@ -57,7 +58,7 @@ def bitstring_list(
     if unsigned:
         return document
     key = signed_by or issuer
-    signer = EnvSigner(issuer.did, env_var="K", env={"K": key.private_key})
+    signer = EnvSigner(issuer.did, kid="key-1", env_var="K", env={"K": key.private_key})
     return sign_data_integrity(document, signer, created="2026-01-01T00:00:00Z")
 
 
