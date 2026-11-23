@@ -120,6 +120,30 @@ class TestCoreMode:
         client = HelixClient(BASE_URL, admin_api_key="admin")
         assert not hasattr(client, "sign_vp") and not hasattr(client, "verify_vp")
 
+    def test_did_lifecycle_calls(self, http) -> None:
+        client = HelixClient(BASE_URL, admin_api_key="admin")
+        http.respond(201, {"did": "did:web:helix.test:agents:new", "didDocument": {"id": "did:web:helix.test:agents:new"}, "hederaTransactionId": "tx"})
+        created = client.create_did("agent", domains=["https://a.example"])
+        assert created["did"] == "did:web:helix.test:agents:new" and created["hederaTransactionId"] == "tx"
+        assert http.calls[-1].json["subjectType"] == "agent" and http.calls[-1].json["domains"] == ["https://a.example"]
+        http.respond(201, {"didDocument": {"id": "did:web:x"}})
+        assert client.create_did("user")["did"] == "did:web:x"
+        http.respond(200, {"didDocument": {"id": AGENT_DID}})
+        assert client.resolve_did(AGENT_DID, live=True) == {"did": AGENT_DID, "didDocument": {"id": AGENT_DID}, "source": "hedera"}
+        assert http.calls[-1].url.endswith("?live=true")
+        http.respond(200, {"id": AGENT_DID})
+        assert client.resolve_did(AGENT_DID)["source"] == "cache"
+        http.respond(200, {"id": AGENT_DID, "service": [{"id": "#s"}]})
+        assert client.add_service_endpoint(AGENT_DID, {"id": "#s"})["didDocument"]["service"] == [{"id": "#s"}]
+        http.respond(200, {"id": AGENT_DID})
+        assert client.remove_service_endpoint(AGENT_DID, "#s")["did"] == AGENT_DID
+        assert http.calls[-1].method == "DELETE" and http.calls[-1].url.endswith("/services/%23s")
+        http.respond(200, {})
+        assert client.deactivate_did(AGENT_DID, "retired") == {"did": AGENT_DID, "deactivated": True}
+        http.respond(201, {"id": "vc-1"})
+        assert client.issue_vc(subjectDid=AGENT_DID)["id"] == "vc-1"
+        assert http.calls[-1].json["expiresInSeconds"] == 7_776_000
+
     def test_create_service_posts_to_v1_services(self, http) -> None:
         http.respond(201, {"serviceDid": "did:web:helix.test:services:s1", "serviceName": "orders"})
         client = HelixClient(BASE_URL, admin_api_key="admin")

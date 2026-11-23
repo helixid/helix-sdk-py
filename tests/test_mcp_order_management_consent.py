@@ -14,6 +14,8 @@ from typing import Any, Dict, List
 
 import pytest
 
+pytest.importorskip("mcp")
+pytest.importorskip("uvicorn")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "examples"))
 
 from helix_mcp_middleware import ChallengeContext, ChallengeInput, RetryAuthorizerInput  # noqa: E402
