@@ -189,14 +189,18 @@ class TestGate:
             "camel": {"sub": "agent-op", "scopes": [], "cnfJkt": jkt},
             "plain": {"sub": "agent-op", "scopes": []},
         }
-        mw = gate(validate_oauth_token=lambda token: tokens[token], l3_minus_satisfies_l3=False)
+        # One gate per call, as in the JS twin: a second call on one verifier reads its status from the
+        # status cache, which is not fresh, and so comes to L2 (story L3-C point 4).
+        def mw() -> Any:
+            return gate(validate_oauth_token=lambda token: tokens[token], l3_minus_satisfies_l3=False)
+
         for token in ("fused", "claims", "camel"):
-            caller = mw.authorize({"name": "lookup", "headers": {"authorization": f"Bearer {token}"}, "_meta": signed_meta(cnf_jkt=jkt)})
+            caller = mw().authorize({"name": "lookup", "headers": {"authorization": f"Bearer {token}"}, "_meta": signed_meta(cnf_jkt=jkt)})
             assert (caller.auth_method, caller.level, caller.proof_assurance) == ("kyaos", "L3", "L3"), token
         # A token cnf with no proof cnf is refused; a proof cnf with no token cnf is L3-minus with a diagnostic.
-        refused = refusal(lambda: mw({"name": "lookup", "headers": {"authorization": "Bearer fused"}, "_meta": signed_meta()}))
+        refused = refusal(lambda: mw()({"name": "lookup", "headers": {"authorization": "Bearer fused"}, "_meta": signed_meta()}))
         assert isinstance(refused, ProofError) and refused.reasons == ("cnf_required_by_token",)
-        unfused = refusal(lambda: mw({"name": "lookup", "headers": {"authorization": "Bearer plain"}, "_meta": signed_meta(cnf_jkt=jkt)}))
+        unfused = refusal(lambda: mw()({"name": "lookup", "headers": {"authorization": "Bearer plain"}, "_meta": signed_meta(cnf_jkt=jkt)}))
         assert isinstance(unfused, LevelError) and unfused.derived_level == "L3-minus"
         events: List[Dict[str, Any]] = []
         caller = gate(events).authorize({"name": "lookup", "_meta": signed_meta(cnf_jkt=jkt)})
@@ -212,12 +216,15 @@ class TestGate:
 
     def test_the_async_gate_applies_the_same_levels(self) -> None:
         assert ENV is not None
-        verifier = create_local_verifier(fixture_verifier_options(SERVICE, env=ENV, cards={AGENT: ENV["cards"]["attested"]}, catalog=["read:orders"]))
-        mw = async_helixid_mcp_middleware(MCPMiddlewareOptions(verifier=verifier, service_did=SERVICE, tool_scopes=TOOLS))
+        # One gate per call: a second call on one verifier would read its status from the cache, at L2 (story L3-C).
+        def mw() -> Any:
+            verifier = create_local_verifier(fixture_verifier_options(SERVICE, env=ENV, cards={AGENT: ENV["cards"]["attested"]}, catalog=["read:orders"]))
+            return async_helixid_mcp_middleware(MCPMiddlewareOptions(verifier=verifier, service_did=SERVICE, tool_scopes=TOOLS))
+
         chain_only = {"name": "lookup", "_meta": {DELEGATION_CHAIN_META_KEY: valid_chain()}}
         with pytest.raises(LevelError):
-            asyncio.run(mw(chain_only))
-        assert asyncio.run(mw.authorize({"name": "lookup", "_meta": signed_meta()})).level == "L3"  # type: ignore[attr-defined]
+            asyncio.run(mw()(chain_only))
+        assert asyncio.run(mw().authorize({"name": "lookup", "_meta": signed_meta()})).level == "L3"
 
     def test_the_proof_alone_with_the_verifiers_seams(self) -> None:
         assert ENV is not None
