@@ -439,6 +439,10 @@ class HelixInitResult:
     key_custody: str = "self"
     resolution: Optional[Dict[str, Any]] = None
     vc_id: Optional[str] = None
+    #: Own hosting, on activation: ``card.json`` was rewritten with what the
+    #: agent's credentials put on its card (attestations, responsible party,
+    #: revocation entry; F-3 parity). Republish it at ``card_url``.
+    card_updated: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -565,6 +569,11 @@ def _activate(result: HelixInitResult, enrollment_token: str, client: HelixCusto
     active = client.activate(result.did, enrollment_token)
     result.status = active.get("status", result.status)
     result.vc_id = active.get("vcId") or result.vc_id
+    # The card now carries the agent's attestations; the owner republishes it.
+    card = (active.get("documents") or {}).get("card")
+    if card is not None:
+        _write_json(result.files["card"], card)
+        result.card_updated = True
     return result
 
 
@@ -669,6 +678,7 @@ def _init_json(result: HelixInitResult) -> Dict[str, Any]:
         "cardUrl": result.card_url,
         "resolution": result.resolution,
         **({"vcId": result.vc_id} if result.vc_id else {}),
+        **({"cardUpdated": True} if result.card_updated else {}),
     }
 
 
@@ -679,6 +689,7 @@ def _print_init(result: HelixInitResult, out_dir: str, out: TextIO) -> None:
     else:
         out.write(f"\u26a0 Agent enrolled, waiting for its documents on your domain: {result.did}\n")
     _report(result, out)
+    _print_republish(result, out)
     if result.status == "pending_resolution":
         out.write("\nPublish the two documents, then activate:\n")
         out.write(f"  {result.files['did_document']}  ->  {result.did_document_url}\n")
@@ -694,6 +705,15 @@ def _print_activate(result: HelixInitResult, out: TextIO) -> None:
     else:
         reason = (result.resolution or {}).get("reason") or "the documents do not resolve from your domain"
         out.write(f"\u26a0 Not active yet: {reason}\n")
+    _print_republish(result, out)
+
+
+def _print_republish(result: HelixInitResult, out: TextIO) -> None:
+    """On activation Helix returns the card with the agent's attestations: say where to republish it."""
+    if not result.card_updated:
+        return
+    out.write("\ncard.json now carries the attestations Helix issued; republish it:\n")
+    out.write(f"  {result.files['card']}  ->  {result.card_url}\n")
 
 
 def _print_take(did: str, out_dir: str, changed: Mapping[str, Any], out: TextIO) -> None:
