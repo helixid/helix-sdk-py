@@ -226,6 +226,14 @@ def test_status_list_reading() -> None:
     )
 
 
+@skip_without_vectors
+def test_status_list_refusal_when_the_named_list_is_not_served() -> None:
+    vectors = json.loads((VECTORS / "status-list.json").read_text())["vectors"]
+    active = next(v for v in vectors if v["id"] == "status-list/active-credential")["input"]
+    assert status_list_refusal(active) is None
+    assert status_list_refusal({**active, "statusLists": {}}).startswith("status_unavailable: no list at ")
+
+
 def test_delegation_binding_and_response_proof() -> None:
     assert credential_signed_form("a..b") is None
     assert credential_signed_form("a.b.!!") is None
