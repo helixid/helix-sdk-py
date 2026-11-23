@@ -6,9 +6,8 @@
 """
 HelixClient tests against a stubbed HTTP layer.
 
-With agent self-custody retired, onboard_agent()/sign_vp()/
-delegate_authority() are the whole agent-side surface: the server holds the
-key, and the client only shapes requests and unwraps responses. These pin
+With agent self-custody retired, onboard_agent()/sign_vp() are the whole
+agent-side surface: the server holds the key, and the client only shapes requests and unwraps responses. These pin
 the routes, auth headers, and bodies for both core (admin key) and
 enterprise (account API key) modes, plus how API errors surface. No network
 access or running helix-api instance needed.
@@ -95,7 +94,6 @@ class TestSdkOnlyMode:
         [
             lambda c: c.onboard_agent("token"),
             lambda c: c.sign_vp(AGENT_DID, "orders"),
-            lambda c: c.delegate_authority(AGENT_DID, "did:key:z6Mkchild", ["read:orders"], 3600),
             lambda c: c.list_vcs(),
         ],
     )
@@ -206,17 +204,6 @@ class TestCoreMode:
         HelixClient(BASE_URL, admin_api_key="admin").sign_vp(AGENT_DID, "orders")
         assert http.calls[0].json == {"targetService": "orders"}
 
-    def test_delegate_authority_returns_the_delegated_vc(self, http) -> None:
-        http.respond(200, {"delegatedVC": {"id": "vc-child"}})
-        client = HelixClient(BASE_URL, admin_api_key="admin")
-
-        vc = client.delegate_authority(AGENT_DID, "did:key:z6Mkchild", ["read:orders"], 3600, vc_id="vc-1")
-
-        assert vc == {"id": "vc-child"}
-        call = http.calls[0]
-        assert call.url == f"{BASE_URL}/v1/agents/did%3Aweb%3Ahelix.test%3Aagents%3Aa1/delegate"
-        assert call.json == {"to": "did:key:z6Mkchild", "scopes": ["read:orders"], "expiresIn": 3600, "vcId": "vc-1"}
-
     @pytest.mark.parametrize(
         "code, error_type",
         [
@@ -227,9 +214,7 @@ class TestCoreMode:
     def test_delegation_refusals_map_to_typed_errors(self, http, code, error_type) -> None:
         http.respond(400, {"error": {"code": code, "message": "refused"}})
         with pytest.raises(error_type):
-            HelixClient(BASE_URL, admin_api_key="admin").delegate_authority(
-                AGENT_DID, "did:key:z6Mkchild", ["read:orders"], 3600
-            )
+            HelixClient(BASE_URL, admin_api_key="admin").get_vc("vc-1")
 
     def test_unknown_error_code_keeps_code_and_status(self, http) -> None:
         http.respond(418, {"error": {"code": "SOMETHING_NEW", "message": "teapot"}})
@@ -322,22 +307,10 @@ class TestEnterpriseMode:
         HelixClient(BASE_URL, api_key="hak_test").renew_vc("vc-1")
         assert http.calls[0].headers["authorization"] == "Bearer hak_test"
 
-    def test_delegate_authority_uses_the_custodial_route(self, http) -> None:
-        http.respond(200, {"delegatedVC": {"id": "vc-child"}})
-        client = HelixClient(BASE_URL, api_key="hak_test")
-
-        vc = client.delegate_authority(AGENT_DID, "did:key:z6Mkchild", ["read:orders"], 3600)
-
-        assert vc == {"id": "vc-child"}
-        call = http.calls[0]
-        assert call.url == f"{BASE_URL}/v1/custodial-agents/did%3Aweb%3Ahelix.test%3Aagents%3Aa1/delegate"
-        assert call.headers["authorization"] == "Bearer hak_test"
-
     @pytest.mark.parametrize(
         "method",
         [
             lambda c: c.sign_vp(AGENT_DID, "orders"),
-            lambda c: c.delegate_authority(AGENT_DID, "did:key:z6Mkchild", ["read:orders"], 3600),
         ],
     )
     def test_custodial_route_errors_are_mapped(self, http, method) -> None:
@@ -349,7 +322,6 @@ class TestEnterpriseMode:
         "method",
         [
             lambda c: c.sign_vp(AGENT_DID, "orders"),
-            lambda c: c.delegate_authority(AGENT_DID, "did:key:z6Mkchild", ["read:orders"], 3600),
         ],
     )
     def test_custodial_route_error_without_json_is_internal(self, http, method) -> None:
