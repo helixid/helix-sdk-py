@@ -38,6 +38,7 @@ from .runtime import (
     create_kyaos,
 )
 from .status_cache_store import RedisStatusCacheClient, RedisStatusCacheStore
+from .rotation_sequence_store import RAISE_TO_MAX_SCRIPT, ROTATION_SEQUENCE_KEY_PREFIX, RedisRotationSequenceClient, RedisRotationSequenceStore
 from .session_store import IDENTITY_ANONYMOUS, IDENTITY_AUTHENTICATED, KyaOsSession, MemorySessionStore, SessionStore
 from helix_sdk.response_proof import RESPONSE_PROOF_META_KEY
 
@@ -61,6 +62,10 @@ __all__ = [
     "MemoryNonceStore",
     "RedisNonceStore",
     "RedisStatusCacheStore",
+    "RedisRotationSequenceClient",
+    "RedisRotationSequenceStore",
+    "RAISE_TO_MAX_SCRIPT",
+    "ROTATION_SEQUENCE_KEY_PREFIX",
     "RedisStatusCacheClient",
     "DynamoNonceStore",
     "nonce_key",
