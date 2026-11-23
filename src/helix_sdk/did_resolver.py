@@ -121,14 +121,13 @@ def _is_loopback(host: str) -> bool:
 
 def did_web_to_url(did: str) -> str:
     """The URL a did:web document is served at: https, or http for a loopback host
-    (``did:web:localhost%3A3000:agents:x`` and the legacy ``did:web:localhost:3000:agents:x``)."""
+    (``did:web:localhost%3A3000:agents:x``). A port is read only from the encoded
+    host: a raw ``did:web:localhost:3000:x`` is host ``localhost``, path ``3000/x``."""
     parts = did.split(":")
     if len(parts) < 3 or parts[0] != "did" or parts[1] != "web" or not parts[2]:
         raise ValidationError(f"Invalid did:web DID: {did}")
     decoded = [unquote(part) for part in parts[2:]]
     host, path = decoded[0], decoded[1:]
-    if _is_loopback(host) and path and path[0].isdigit():
-        host, path = f"{host}:{path[0]}", path[1:]
     hostname = host.split(":")[0]
     scheme = "http" if _is_loopback(hostname) else "https"
     suffix = "/.well-known/did.json" if not path else "/" + "/".join(path) + "/did.json"

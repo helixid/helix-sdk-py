@@ -34,6 +34,8 @@ from helix_sdk.entity_card import (
     did_web_card_url,
     did_web_document_url,
     did_web_for,
+    is_raw_did_web_host,
+    own_did_web_problem,
     entity_card_summary,
     fetch_entity_card,
     is_public_unicast_address,
@@ -86,6 +88,20 @@ def _reason(run) -> str:
 
 def test_did_web_helpers():
     assert did_web_for("Helix.Test", ["acme", "a b"]) == "did:web:helix.test:acme:a%20b"
+    assert did_web_for("localhost:3680", ["agents", "0a1b"]) == "did:web:localhost%3A3680:agents:0a1b"
+    for host in ("localhost%3A3680", "https://helix.test", "", 7):
+        with pytest.raises(EntityCardError, match="raw host"):
+            did_web_for(host, [])  # type: ignore[arg-type]
+    for seg in ("acct:f61a", "", "..", "a/b"):
+        with pytest.raises(EntityCardError, match="segment"):
+            did_web_for("helix.test", ["accounts", seg])
+    assert is_raw_did_web_host("[::1]:3000") and not is_raw_did_web_host("a:1:2")
+    assert own_did_web_problem("did:web:acme.example:bot") is None
+    assert own_did_web_problem("did:web:acme.example") is None
+    assert own_did_web_problem("did:web:localhost%3A3000:x") is None
+    assert "localhost%3A3000" in (own_did_web_problem("did:web:localhost:3000:x") or "")
+    assert "not a did:web" in (own_did_web_problem("did:key:z6Mk") or "")
+    assert "string" in (own_did_web_problem(1) or "")
     assert parse_did_web("did:web:localhost%3A3000:acme:a%20b") == ("localhost:3000", ["acme", "a b"])
     assert parse_did_web("did:web:helix.test") == ("helix.test", [])
     for bad in ("did:key:z6Mk", "did:web:", "did:web:helix.test::x", "did:web:helix.test:acme:agent#key-1", "did:web:helix.test:%E0%A4%A", "did:web:helix.test:a%2Fb", 42):

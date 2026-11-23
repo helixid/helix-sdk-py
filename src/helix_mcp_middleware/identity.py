@@ -42,6 +42,7 @@ from helix_sdk.entity_card import (
     did_web_document_url,
     did_web_for,
     kya_os_card_service_entry,
+    own_did_web_problem,
     parse_did_web,
     parse_entity_card,
     resolve_entity_card_from_server_meta,
@@ -162,6 +163,9 @@ def serve_identity(options: Optional[ServeIdentityOptions] = None, **kwargs: Any
     parsed = parse_did_web(did)
     if parsed is None:
         raise ValueError(f"serve_identity: {did} is not a did:web DID")
+    problem = own_did_web_problem(did)
+    if problem is not None:
+        raise ValueError(f"serve_identity: {problem}")
     paths = _paths_for(parsed[1])
     canonical = origin.scheme == "https" and public_base == f"https://{parsed[0]}"
     did_document_url = did_web_document_url(did) if canonical else f"{public_base}{paths['did_document']}"

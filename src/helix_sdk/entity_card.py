@@ -114,9 +114,43 @@ def _require_did_web(did: str) -> Tuple[str, List[str]]:
     return parsed
 
 
+_RAW_HOST = re.compile(r"^(?:\[[0-9a-fA-F:.]+\]|[A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_])?)(?::\d{1,5})?$")
+
+
+def is_raw_did_web_host(host: object) -> bool:
+    """Whether ``host`` is a raw ``host[:port]`` (not percent-encoded, no scheme or path)."""
+    return isinstance(host, str) and _RAW_HOST.match(host) is not None
+
+
 def did_web_for(host: str, segments: Sequence[str] = ()) -> str:
-    """``did:web:<host>:<seg>…`` with every segment percent-encoded and the host lowercased."""
+    """``did:web:<host>:<seg>…``: the raw ``host[:port]`` lowercased and percent-encoded
+    once (a port's ``:`` is ``%3A``), every segment percent-encoded; a segment holds no
+    ``:`` of its own. Same rule as core's ``didWebFor`` (one did:web shape, 2026-11-23)."""
+    if not is_raw_did_web_host(host):
+        raise EntityCardError(
+            "malformed_did",
+            f"did:web host must be a raw host name, optionally with a port (host or host:port, not percent-encoded): {host!r}",
+        )
+    for seg in segments:
+        if not isinstance(seg, str) or not seg or re.search(r"[/#?:]", seg) or seg in (".", ".."):
+            raise EntityCardError("malformed_did", f"did:web path segment is not one segment: {seg!r}")
     return ":".join(["did:web", quote(host.lower(), safe="")] + [quote(seg, safe="") for seg in segments])
+
+
+def own_did_web_problem(did: object) -> Optional[str]:
+    """Why ``did`` cannot be a DID on its owner's own domain, or None when it can: any
+    path, with or without a kind segment, but no unencoded port
+    (``did:web:localhost:3000:x`` is host ``localhost``, path ``3000/x``)."""
+    if not isinstance(did, str):
+        return "did must be a string"
+    parsed = parse_did_web(did)
+    if parsed is None:
+        return f"{did} is not a did:web DID that names a URL"
+    host, path = parsed
+    raw = did[len("did:web:"):].split(":")
+    if path and len(raw) > 1 and raw[1] == path[0] and re.fullmatch(r"\d{1,5}", path[0]) and ":" not in host:
+        return f"{did} has an unencoded port: write the host as {quote(host + ':' + path[0], safe='')} (did:web percent-encodes the port's colon)"
+    return None
 
 
 def is_loopback_host(host: str) -> bool:

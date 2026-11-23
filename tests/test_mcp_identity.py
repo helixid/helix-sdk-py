@@ -148,6 +148,9 @@ def test_serves_documents_helix_init_wrote_and_refuses_ones_for_another_did_or_a
         serve_identity(public_origin="ftp://mcp.example.com")
     with pytest.raises(ValueError, match="did:web"):
         serve_identity(public_origin="https://mcp.example.com", did="did:key:z6Mk")
+    with pytest.raises(ValueError, match="unencoded port"):
+        serve_identity(public_origin="http://localhost:3000", did="did:web:localhost:3000:mcp")
+    assert serve_identity(public_origin="http://localhost:3000", path="/mcp").did == "did:web:localhost%3A3000:mcp"
     with pytest.raises(EntityCardError, match="proof") as refused:
         serve_identity(public_origin="https://mcp.example.com", card={"name": "X", "proof": {}})
     assert refused.value.code == codes.ENTITY_CARD_INVALID == "ENTITY_CARD_INVALID"
@@ -275,7 +278,7 @@ def test_the_middleware_and_sdk_export_what_helix_sdk_js_exports():
     js_names = [
         "resolve_entity_card", "resolve_entity_card_from_server_meta", "fetch_entity_card", "parse_entity_card", "validate_entity_card",
         "build_entity_card", "entity_card_summary", "server_card_meta", "capability_name", "create_safe_fetch", "default_outbound_fetch",
-        "requests_transport", "node_transport", "is_public_unicast_address", "parse_did_web", "did_web_for", "did_web_document_url",
+        "requests_transport", "node_transport", "is_public_unicast_address", "parse_did_web", "did_web_for", "is_raw_did_web_host", "own_did_web_problem", "did_web_document_url",
         "did_web_card_url", "is_loopback_host", "normalize_did", "same_did", "card_endpoint_of", "kya_os_card_service_entry",
         "EntityCardError", "SafeFetchRefusedError", "ENTITY_TYPES", "KYA_OS_CARD_SERVICE_TYPE", "KYA_OS_CARD_SERVICE_ID",
         "KYA_OS_CARD_META_KEY", "KYA_OS_CARD_REF_KEY", "KYA_OS_CARD_WELL_KNOWN_PATH", "PROOF_PROFILE_V1", "SAFE_FETCH_MAX_BYTES",

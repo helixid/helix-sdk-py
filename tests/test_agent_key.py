@@ -347,7 +347,9 @@ class TestResolve:
         assert did_web_to_url("did:web:example.com:agents:a:b") == "https://example.com/agents/a/b/did.json"
         assert did_web_to_url("did:web:example.com%3A8443:agents:a") == "https://example.com:8443/agents/a/did.json"
         assert did_web_to_url("did:web:localhost%3A3000:agents:a") == "http://localhost:3000/agents/a/did.json"
-        assert did_web_to_url("did:web:127.0.0.1:3680:agents:a") == "http://127.0.0.1:3680/agents/a/did.json"
+        # A port is read only from the encoded host; a raw port is a path segment, as the did:web spec reads it.
+        assert did_web_to_url("did:web:127.0.0.1%3A3680:agents:a") == "http://127.0.0.1:3680/agents/a/did.json"
+        assert did_web_to_url("did:web:127.0.0.1:3680:agents:a") == "http://127.0.0.1/3680/agents/a/did.json"
         assert did_web_to_url("did:web:localhost") == "http://localhost/.well-known/did.json"
         assert did_web_to_url("did:web:LOCALHOST:services:s") == "http://LOCALHOST/services/s/did.json"
         for bad in ("did:web:", "did:web", "did:key:z", "web:example.com"):

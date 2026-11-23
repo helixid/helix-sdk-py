@@ -49,7 +49,7 @@ import nacl.signing
 
 from .agent_key import AgentKey, assert_no_private_material, generate_agent_key, to_public_key_jwk
 from .crypto.jws import DEFAULT_KID_FRAGMENT, DEFAULT_SIGNING_KEY_ENV_VAR, EnvSigner, Signer, default_kid_fragment
-from .entity_card import FetchJson, resolve_entity_card, same_did
+from .entity_card import FetchJson, own_did_web_problem, resolve_entity_card, same_did
 from .keys import _normalize_ed25519_private_key
 
 ENROLLMENT_PROOF_PREFIX = "helix-enroll:v1"
@@ -290,6 +290,17 @@ class CustodyApiError(Exception):
         self.details = dict(details) if details else None
 
 
+def _assert_own_did(input: Mapping[str, Any]) -> None:
+    """Own hosting: the DID on the owner's domain may have any path, but no unencoded
+    port (``did:web:localhost:3000:x`` names another URL); refused here before any
+    request, as the API refuses it (one did:web shape, 2026-11-23)."""
+    if input.get("didHosting") != "own" or input.get("did") is None:
+        return
+    problem = own_did_web_problem(input["did"])
+    if problem is not None:
+        raise CustodyApiError(400, "VALIDATION_ERROR", problem)
+
+
 class HelixCustodyClient:
     """The custody endpoints of the Helix API. Bodies are checked for private
     key material before anything is sent."""
@@ -335,12 +346,15 @@ class HelixCustodyClient:
         expiry, requestedDomains (bare hosts or http(s) URLs, published as
         ``#domain-N`` LinkedDomains entries) and maxDelegationDepth (0 to 5,
         default 0, written on the identity credential), passed as given."""
+        _assert_own_did(input)
         return self.request("POST", "/v1/agents", input)
 
     def create_service(self, **input: Any) -> OnboardingResult:
+        _assert_own_did(input)
         return self.request("POST", "/v1/services", input)
 
     def create_owner(self, **input: Any) -> OnboardingResult:
+        _assert_own_did(input)
         return self.request("POST", "/v1/owners", input)
 
     def enrollment_challenge(self, enrollment_token: str) -> EnrollmentChallenge:
