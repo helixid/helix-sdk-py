@@ -387,6 +387,18 @@ class NeedsAuthorizationError(HelixError):
         self.reason = reason
 
 
+class ConsentFlowError(HelixError):
+    """A step of the consent flow (KYA-OS story L3-H) that did not go through: a
+    consent request, the signed root hop the consent page returned, a renewal or
+    a withdrawal. ``reason`` is one of helix_sdk.consent.ConsentReasons
+    (``step_up_required`` among them), ``status`` the HTTP status Helix answered
+    with, when it answered."""
+
+    def __init__(self, reason: str, message: str = "consent flow failed", status: int = 400) -> None:
+        super().__init__(codes.CONSENT_FLOW_FAILED, message, status, {"reason": reason})
+        self.reason = reason
+
+
 class JWTExpiredError(HelixError):
     def __init__(self, message: str = "JWT has expired") -> None:
         super().__init__(codes.JWT_EXPIRED, message, 401)

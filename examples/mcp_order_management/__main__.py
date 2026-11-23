@@ -107,6 +107,12 @@ Configuration (environment), the same as the JS sample:
                         demo_authorizer.py); outside it every retry is refused until a verifier
                         (stories F-2, L3-H) is wired in. Optional:
   KYAOS_RESUME_TTL_SECONDS  resume-token lifetime (default 600)
+  KYAOS_HELIX_CONSENT_URL KYA-OS (story L3-H): Helix's API base. The challenge's consent page becomes
+                          Helix's, where the user's own did:key signs the root hop; a retry's credential is
+                          verified in full by the local verifier. Needs SERVICE_DID and SERVICE_SIGNING_KEY.
+                          Optional: KYAOS_CONSENT_WINDOW_SECONDS (default 86400),
+                          KYAOS_CONSENT_HOP_LIFETIME_SECONDS, KYAOS_CONSENT_USER (one-user demo),
+                          KYAOS_CONSENT_SERVICE_NAME (the page's branding)
   AUDIT_LOG_FILE        append every audit event as one JSON line to this file, next to (or instead
                         of) the HelixID audit sink; for local runs and the e2e suite
   WELL_KNOWN_MCP        KYA-OS discovery (story L1-D): GET /.well-known/mcp is served whenever SERVICE_DID
@@ -171,6 +177,7 @@ from .app import create_order_app
 from .downstream import FORWARD_TOOL, DownstreamOptions
 from .levels import LEVEL_VARIABLES, describe_level_settings, read_level_settings
 from .demo_authorizer import demo_retry_authorizer
+from .consent_env import consent_from_settings, describe_consent, read_consent_settings
 from .orders import TOOL_SCOPES
 
 L3C_SETTINGS = (
@@ -576,13 +583,39 @@ def verifier_from_env(env: Dict[str, str], service_did: str, kyaos: Optional[Kya
 
 
 def needs_authorization_from_env(
-    env: Dict[str, str], service_did: Optional[str], demo: bool, audit_sink: Optional[Callable[[Dict[str, Any]], Any]]
+    env: Dict[str, str],
+    service_did: Optional[str],
+    demo: bool,
+    audit_sink: Optional[Callable[[Dict[str, Any]], Any]],
+    verifier_of: Callable[[], Any] = lambda: None,
 ) -> Optional[NeedsAuthorization]:
-    """The L3-E layer from KYAOS_AUTHORIZATION_URL and KYAOS_RESUME_TTL_SECONDS, or None when it is off."""
+    """The L3-E layer from KYAOS_AUTHORIZATION_URL (or story L3-H's KYAOS_HELIX_CONSENT_URL) and
+    KYAOS_RESUME_TTL_SECONDS, or None when it is off."""
     authorization_url = env.get("KYAOS_AUTHORIZATION_URL")
+    try:
+        consent = read_consent_settings(env)
+    except ValueError as error:
+        fail(str(error))
+    if consent is not None:
+        if authorization_url:
+            fail("set KYAOS_AUTHORIZATION_URL or KYAOS_HELIX_CONSENT_URL, not both")
+        if not service_did:
+            fail("KYAOS_HELIX_CONSENT_URL needs SERVICE_DID (the consent request is for this service)")
+        url_of, authorizer = consent_from_settings(consent, service_did, EnvSigner(did=service_did, env_var="SERVICE_SIGNING_KEY", env=env), verifier_of)
+        return create_needs_authorization(
+            NeedsAuthorizationOptions(
+                authorization_url=url_of,
+                ttl_seconds=_positive_number(env, "KYAOS_RESUME_TTL_SECONDS", False),
+                env=env,
+                authorizer=authorizer,
+                audit_sink=audit_sink,
+                on_audit_error=lambda error: print("audit write failed:", error, file=sys.stderr),
+                service_did=service_did,
+            )
+        )
     if not authorization_url:
         if env.get("KYAOS_RESUME_TTL_SECONDS"):
-            fail("KYAOS_RESUME_TTL_SECONDS needs KYAOS_AUTHORIZATION_URL")
+            fail("KYAOS_RESUME_TTL_SECONDS needs KYAOS_AUTHORIZATION_URL or KYAOS_HELIX_CONSENT_URL")
         return None
     if not service_did:
         fail("KYAOS_AUTHORIZATION_URL needs SERVICE_DID (the challenge binds the token to this service)")
@@ -759,7 +792,7 @@ def main() -> None:
 
     downstream = downstream_from_env(env, service_did, audit)
     identity = identity_from_env(env, resource, service_did)
-    auth.needs_authorization = needs_authorization_from_env(env, service_did, demo, auth.audit_sink)
+    auth.needs_authorization = needs_authorization_from_env(env, service_did, demo, auth.audit_sink, lambda: auth.verifier)
     well_known, well_known_off = well_known_from_env(env, resource, service_did, kyaos)
     try:
         app = create_order_app(
@@ -801,12 +834,15 @@ def main() -> None:
     print(f"  Audit:       {' + '.join(a for a in audits if a) or 'off (set HELIX_API_URL + HELIX_API_KEY + SERVICE_DID, or AUDIT_LOG_FILE)'}")
     path = urlsplit(resource).path.rstrip("/")
     print(f"  Identity:    {identity.public_origin + path + '/{did,card}.json' if identity else 'off (set PUBLIC_ORIGIN)'}")
-    if auth.needs_authorization is not None:
+    consent_settings = read_consent_settings(env)
+    if consent_settings is not None:
+        print(f"  Consent:     needs_authorization challenges to Helix's consent page (story L3-H): {describe_consent(consent_settings)}; retries verified by the local verifier")
+    elif auth.needs_authorization is not None:
         store = "in redis (KYAOS_REDIS_URL)" if read_nonce_store_config(env).kind == "redis" else "in memory"
         retries = "checked structurally (DEMO_MODE, no signature verification)" if demo else "refused until a verifier is wired in"
         print(f"  Consent:     needs_authorization challenges to {env['KYAOS_AUTHORIZATION_URL']}, resume tokens {store}, retries {retries}")
     else:
-        print("  Consent:     off (set KYAOS_AUTHORIZATION_URL)")
+        print("  Consent:     off (set KYAOS_HELIX_CONSENT_URL or KYAOS_AUTHORIZATION_URL)")
     if kyaos is not None:
         print(
             f"  KYA-OS:      proofs by {kyaos.server_did}, sessions {'on' if kyaos.sessions_enabled else 'off'}, "
