@@ -167,7 +167,7 @@ class HelixClient:
     # -- Service Providers ---------------------------------------------------
     # Services hold no keys: the server mints the service DID, keeps its key,
     # and signs consent grants on the service's behalf -- the same custody
-    # model as agents (onboard_agent / sign_vp / delegate_authority).
+    # model as agents (onboard_agent / sign_vp).
 
     def create_service(
         self,
@@ -356,41 +356,6 @@ class HelixClient:
         route = "custodial-agents" if self._api_key else "agents"
         result = self._http_required().post(f"/v1/{route}/{quote(did, safe='')}/vp", body)
         return result["signedVP"]
-
-    def delegate_authority(
-        self,
-        did: str,
-        to: str,
-        scopes: List[str],
-        expires_in: int,
-        vc_id: Optional[str] = None,
-        revoke_existing: bool = False,
-    ) -> Dict[str, Any]:
-        """Delegates a slice of a server-custody agent's authority to another
-        DID -- the custodial counterpart to a wallet-based delegate(), which
-        needed the delegator's own private key and so has nothing legitimate
-        to call since agent self-custody was retired. Same trust boundary as
-        sign_vp(): this is an API call that authorizes HelixID to sign on the
-        delegator's behalf, not a local signature.
-
-        Mirrors sign_vp()'s two modes: enterprise (self._api_key set) hits
-        the account-scoped custodial route; core/OSS hits the admin-key-gated
-        route. Auth is the adapter's job either way. Pass vc_id to pin which
-        of the delegator's active credentials to delegate from.
-
-        Same rule as every stored credential: delegating the same scopes
-        again refreshes the earlier delegation, other scopes stand beside
-        it, `revoke_existing` clears the others."""
-        self._assert_api_configured()
-        body: Dict[str, Any] = {"to": to, "scopes": scopes, "expiresIn": expires_in}
-        if vc_id is not None:
-            body["vcId"] = vc_id
-        if revoke_existing:
-            body["revokeExisting"] = True
-
-        route = "custodial-agents" if self._api_key else "agents"
-        result = self._http_required().post(f"/v1/{route}/{quote(did, safe='')}/delegate", body)
-        return result["delegatedVC"]
 
     def request_user_challenge(self, user_did: str) -> Dict[str, Any]:
         return self._http_required().post("/v1/challenges", {"did": user_did, "purpose": "user_verification"})
