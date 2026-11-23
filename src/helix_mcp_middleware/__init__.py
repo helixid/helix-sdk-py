@@ -252,6 +252,12 @@ from .resume_token_store_env import __all__ as _resume_token_store_env_all  # no
 
 __all__ += _needs_authorization_all + _resume_token_store_all + _resume_token_store_env_all
 
+# KYA-OS consent at Helix: the user's did:key signs the root hop (story L3-H).
+from .helix_consent import *  # noqa: E402,F401,F403
+from .helix_consent import __all__ as _helix_consent_all  # noqa: E402
+
+__all__ += _helix_consent_all
+
 # KYA-OS session, replay store and server response proof (story L2-A).
 from .kyaos import *  # noqa: E402,F401,F403
 from .kyaos import __all__ as _kyaos_all  # noqa: E402
