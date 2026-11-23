@@ -180,6 +180,25 @@ def test_client_refuses_to_send_private_material() -> None:
     assert api.calls == []
 
 
+def test_client_refuses_an_own_hosted_did_with_an_unencoded_port_before_any_request() -> None:
+    api = FakeApi({})
+    client = HelixCustodyClient("https://helix.example", http=api)
+    for call in (
+        lambda: client.create_agent(name="a", didHosting="own", did="did:web:localhost:3000:a"),
+        lambda: client.create_service(name="s", domain="d", requiredScopes=["x"], didHosting="own", did="did:web:localhost:3000:s"),
+        lambda: client.create_owner(name="o", didHosting="own", did="did:web:localhost:3000"),
+    ):
+        with pytest.raises(CustodyApiError) as refused:
+            call()
+        assert (refused.value.status, refused.value.code) == (400, "VALIDATION_ERROR")
+    assert api.calls == []
+    ok = FakeApi({"POST /v1/agents": lambda body: (201, {"did": DID, **body})})
+    sending = HelixCustodyClient("https://helix.example", http=ok)
+    sending.create_agent(name="a", didHosting="own", did="did:web:localhost%3A3000:a")
+    sending.create_agent(name="b", didHosting="own")
+    assert len(ok.calls) == 2
+
+
 def test_create_agent_sends_requested_domains_and_max_delegation_depth() -> None:
     api = FakeApi({"POST /v1/agents": lambda body: (201, {"did": DID, **body})})
     client = HelixCustodyClient("https://helix.example", admin_api_key="admin", http=api)
