@@ -124,6 +124,21 @@ class ChallengeContext:
 
 
 @dataclass(frozen=True)
+class ChallengeInput:
+    """Who the challenged caller is, beside the binding: what an ``authorization_url`` function of two
+    arguments receives (story L3-H's create_helix_consent names the service user from ``oauth_subject``)."""
+
+    agent_did: str
+    tool: str
+    scopes: List[str]
+    missing: List[str] = field(default_factory=list)
+    auth_method: Optional[str] = None
+    oauth_subject: Optional[str] = None
+    level: Optional[str] = None
+    fresh: Optional[bool] = None
+
+
+@dataclass(frozen=True)
 class RetryAuthorizerInput:
     #: The DelegationCredential the retry carried, as received.
     credential: Any
@@ -158,8 +173,10 @@ class ResumeRetry:
 
 @dataclass
 class NeedsAuthorizationOptions:
-    #: The consent page: a URL, or a function of the challenge's ChallengeContext. Always covered by the proof.
-    authorization_url: Union[str, Callable[[ChallengeContext], str]]
+    #: The consent page: a URL, or a function of the challenge's ChallengeContext (and, with a second
+    #: parameter, its ChallengeInput: story L3-H's create_helix_consent creates a consent request at Helix
+    #: per challenge). Always covered by the proof.
+    authorization_url: Union[str, Callable[..., str]]
     #: Default: the store KYAOS_NONCE_STORE leads to (resume_token_store_from_env: Redis on KYAOS_REDIS_URL
     #: when the replay store is Redis, memory otherwise). An explicit store wins.
     store: Optional[ResumeTokenStore] = None
@@ -215,6 +232,16 @@ def _sync(value: Any, what: str) -> Any:
             close()
         raise TypeError(f"{what} returned an awaitable; use async_helixid_mcp_middleware for async seams")
     return value
+
+
+def _takes_two(function: Callable[..., Any]) -> bool:
+    """Whether ``function`` takes a second positional argument (the ChallengeInput)."""
+    try:
+        parameters = list(inspect.signature(function).parameters.values())
+    except (TypeError, ValueError):
+        return False
+    positional = [p for p in parameters if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    return len(positional) >= 2 or any(p.kind == p.VAR_POSITIONAL for p in parameters)
 
 
 def _normalise_url(url: str) -> str:
@@ -273,9 +300,11 @@ class NeedsAuthorization:
         )
         return layer
 
-    def _url_of(self, context: ChallengeContext) -> str:
+    def _url_of(self, context: ChallengeContext, details: ChallengeInput) -> str:
         url = self._options.authorization_url
-        return _normalise_url(url(context) if callable(url) else url)
+        if not callable(url):
+            return _normalise_url(url)
+        return _normalise_url(_sync(url(context, details) if _takes_two(url) else url(context), "authorization_url"))
 
     def _audit(
         self,
@@ -332,7 +361,10 @@ class NeedsAuthorization:
         if not context.scopes:
             raise ValueError("create_needs_authorization: a challenge needs at least one scope")
         lacking = list(missing) if missing else context.scopes
-        authorization_url = self._url_of(context)
+        details = ChallengeInput(
+            agent_did=agent_did, tool=tool, scopes=list(context.scopes), missing=lacking, auth_method=auth_method, oauth_subject=oauth_subject, level=level, fresh=fresh
+        )
+        authorization_url = self._url_of(context, details)
         expires_at = self._now() + self.ttl_seconds
         token = _sync(self.store.issue(ResumeTokenBinding(agent_did, tool, list(context.scopes)), expires_at), "store.issue")
         shown = display if display is not None else self._options.display
@@ -407,6 +439,7 @@ __all__ = [
     "ResumeRefusalReasons",
     "ChallengeContext",
     "RetryAuthorizerInput",
+    "ChallengeInput",
     "RetryAuthorization",
     "RetryAuthorizer",
     "ResumeRetry",

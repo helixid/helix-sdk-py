@@ -188,54 +188,9 @@ class HelixClient:
             body["apiEndpoint"] = api_endpoint
         return self._http_required().post("/v1/services", body)
 
-    def issue_service_delegation_grant(
-        self,
-        service_did: str,
-        agent_did: str,
-        user_did: str,
-        scopes: List[str],
-        durability: str = "standing",
-        revoke_existing: bool = False,
-        allow_delegation: Optional[bool] = None,
-    ) -> Dict[str, Any]:
-        """Issues a DelegationGrantCredential from `service_did` to `agent_did`
-        on `user_did`'s behalf: built, signed with the service's server-held
-        key and stored with a revocable status-list entry, in one call.
-        `user_did` is recorded as given, never resolved.
-
-        One grant per (user, agent, service, scope set): consenting again to
-        exactly the scopes an active grant carries refreshes that grant; a
-        different scope set is a new grant beside the existing ones, unless
-        `revoke_existing` asks for those to be revoked too. Revoke one with
-        revoke_vc().
-
-        `scopes` may only hold scopes the agent was onboarded with (plus
-        `accept-terms`); see get_agent_scopes(). `allow_delegation` says
-        whether the consent also covers agents this agent delegates to;
-        None leaves the grant without the flag, which verifiers treat as
-        allowed."""
-        body = {
-            "serviceDid": service_did,
-            "agentDid": agent_did,
-            "userDid": user_did,
-            "scopes": scopes,
-            "durability": durability,
-        }
-        if revoke_existing:
-            body["revokeExisting"] = True
-        if allow_delegation is not None:
-            body["allowDelegation"] = allow_delegation
-        result = self._http_required().post("/v1/service-delegation-grants", body)
-        return result["grantVC"]
-
-    def get_agent_scopes(self, service_did: str, agent_did: str) -> Dict[str, Any]:
-        """The scopes `agent_did` holds as itself, from its own active
-        onboarding credentials (never those delegated to it), for
-        `service_did`'s consent screen. Grant issuance refuses any scope
-        outside this set. Returns {"agentDid": ..., "scopes": [...]}."""
-        self._assert_api_configured()
-        qs = _query_string({"serviceDid": service_did, "agentDid": agent_did})
-        return self._http_required().get(f"/v1/service-delegation-grants/agent-scopes{qs}")
+    # Consent is not a grant a service signs for its user any more: since KYA-OS
+    # story L3-H the user's own did:key signs the root hop on Helix's consent
+    # page (helix_sdk.consent).
 
     # -- Status lists ---------------------------------------------------------
 
