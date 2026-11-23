@@ -29,6 +29,18 @@ rebuilt from 'name', 'input' and '_meta'."""
 
 
 @dataclass
+class InboundDelegationSettings:
+    """How the gate verifies downstream calls carrying KYA-OS delegation headers (story L3-D)."""
+
+    audience: Union[None, str, Sequence[str]] = None
+    """This service's host(s), as forwarders name it in the proof's ``aud``; default the host of a did:web service DID."""
+    forwarders: Union[None, str, Sequence[str]] = None
+    """Forwarding services whose own resource is honoured as a chain's target: ``"*"`` or DIDs. Default none."""
+    cache: Any = None
+    """The chain verdict cache (a VerificationCache); default one as long-lived as the verifier's status cache; ``False`` for none."""
+
+
+@dataclass
 class MCPMiddlewareOptions:
     verifier: Optional[Union[LocalVerifier, MiddlewareVerifierOptions]] = None
     """How KYA-OS request proofs are verified: in-process, from the proof and
@@ -71,3 +83,8 @@ class MCPMiddlewareOptions:
     not cover the tool's scopes with a signed `needs_authorization` challenge
     (instead of the plain 403), and verifies the retry that carries the resume
     token and the new delegation credential. See create_needs_authorization."""
+    inbound_delegation: Union[None, bool, "InboundDelegationSettings"] = None
+    """KYA-OS story L3-D: a call carrying ``KYA-OS-Delegation-Credential`` and
+    ``KYA-OS-Delegation-Proof`` (another service forwarding an agent's
+    authority) is verified from those signed artifacts by the local verifier.
+    On by default with a verifier; ``False`` turns it off."""

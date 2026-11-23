@@ -89,6 +89,12 @@ A level that does not exist is refused at startup, never read as a lower bar. Th
 A bearer token sent with a request proof is the proof's sender constraint: when its `cnf.jkt` matches the proof's
 `cnf.jkt` and the signing key, the call is `L3` (SPEC-ENTITY-CARD section 8.6).
 
+## Calling another service on the agent's behalf (story L3-D)
+
+`KYAOS_DOWNSTREAM_URL` (with `SERVICE_DID` and `SERVICE_SIGNING_KEY`) adds `forward_lookup_order` (`orders:read`): it asks another order service's `lookup_order` for the order, through the middleware's `withDelegation` / `with_delegation`, which forwards the chain the agent presented here (`KYA-OS-Delegation-Credential`), a delegation proof this server signs for the target host (`KYA-OS-Delegation-Proof`, 60 s), the agent DID and the session id; `KYAOS_DELEGATION_ADVISORY=1` adds the advisory chain and scope headers. Each attachment is audited: `delegation.outbound_attached` on the typed trail, and a `outbound-delegation` line in `KYAOS_VERIFICATION_LOG`.
+
+The receiving sample accepts such calls from the services in `KYAOS_FORWARDERS` (`*` or DIDs; default none) for chains that target them, and always for chains that target itself. `KYAOS_DELEGATION_AUDIENCE` is its host as forwarders name it (default the host of a did:web `SERVICE_DID`). A forwarded call carries no request proof of the agent's, so it comes to at most Card L2: lower the receiving tool's level (`KYAOS_TOOL_LEVELS=lookup_order=L2`). A revocation signal drops the cached verdict of a forwarded chain at once.
+
 ## KYA-OS session and response proof (story L2-A)
 
 Set `SERVICE_SIGNING_KEY` (the Ed25519 private key, hex, that `SERVICE_DID`'s document lists as `key-1`) and the

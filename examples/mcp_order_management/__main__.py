@@ -47,6 +47,16 @@ Configuration (environment), the same as the JS sample:
   KYAOS_REVOCATION_WEBHOOK_PATH a path on this server that receives pushed SETs (RFC 8935)
   KYAOS_VERIFICATION_LOG      1: print each verification (level, fresh, reasons) and each revocation signal
                               as one JSON line; a file path: append them there as JSON lines instead
+  KYAOS_DOWNSTREAM_URL        KYA-OS story L3-D: another order service's MCP endpoint; adds forward_lookup_order
+                              (orders:read), which looks the order up there on the calling agent's behalf,
+                              forwarding the chain it presented with a delegation proof this server signs
+                              (needs SERVICE_SIGNING_KEY); each attachment is audited (the typed trail when
+                              on, and a line in KYAOS_VERIFICATION_LOG)
+  KYAOS_DELEGATION_ADVISORY   1: also send the advisory KYA-OS-Delegation-Chain / KYA-OS-Granted-Scopes
+  KYAOS_FORWARDERS            the services whose forwarded chains this server honours (their own resource as
+                              the chain's target): * or comma-separated DIDs; default none
+  KYAOS_DELEGATION_AUDIENCE   this server's host(s), as forwarders name it in the proof's aud; default the
+                              host of a did:web SERVICE_DID
   KYAOS_REDIS_URL             also the status cache's Redis, whatever KYAOS_NONCE_STORE says: lists and
                               verdicts shared by every instance, JS or Python (pip install 'helixid-sdk-py[redis]');
                               without it the cache is in memory and covers this instance only
@@ -148,6 +158,7 @@ from helix_mcp_middleware import (
     create_revocation_signal_client,
     create_well_known_mcp,
     describe_nonce_store,
+    InboundDelegationSettings,
     read_nonce_store_config,
     entra,
     keycloak,
@@ -156,6 +167,7 @@ from helix_mcp_middleware import (
 from helix_sdk.verifier import StatusCache
 
 from .app import create_order_app
+from .downstream import FORWARD_TOOL, DownstreamOptions
 from .levels import LEVEL_VARIABLES, describe_level_settings, read_level_settings
 from .demo_authorizer import demo_retry_authorizer
 from .orders import TOOL_SCOPES
@@ -407,6 +419,34 @@ def json_object_from_env(env: Dict[str, str], name: str) -> Optional[Dict[str, A
     if not isinstance(parsed, dict):
         fail(f"{name} must be a JSON object")
     return parsed
+
+
+def downstream_from_env(env: Dict[str, str], service_did: str, audit: Any) -> Optional[DownstreamOptions]:
+    """Story L3-D: forward_lookup_order's downstream service, or None when KYAOS_DOWNSTREAM_URL is unset."""
+    url = env.get("KYAOS_DOWNSTREAM_URL")
+    if not url:
+        if env.get("KYAOS_DELEGATION_ADVISORY"):
+            fail("KYAOS_DELEGATION_ADVISORY needs KYAOS_DOWNSTREAM_URL")
+        return None
+    if not service_did or not env.get("SERVICE_SIGNING_KEY"):
+        fail("KYAOS_DOWNSTREAM_URL needs SERVICE_DID and SERVICE_SIGNING_KEY (the delegation proof is signed by this server)")
+    if urlsplit(url).scheme not in ("http", "https"):
+        fail("KYAOS_DOWNSTREAM_URL must be an http(s) URL")
+    log_event = event_logger(env)
+
+    def record(attachment: Any) -> None:
+        # Every attachment: the typed trail (delegation.outbound_attached, when on) and one log line.
+        if log_event is not None:
+            log_event("outbound-delegation", attachment.to_dict())
+        if audit is not None:
+            audit.outbound_attached(attachment)
+
+    return DownstreamOptions(
+        url=url,
+        signer=EnvSigner(service_did, env_var="SERVICE_SIGNING_KEY"),
+        advisory_headers=env.get("KYAOS_DELEGATION_ADVISORY") == "1",
+        audit=record,
+    )
 
 
 def event_logger(env: Dict[str, str]) -> Optional[Callable[[str, Dict[str, Any]], None]]:
@@ -688,11 +728,18 @@ def main() -> None:
         signals, webhook_path = revocation_signals_from_env(env, local, event_logger(env))
         # Story C-C: the minimum Card level, per tool.
         try:
-            levels = read_level_settings(env, list(TOOL_SCOPES))
+            levels = read_level_settings(env, [*TOOL_SCOPES, *([FORWARD_TOOL] if env.get("KYAOS_DOWNSTREAM_URL") else [])])
         except ValueError as error:
             fail(str(error))
         auth = replace(auth, **levels)
-    elif any(env.get(name) for name in ("KYAOS_TRUSTED_ISSUERS", "KYAOS_TRUSTED_ROOTS", "KYAOS_MAX_CHAIN_LENGTH", "KYAOS_CARDS_FILE", *L3C_SETTINGS, *LEVEL_VARIABLES)):
+        # Story L3-D: downstream calls forwarding an agent's delegation, verified by the same verifier.
+        forwarders = "*" if (env.get("KYAOS_FORWARDERS") or "").strip() == "*" else did_list(env, "KYAOS_FORWARDERS")
+        audience = [host.strip() for host in (env.get("KYAOS_DELEGATION_AUDIENCE") or "").split(",") if host.strip()]
+        auth.inbound_delegation = InboundDelegationSettings(forwarders=forwarders, audience=audience or None)
+    elif any(
+        env.get(name)
+        for name in ("KYAOS_TRUSTED_ISSUERS", "KYAOS_TRUSTED_ROOTS", "KYAOS_MAX_CHAIN_LENGTH", "KYAOS_CARDS_FILE", "KYAOS_FORWARDERS", "KYAOS_DELEGATION_AUDIENCE", *L3C_SETTINGS, *LEVEL_VARIABLES)
+    ):
         fail("KYAOS_TRUSTED_ISSUERS / KYAOS_TRUSTED_ROOTS / KYAOS_MAX_CHAIN_LENGTH / KYAOS_CARDS_FILE / KYAOS_*_LEVEL(S) and the revocation settings need SERVICE_DID")
     if demo:
         def demo_token(token: str) -> AuthResult:
@@ -706,6 +753,7 @@ def main() -> None:
     if auth.verifier is None and auth.validate_oauth_token is None and auth.oauth is None:
         fail("no way to authenticate callers: set SERVICE_DID (KYA-OS request proofs), OAUTH_ISSUER / OAUTH_ISSUERS, or DEMO_MODE=1")
 
+    downstream = downstream_from_env(env, service_did, audit)
     identity = identity_from_env(env, resource, service_did)
     auth.needs_authorization = needs_authorization_from_env(env, service_did, demo, auth.audit_sink)
     well_known, well_known_off = well_known_from_env(env, resource, service_did, kyaos)
@@ -720,6 +768,7 @@ def main() -> None:
             kyaos=kyaos,
             revocation_webhook=(webhook_path, signals.asgi_webhook()) if signals is not None and webhook_path else None,
             well_known=well_known,
+            downstream=downstream,
         )
     except ValueError as error:
         fail(str(error))
@@ -762,6 +811,10 @@ def main() -> None:
     else:
         print("  KYA-OS:      off (set SERVICE_SIGNING_KEY)")
     print(f"  Discovery:   {describe_well_known(well_known, well_known_off)}")
+    inbound = auth.inbound_delegation if isinstance(auth.inbound_delegation, InboundDelegationSettings) else None
+    accepted = "none" if inbound is None or inbound.forwarders is None else "any service" if inbound.forwarders == "*" else ", ".join(inbound.forwarders)
+    outbound = f"forward_lookup_order to {downstream.url}{' (advisory headers on)' if downstream.advisory_headers else ''}" if downstream else "off (set KYAOS_DOWNSTREAM_URL)"
+    print(f"  Downstream:  {outbound}; forwards accepted from {accepted}")
     sys.stdout.flush()
     if signals is not None and signals.events_url:
         signals.start()

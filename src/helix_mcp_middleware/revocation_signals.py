@@ -43,6 +43,8 @@ from urllib.request import Request, urlopen
 
 from helix_sdk.verifier import SECEVENT_JWT_MEDIA_TYPE, SignalReasons, verify_revocation_signal
 
+from .delegation.verification_cache import revocation_invalidation
+
 #: RFC 8935 §2.3 error codes.
 PUSH_ERRORS: Dict[str, str] = {
     SignalReasons.MALFORMED: "invalid_request",
@@ -464,5 +466,6 @@ def create_revocation_signal_client(verifier: Any, trusted_issuers: Sequence[str
     resolve_did = options.pop("resolve_did", None) or getattr(verifier.seams, "resolve_did", None)
     if resolve_did is None:
         raise ValueError("create_revocation_signal_client: the verifier has no resolve_did seam")
-    cache = options.pop("cache", None) or verifier.status_cache
+    # Story L3-D: the default also drops the verdicts of every verification cache linked to the status cache.
+    cache = options.pop("cache", None) or revocation_invalidation(verifier.status_cache)
     return RevocationSignalClient(trusted_issuers, resolve_did, cache, **options)

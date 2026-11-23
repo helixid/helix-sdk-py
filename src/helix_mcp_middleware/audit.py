@@ -34,14 +34,19 @@ from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from helix_sdk.audit import (
     AUDIT_BINDING_MCP,
+    UNKNOWN_DELEGATION_REF,
     AuditSink as TypedAuditSink,
     AuditTrail,
     AuditTrailEntry,
     PartyRef,
+    credential_digest,
+    delegation_chain_digests,
+    delegation_ref,
     keyed_commitment_value,
     pairwise_did,
     public_did,
 )
+from helix_sdk.entity_card import did_web_for
 
 ToolAuditEvent = Dict[str, Any]
 """One authorization decision for one tool call, as middleware.py reports it:
@@ -243,6 +248,60 @@ class McpAuditTrail:
             details["parentRef"] = parent_ref
         return self._record(self._input(f"delegation.{phase}", "delegation", outcome, details, reason_code), context)
 
+    def outbound_attached(self, attachment: Any, target_did: Optional[str] = None, context: Optional[McpAuditContext] = None) -> Optional[AuditTrailEntry]:
+        """Story L3-D (L3.26): one outbound delegation attachment (an
+        OutboundAttachment), as ``delegation.outbound_attached``: the chain
+        string as the action name (verbatim up to 256 characters, else its
+        digest), the target as the resource (its DID when given, else the
+        did:web of the audience host), the forwarded credential's reference,
+        digest and the chain's digests root first, the agent as actor and the
+        Responsible Party."""
+        chain = list(attachment.chain)
+        leaf = chain[-1] if chain else None
+        parent = chain[-2] if len(chain) > 1 else None
+        leaf_ref = delegation_ref(leaf) or UNKNOWN_DELEGATION_REF
+        parent_ref = delegation_ref(parent) if parent is not None else None
+        target = target_did
+        if target is None:
+            try:
+                target = did_web_for(attachment.audience)
+            except Exception:  # noqa: BLE001 - an audience that names no host has no DID
+                target = None
+        authorization: Dict[str, Any] = {"source": "delegation", "decision": "allowed", "delegationRef": leaf_ref}
+        digest = credential_digest(leaf)
+        if digest is not None:
+            authorization["delegationCredentialDigest"] = digest
+        digests = delegation_chain_digests(chain)
+        if digests is not None:
+            authorization["delegationChainDigests"] = digests
+        details: Dict[str, Any] = {"family": "delegation", "phase": "outbound_attached", "delegationRef": leaf_ref}
+        if parent_ref is not None:
+            details["parentRef"] = parent_ref
+        event = {
+            "eventType": "delegation.outbound_attached",
+            "action": {"category": "delegation.outbound", "name": attachment.chain_string},
+            "outcome": "succeeded",
+            "details": details,
+        }
+        merged: McpAuditContext = {
+            "actor": pairwise_did(attachment.agent_did),
+            "responsibleParty": pairwise_did(attachment.responsible_party),
+            "authorization": authorization,
+            "causationId": attachment.jti,
+        }
+        if attachment.correlation_id is not None:
+            merged["correlationId"] = attachment.correlation_id
+        merged.update(context or {})
+        return self._record(event, merged, resource=public_did(target) if target is not None else None)
+
+    def outbound_audit(self, target_did: Optional[Callable[[Any], Optional[str]]] = None) -> Callable[[Any], None]:
+        """``with_delegation``'s ``audit``: every outbound attachment recorded by ``outbound_attached``."""
+
+        def record(attachment: Any) -> None:
+            self.outbound_attached(attachment, target_did(attachment) if target_did is not None else None)
+
+        return record
+
     def authorization(
         self,
         phase: str,
@@ -380,7 +439,9 @@ class McpAuditTrail:
         event["details"] = details
         return event
 
-    def _record(self, event: Dict[str, Any], context: Optional[McpAuditContext], tool_name: Optional[str] = None) -> Optional[AuditTrailEntry]:
+    def _record(
+        self, event: Dict[str, Any], context: Optional[McpAuditContext], tool_name: Optional[str] = None, resource: Any = ...
+    ) -> Optional[AuditTrailEntry]:
         """Fills the context (explicit members over the current call's) and the resource, applies the tool-name policy, records."""
         call = _CURRENT_CALL.get()
         context = context or {}
@@ -398,7 +459,10 @@ class McpAuditTrail:
             event["actor"] = actor
         if context.get("responsibleParty") is not None:
             event["responsibleParty"] = context["responsibleParty"]
-        if self.service_did is not None:
+        if resource is not ...:
+            if resource is not None:  # an explicit None: the event names no resource, never this server instead
+                event["resource"] = resource
+        elif self.service_did is not None:
             event["resource"] = public_did(self.service_did)
         if context.get("authorization") is not None:
             event["authorization"] = context["authorization"]
