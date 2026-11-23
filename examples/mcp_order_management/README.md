@@ -52,6 +52,15 @@ one whose completion cannot be recorded is marked degraded; `AUDIT_DELIVERY=buff
 authorization server; `OAUTH_ISSUERS` for several, with the `entra`, `auth0`, `okta` and `keycloak` presets. See the
 docstring of [`__main__.py`](__main__.py) and the JS sample's README for the full table.
 
+Status lists (story L3-C): each list's proof is verified before a bit is read, and an unreachable, unsigned, badly
+signed, wrong-purpose or out-of-range list reads as revoked. Lists and verdicts are cached (`KYAOS_STATUS_CACHE_TTL`,
+`KYAOS_HIGH_PRIVILEGE_SCOPES` / `KYAOS_HIGH_PRIVILEGE_TTL`, `KYAOS_MAX_STALE_SECONDS`, `KYAOS_STATUS_LIST_ISSUERS`), in
+Redis with `KYAOS_REDIS_URL`, in the same keys as the JS sample, so JS and Python instances can share it.
+`KYAOS_REVOCATION_EVENTS_URL` and/or `KYAOS_REVOCATION_WEBHOOK_PATH`, with `KYAOS_SIGNAL_ISSUERS`, drop a cached verdict
+the moment Helix signals the revocation. `KYAOS_VERIFICATION_LOG=1` prints each verification and signal as one JSON line
+(a path appends them there). Unlike the JS sample, `KYAOS_REDIS_URL` backs only the status cache here: the Python
+middleware has no shared replay store yet (story L2-A).
+
 ## How it is wired ([`app.py`](app.py))
 
 A small ASGI wrapper sits in front of the MCP SDK's Streamable HTTP app. For each `tools/call` in the request body it

@@ -3,8 +3,9 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #    http://www.apache.org/licenses/LICENSE-2.0
-"""KYA-OS session, replay store and server response proof (story L2-A), the
-Python twin of helix-sdk-js's mcp-middleware/src/kyaos."""
+"""KYA-OS session, replay store and server response proof (story L2-A), and
+the shared status cache store (story L3-C): the Python twin of
+helix-sdk-js's mcp-middleware/src/kyaos."""
 
 from .describe import describe_kyaos
 from .errors import KYAOS_REJECTED, KyaOsError, KyaOsReasons
@@ -36,6 +37,7 @@ from .runtime import (
     KyaOsStarted,
     create_kyaos,
 )
+from .status_cache_store import RedisStatusCacheClient, RedisStatusCacheStore
 from .session_store import IDENTITY_ANONYMOUS, IDENTITY_AUTHENTICATED, KyaOsSession, MemorySessionStore, SessionStore
 from helix_sdk.response_proof import RESPONSE_PROOF_META_KEY
 
@@ -58,6 +60,8 @@ __all__ = [
     "NonceStore",
     "MemoryNonceStore",
     "RedisNonceStore",
+    "RedisStatusCacheStore",
+    "RedisStatusCacheClient",
     "DynamoNonceStore",
     "nonce_key",
     "nonce_store_from_env",

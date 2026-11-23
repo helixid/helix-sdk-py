@@ -152,7 +152,9 @@ class TestSharedFixtures:
 
 class TestReasonCodes:
     def test_the_set_is_the_javascript_set(self) -> None:
-        assert len(ALL_REASON_CODES) == len(set(ALL_REASON_CODES)) == 47
+        assert len(ALL_REASON_CODES) == len(set(ALL_REASON_CODES)) == 49
+        assert ReasonCodes.STATUS_LIST_PROOF_INVALID == "status_list_proof_invalid"
+        assert ReasonCodes.STATUS_LIST_MALFORMED == "status_list_malformed"
         assert ReasonCodes.NONCE_SEAM_MISSING == "nonce_seam_missing"
         assert ReasonCodes.DID_MEMBERSHIP_UNVERIFIABLE == "did_membership_unverifiable"
 
@@ -449,6 +451,12 @@ class TestVerifyEdges:
         assert verify_capability_attestation(signed, resolve, **{**kwargs, "fetch_status_list": down}).reason == "status_unavailable"
         assert verify_capability_attestation(signed, resolve, **{**kwargs, "fetch_status_list": lambda _url: None}).reason == "status_unavailable"
         assert verify_capability_attestation({**signed, "extra": 1}, resolve, **kwargs).reason == "schema_invalid"
+
+        def raising(_credential: Any, _context: Any) -> Any:
+            raise RuntimeError("checker down")
+
+        refused = verify_capability_attestation(signed, resolve, **{**kwargs, "fetch_status_list": None, "check_revocation": raising})
+        assert (refused.reason, "checker down" in (refused.message or "")) == ("status_unavailable", True)
         from helix_sdk.verifier import capability_name
 
         assert capability_name("x") == "x" and capability_name({"name": "y"}) == "y"

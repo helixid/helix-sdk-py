@@ -34,7 +34,8 @@ from helix_sdk.conformance.delegation_binding import (
 from helix_sdk.conformance.legacy import assertion_key, issuer_did, legacy_chain_refusal, verify_legacy_proof, verify_vc_jwt
 from helix_sdk.conformance.response_proof import proof_verifies, request_hash, response_hash
 from helix_sdk.conformance.runner import main
-from helix_sdk.conformance.status_list import accepts_list, keeper, list_bits, status_configuration, status_index, status_list_refusal, within_window
+from helix_sdk.conformance.status_list import keeper, status_configuration, status_list_refusal
+from helix_sdk.verifier import decode_status_list_bits, is_calendar_date_time, parse_status_list_index
 from helix_sdk.crypto.jcs import canonicalize
 from helix_sdk.crypto.jws import EnvSigner, base64url_encode
 from helix_sdk.did import build_did_document
@@ -206,24 +207,31 @@ def test_status_list_reading() -> None:
     ]:
         with pytest.raises(ValueError, match=words):
             status_configuration(value)
-    root, root_list, services = status_configuration({"statusListIssuers": {"did:web:svc": ["https://svc.example"]}})
-    assert keeper("https://svc.example/list", "did:web:o", root, root_list, services) == ("did:web:svc", False)
-    assert not accepts_list(None, "did:web:o", "u", "revocation", None, None, {})
-    assert not accepts_list({"issuer": 42}, "did:web:o", "u", "revocation", None, None, {})
-    assert not accepts_list({"issuer": "did:web:o", "id": "u"}, "did:web:o", "u", "revocation", None, None, {})
-    assert within_window({"validUntil": "2026-01-01T00:00:00.123456789+05:00"}, 1735689600000)
-    with pytest.raises(ValueError):
-        within_window({"validFrom": "2026-01-01"}, 0)
-    with pytest.raises(ValueError):
-        within_window({"validFrom": "2026-02-30T00:00:00Z"}, 0)
-    assert status_index(7) is None and status_index("0" * 20 + "7") == 7 and status_index("99999999999999999") is None
-    with pytest.raises(ValueError):
-        list_bits("u!!")
-    assert len(list_bits(base64.urlsafe_b64encode(gzip.compress(bytes(2))).decode().rstrip("="))) == 2
+    config = status_configuration({"statusListIssuers": {"did:web:svc": ["https://svc.example"]}})
+    assert keeper("https://svc.example/list", "did:web:o", config) == ("did:web:svc", False)
+    assert keeper("https://other.example/list", "did:web:o", config) == ("did:web:o", True)
+    assert is_calendar_date_time("2026-01-01T00:00:00.123456789+05:00")
+    assert not is_calendar_date_time("2026-01-01")
+    assert not is_calendar_date_time("2026-02-30T00:00:00Z")
+    assert parse_status_list_index(7) is None and parse_status_list_index("0" * 10 + "7") == 7 and parse_status_list_index("99999999999999999") is None
+    with pytest.raises(Exception):
+        decode_status_list_bits("u!!")
+    assert len(decode_status_list_bits(base64.urlsafe_b64encode(gzip.compress(bytes(2))).decode().rstrip("="))) == 2
     assert "credentialStatus" in status_list_refusal({"credential": {"credentialStatus": "x"}, "statusLists": {}, "didDocuments": {}}, 0)
     assert "names no list" in status_list_refusal({"credential": {"credentialStatus": {}}, "statusLists": {}, "didDocuments": {}}, 0)
     assert "unreadable" in status_list_refusal({"credential": None}, 0)
     assert status_list_refusal({"credential": None}) is not None
+    assert "no purpose" in status_list_refusal(
+        {"credential": {"issuer": "did:web:o", "credentialStatus": {"statusListCredential": "https://o.example/l"}}, "statusLists": {}, "didDocuments": {}}, 0
+    )
+
+
+@skip_without_vectors
+def test_status_list_refusal_when_the_named_list_is_not_served() -> None:
+    vectors = json.loads((VECTORS / "status-list.json").read_text())["vectors"]
+    active = next(v for v in vectors if v["id"] == "status-list/active-credential")["input"]
+    assert status_list_refusal(active) is None
+    assert status_list_refusal({**active, "statusLists": {}}).startswith("status_unavailable: no list at ")
 
 
 def test_delegation_binding_and_response_proof() -> None:

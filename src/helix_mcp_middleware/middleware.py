@@ -215,6 +215,9 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
                 token_cnf_jkt = bearer_auth.cnf_jkt or cnf_jkt_of(bearer_auth.claims)
             # A chain may come without a proof (story C-C): it verifies, at most at L2, and the level check below decides.
             call: Dict[str, Any] = {"name": tool_name, "input": tool_call.get("input"), "_meta": tool_call.get("_meta"), "require_proof": False}
+            # A tool that demands L3 needs fresh revocation status: its lists are read live, past the status cache (story L3-C).
+            if minimum_level_for(level_policy, tool_name) == "L3":
+                call["live_status"] = True
             if tool_call.get("request") is not None:
                 call["request"] = tool_call["request"]
             if token_cnf_jkt is not None:

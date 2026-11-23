@@ -44,7 +44,7 @@ from __future__ import annotations
 import json
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import Annotated, Any, Awaitable, Callable, Dict, Optional, Sequence
+from typing import Annotated, Any, Awaitable, Callable, Dict, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -154,6 +154,7 @@ def create_order_app(
     audit: Optional[McpAuditTrail] = None,
     identity: Optional[ServeIdentityOptions] = None,
     kyaos: Optional[KyaOsRuntime] = None,
+    revocation_webhook: Optional[Tuple[str, Callable[[Any, Any, Any], Any]]] = None,
     well_known: Optional[WellKnownMcp] = None,
 ) -> Any:
     """An ASGI app. `resource` is this server's MCP endpoint URL (MCP is
@@ -165,7 +166,9 @@ def create_order_app(
     L2-A): the handshake tool, sessions, the replay store and a server-signed
     proof on every tool call outcome. `well_known` serves the KYA-OS discovery
     document at `/.well-known/mcp` (story L1-D, from create_well_known_mcp());
-    a disabled one answers 404."""
+    a disabled one answers 404. `revocation_webhook` (KYA-OS story L3-C) is
+    `(path, asgi_app)`: the RFC 8935 receiver of Helix's revocation signals
+    (`RevocationSignalClient.asgi_webhook()`), mounted at `path`."""
     url = urlsplit(resource)
     if url.scheme not in ("http", "https") or not url.hostname:
         raise ValueError(f"resource must be an http(s) URL, got {resource!r}")
@@ -232,6 +235,9 @@ def create_order_app(
         path, method = scope["path"], scope["method"]
         if path == metadata_path and method == "GET":
             await respond(200, metadata)
+            return
+        if revocation_webhook is not None and path == revocation_webhook[0]:
+            await revocation_webhook[1](scope, receive, send)
             return
         if served_identity is not None and await served_identity.handle(scope, receive, send):
             return

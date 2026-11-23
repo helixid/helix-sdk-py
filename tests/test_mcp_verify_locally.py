@@ -10,8 +10,6 @@ mcp-middleware tests/verify-locally.test.ts and tests/middleware.test.ts
 
 from __future__ import annotations
 
-import base64
-import gzip
 import io
 import json
 from pathlib import Path
@@ -21,7 +19,7 @@ import pytest
 
 from helix_sdk.crypto.jws import EnvSigner
 from helix_sdk.keys import derive_public_key, public_key_to_multibase
-from helix_sdk.verifier import sign_request_proof
+from helix_sdk.verifier import StatusListError, sign_request_proof
 from helix_mcp_middleware import (
     LocalVerifierOptions,
     MemoryNonceStore,
@@ -35,7 +33,10 @@ from helix_mcp_middleware import (
     unrecorded_reporter,
 )
 import helix_mcp_middleware.verify_locally as verify_locally_module
+import helix_mcp_middleware.resolution_fetch as resolution_fetch_module
+from helix_mcp_middleware.resolution_fetch import TransportResponse
 
+from mcp_revocation_helpers import ListIssuer, bitstring_list, well_known_did_url
 from mcp_proof_helpers import (
     NOW_MS,
     fixture_signer,
@@ -59,13 +60,8 @@ DOCUMENT: Dict[str, Any] = {
 # The same document without the card service: no card is fetched for it.
 PLAIN_DOCUMENT: Dict[str, Any] = {key: value for key, value in DOCUMENT.items() if key != "service"}
 CARD = {"id": AGENT, "entityType": "agent", "name": "a1", "capabilities": ["read:orders"]}
-STATUS_LIST = {
-    "id": "https://issuer.example/status/1",
-    "issuer": "did:web:issuer.example",
-    "validFrom": "2026-01-01T00:00:00Z",
-    "validUntil": "2027-01-01T00:00:00Z",
-    "credentialSubject": {"statusPurpose": "revocation", "encodedList": "u" + base64.urlsafe_b64encode(gzip.compress(bytes(32))).rstrip(b"=").decode()},
-}
+LIST_ISSUER = ListIssuer("did:web:issuer.example")
+STATUS_LIST = bitstring_list("https://issuer.example/status/1", LIST_ISSUER)
 
 
 def static_fetch(served: Dict[str, Any], asked: List[str]) -> Any:
@@ -115,6 +111,8 @@ def test_resolves_did_web_the_card_and_status_lists_over_the_injected_fetch_and_
         "http://127.0.0.1:4000/agents/a1/did.json": DOCUMENT,
         "http://127.0.0.1:4000/agents/a1/card.json": CARD,
         "https://issuer.example/status/1": STATUS_LIST,
+        "https://issuer.example/status/unsigned": bitstring_list("https://issuer.example/status/unsigned", LIST_ISSUER, unsigned=True),
+        well_known_did_url(LIST_ISSUER.did): LIST_ISSUER.document,
     }
     verifier = quiet(fetch=static_fetch(served, asked), allow_loopback_http=True)
     result = verifier.verify_call({"name": "t", "_meta": proof_meta(SIGNER, SERVICE, "t")})
@@ -122,10 +120,14 @@ def test_resolves_did_web_the_card_and_status_lists_over_the_injected_fetch_and_
     assert asked[-1] == "http://127.0.0.1:4000/agents/a1/card.json"
     assert set(asked) == {"http://127.0.0.1:4000/agents/a1/did.json", "http://127.0.0.1:4000/agents/a1/card.json"}
     read = verifier.seams.fetch_status_list("https://issuer.example/status/1")
-    assert (read.issuer, read.id, read.fresh) == ("did:web:issuer.example", "https://issuer.example/status/1", True)
-    with pytest.raises(LookupError, match="404"):
+    assert (read.issuer, read.id, read.fresh, read.proof_verified) == ("did:web:issuer.example", "https://issuer.example/status/1", True, True)
+    # The list's own proof is verified before any bit is read (story L3-C).
+    with pytest.raises(StatusListError) as unsigned:
+        verifier.seams.fetch_status_list("https://issuer.example/status/unsigned")
+    assert unsigned.value.code == "status_list_proof_invalid"
+    with pytest.raises(StatusListError, match="404"):
         verifier.seams.fetch_status_list("https://issuer.example/status/missing")
-    with pytest.raises(ValueError, match="only https"):
+    with pytest.raises(StatusListError, match="only https"):
         verifier.seams.fetch_status_list("http://issuer.example/status/1")
     assert isinstance(verifier.nonce_store, MemoryNonceStore)
     assert verifier.verify_call({"name": "t", "_meta": {}}) is None
@@ -217,18 +219,12 @@ def test_reports_every_verification_and_survives_a_hook_that_raises_or_is_async(
 def test_fetches_over_http_when_no_fetch_is_injected(monkeypatch: pytest.MonkeyPatch) -> None:
     asked: List[str] = []
 
-    class Response(io.BytesIO):
-        def __enter__(self) -> "Response":
-            return self
+    def fake_transport(url: str, timeout: float, max_bytes: int) -> TransportResponse:
+        asked.append(url)
+        return TransportResponse(200, {}, json.dumps(DOCUMENT).encode())
 
-        def __exit__(self, *exc: Any) -> None:
-            self.close()
-
-    def fake_urlopen(request: Any, timeout: float) -> Response:
-        asked.append(request.full_url)
-        return Response(json.dumps(DOCUMENT).encode())
-
-    monkeypatch.setattr(verify_locally_module, "urlopen", fake_urlopen)
+    # The default fetch is create_resolution_fetch over urllib (story L3-C).
+    monkeypatch.setattr(resolution_fetch_module, "urllib_transport", fake_transport)
     verifier = quiet(allow_loopback_http=True)
     assert verifier.verify_call({"name": "t", "_meta": proof_meta(SIGNER, SERVICE, "t")}).proof_did == AGENT
     assert asked[0] == "http://127.0.0.1:4000/agents/a1/did.json"
@@ -343,7 +339,7 @@ def test_the_async_gate_awaits_an_async_report_hook_on_the_loop() -> None:
 
 def test_the_middleware_imports_no_helix_client_and_no_api_urls() -> None:
     package = Path(verify_locally_module.__file__).parent
-    for name in ("middleware.py", "verify_locally.py", "credentials.py", "types.py", "__init__.py"):
+    for name in ("middleware.py", "verify_locally.py", "credentials.py", "types.py", "__init__.py", "resolution_fetch.py", "revocation_signals.py", "kyaos/status_cache_store.py"):
         content = (package / name).read_text("utf-8")
         assert "HelixClient" not in content, name
         assert "localhost:3000" not in content, name

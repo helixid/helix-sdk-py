@@ -36,7 +36,8 @@ from .card_schema import ENTITY_CARD_SCHEMA
 from .chain import evaluate_delegation_chain_rules
 from .codes import ReasonCodes
 from .request_proof import DEFAULT_PROOF_SKEW_SECONDS, MAX_PROOF_TTL_SECONDS
-from .status import FetchStatusList, check_status_entry
+from .revocation import RevocationChecker, RevocationContext, check_chain_revocation, revocation_checker_of
+from .status import FetchStatusList, StatusListRead
 from .verify_request_proof import RequestProofOptions, verify_request_proof
 
 
@@ -70,6 +71,8 @@ class VerifierSeams:
     resolve_did: Optional[DidResolver] = None
     resolve_did_keys: Optional[Callable[[str], Sequence[Mapping[str, Any]]]] = None
     fetch_status_list: Optional[FetchStatusList] = None
+    #: The revocation check of one credential (story L3-C); default one over ``fetch_status_list``, no cache.
+    check_revocation: Optional[RevocationChecker] = None
     resolve_card: Optional[Callable[[str], Any]] = None
     nonce_store: Optional[Any] = None
     clock: Optional[Callable[[], int]] = None
@@ -93,6 +96,10 @@ class VerifierOptions:
     """Default True: a call without a request proof is refused ``proof_missing``. False (story C-C):
     a call carrying a chain and no proof is verified on the chain alone, with the proof floor
     unmet, so its level is at most L2."""
+    live_status: bool = False
+    """Read every status list live, past the status cache (story L3-C with C-C's levels): a call to
+    a tool whose minimum Card level is L3 needs fresh revocation status, which a cached read is not.
+    Default False: the cache serves, and a cached read is not fresh, so at most L2."""
 
     @classmethod
     def from_dict(cls, options: Mapping[str, Any]) -> "VerifierOptions":
@@ -110,6 +117,7 @@ class VerifierOptions:
             "action": "action",
             "tokenCnfJkt": "token_cnf_jkt",
             "requireProof": "require_proof",
+            "liveStatus": "live_status",
         }
         return cls(**{names[key]: value for key, value in options.items() if key in names})
 
@@ -202,6 +210,18 @@ def _missing_seams(seams: VerifierSeams, refusals: _Refusals) -> None:
         refusals.add(ReasonCodes.NONCE_SEAM_MISSING, "no nonce_store seam: there is no replay defense to run")
 
 
+def _revocation_seam(seams: VerifierSeams, options: VerifierOptions) -> Optional[RevocationChecker]:
+    """The revocation seam in force: the one given, else one over ``fetch_status_list``, else none."""
+    if callable(seams.check_revocation):
+        return seams.check_revocation
+    return revocation_checker_of(seams.fetch_status_list, options.max_clock_skew_ms) if callable(seams.fetch_status_list) else None
+
+
+def _request_scopes(options: VerifierOptions, allowed_action: Sequence[str]) -> Sequence[str]:
+    """The scopes a request touches, which pick the status cache TTL: the invoked action, else what the leaf allows."""
+    return list(allowed_action) if options.action is None else [options.action]
+
+
 def validate_entity_card(value: Any) -> List[str]:
     """Every way ``value`` fails the strict card schema, as ``path: message``; empty when it is a card."""
     return [f"{violation.path}: {violation.message}" for violation in validate_json_schema(ENTITY_CARD_SCHEMA, value)]
@@ -273,6 +293,9 @@ def verify(
         # Every binding held: from here a refusal names the principal it refused.
         proved = {"proof_did": proof_did, "proof_assurance": verdict.assurance, "warnings": verdict.warnings, "proof_floor": True}
 
+    # Lists read live for this verification: a second credential on the same list stays a live read.
+    reads: Dict[str, StatusListRead] = {}
+
     # 6. The chain: local rules, the leaf join, trusted roots, the action, each hop's proof, each hop's status.
     summary = ChainSummary()
     leaf_allowed_action: List[str] = []
@@ -307,20 +330,16 @@ def verify(
             if not verdict.ok:
                 refusals.add(ReasonCodes.HOP_PROOF_INVALID, f"hop {index}: {verdict.reason}: {verdict.message}")
                 return _refused(refusals, summary, **proved)
-        if not callable(seams.fetch_status_list):
+        checker = _revocation_seam(seams, options)
+        if checker is None:
             refusals.add(ReasonCodes.STATUS_SEAM_MISSING, "no fetch_status_list seam: the hops' status cannot be read")
             return _refused(refusals, summary, **proved)
-        for index, hop in enumerate(hops):
-            try:
-                read = seams.fetch_status_list(hop["credentialStatus"]["statusListCredential"])
-            except Exception as exc:  # noqa: BLE001
-                refusals.add(ReasonCodes.STATUS_UNAVAILABLE, f"hop {index}: status list could not be read: {exc}")
-                return _refused(refusals, summary, **proved)
-            status = check_status_entry(hop["credentialStatus"], hop["issuer"], read, now_ms=now, max_clock_skew_ms=options.max_clock_skew_ms)
-            if not status.ok:
-                refusals.add(status.code or ReasonCodes.STATUS_UNAVAILABLE, f"hop {index}: {status.message}")
-                return _refused(refusals, summary, **proved)
-            chain_fresh = chain_fresh and status.fresh
+        # Root to leaf, stopping at the first revoked or unresolvable hop (section 6.5 cascade, story L3-C point 4).
+        revocation = check_chain_revocation(hops, checker, RevocationContext(now_ms=now, scopes=_request_scopes(options, evaluation.allowed_action), reads=reads, live=options.live_status))
+        if revocation.revoked:
+            refusals.add(revocation.code or ReasonCodes.STATUS_REVOKED, f"hop {revocation.index}: {revocation.message or 'revoked'}")
+            return _refused(refusals, summary, **proved)
+        chain_fresh = revocation.fresh
         summary.fresh = chain_fresh
         leaf_allowed_action = evaluation.allowed_action
 
@@ -360,6 +379,10 @@ def verify(
             trusted_issuers=seams.trusted_issuers,
             max_clock_skew_ms=options.max_clock_skew_ms,
             fetch_status_list=seams.fetch_status_list,
+            check_revocation=_revocation_seam(seams, options),
+            scopes=_request_scopes(options, leaf_allowed_action),
+            reads=reads,
+            live_status=options.live_status,
         )
 
     # 8. Authority and level (story F-1 point 4; section 9.4): the proof floor holds only when a proof verified.
