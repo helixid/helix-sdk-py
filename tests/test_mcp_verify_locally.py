@@ -391,7 +391,7 @@ def test_refuses_every_refused_chain_and_status_fixture_with_its_reasons_and_nev
     assert lookups == []
 
 
-def test_the_helix_audit_sink_posts_a_kyaos_caller_with_level_and_freshness_and_refuses_an_error_answer() -> None:
+def test_the_helix_audit_sink_records_a_kyaos_caller_at_its_level_and_refuses_an_error_answer() -> None:
     from helix_mcp_middleware import create_helix_audit_sink
 
     posted: List[Dict[str, Any]] = []
@@ -401,15 +401,20 @@ def test_the_helix_audit_sink_posts_a_kyaos_caller_with_level_and_freshness_and_
             self.status = status
 
         def post(self, url: str, **kwargs: Any) -> Any:
-            posted.append(kwargs["json"])
+            posted.append(json.loads(kwargs["data"]))
             return type("Res", (), {"status_code": self.status})()
 
-    sink = create_helix_audit_sink("http://api.test", "hak", http=Http(201))
+    # A-1's typed trail over F-2's caller: proof.verified at the derived level (_CACHED: not every status read live).
+    sink = create_helix_audit_sink("http://api.test", "hak", service_did="did:web:svc", http=Http(201))
     sink({"event": "AUTHZ_GRANTED", "result": "allowed", "timestamp": "t", "authMethod": "kyaos", "agentDid": "did:key:z6Mkagent", "level": "L3", "fresh": False, "effectiveScopes": ["orders:read"]})
-    assert {k: posted[0].get(k) for k in ("agentDid", "level", "fresh", "effectiveScopes")} == {"agentDid": "did:key:z6Mkagent", "level": "L3", "fresh": False, "effectiveScopes": ["orders:read"]}
-    assert "serviceDid" not in posted[0] and "vpId" not in posted[0]
+    assert [event["eventType"] for event in posted] == ["proof.verified", "authorization.approved"]
+    assert posted[0]["details"]["verificationCode"] == "KYAOS_PROOF_L3_CACHED"
+    assert posted[0]["actor"] == {"kind": "pairwise_did", "did": "did:key:z6Mkagent"}
+    assert posted[1]["authorization"] == {"source": "delegation", "decision": "allowed"}
     with pytest.raises(RuntimeError, match="500"):
-        create_helix_audit_sink("http://api.test", "hak", http=Http(500))({"event": "AUTHZ_GRANTED", "result": "allowed", "timestamp": "t", "agentDid": "did:key:z6Mk", "effectiveScopes": []})
+        create_helix_audit_sink("http://api.test", "hak", service_did="did:web:svc", http=Http(500))(
+            {"event": "AUTHZ_GRANTED", "result": "allowed", "timestamp": "t", "authMethod": "kyaos", "agentDid": "did:key:z6Mk", "effectiveScopes": []}
+        )
 
 
 def test_a_proof_error_carries_one_of_the_two_proof_codes() -> None:

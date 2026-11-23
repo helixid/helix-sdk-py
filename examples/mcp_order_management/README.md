@@ -42,7 +42,13 @@ The variables are the JS sample's. `SERVICE_DID` turns on the KYA-OS door: each 
 against that DID, from public DID documents, status lists and the agent's Entity Card alone, so the server authorises
 with the Helix API unreachable (`KYAOS_TRUSTED_ISSUERS`, `KYAOS_TRUSTED_ROOTS`, `KYAOS_MAX_CHAIN_LENGTH`,
 `KYAOS_CARDS_FILE` and, in development, `KYAOS_ALLOW_LOOPBACK_HTTP=1` tune it). `HELIX_API_URL` + `HELIX_API_KEY`
-only write the audit log, never on the request path. `OAUTH_ISSUER` (alone, or with `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` for opaque tokens) for one
+(with `SERVICE_DID`) only write the audit log, never on the request path: typed KYA-OS audit events, one
+`session.established` / `tool.call.*` bracket per call plus the gate's decisions (`proof.verified` at the proof's level,
+or `proof.rejected`), delivered to the recorder (`POST /v1/audit/submissions`, story A-2); tool names are withheld unless
+`AUDIT_INCLUDE_TOOL_NAMES=1`. A session that cannot be recorded fails the call with a 500; under the default
+`AUDIT_DELIVERY=required` a tool whose intent cannot be recorded does not run and answers `audit_delivery_failed`, and
+one whose completion cannot be recorded is marked degraded; `AUDIT_DELIVERY=buffered` takes `AUDIT_OUTBOX_DIR`, and
+`best-effort` needs `AUDIT_ACCEPT_AAP1=1`, as in the JS sample. `OAUTH_ISSUER` (alone, or with `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET` for opaque tokens) for one
 authorization server; `OAUTH_ISSUERS` for several, with the `entra`, `auth0`, `okta` and `keycloak` presets. See the
 docstring of [`__main__.py`](__main__.py) and the JS sample's README for the full table.
 
@@ -62,7 +68,9 @@ awaits `async_helixid_mcp_middleware` with the tool name, `params._meta`, the JS
 proof's `requestHash` covers it) and the request headers; a denial becomes a
 401 / 400 / 403 through `to_http_error_response()`, an unreachable authorization server a 503, and anything else is
 handed, body intact, to the transport. `initialize` and `tools/list` are not gated. The tools
-([`orders.py`](orders.py)) contain no auth code.
+([`orders.py`](orders.py)) contain no auth or audit code: with an audit trail, `audit_tool_handlers(server)` wraps
+each one before it is registered, so it runs under the tool call `begin_tool_call` opened for the request (the JS
+sample's `auditToolHandlers`).
 
 ## KYA-OS session and response proof (story L2-A)
 
