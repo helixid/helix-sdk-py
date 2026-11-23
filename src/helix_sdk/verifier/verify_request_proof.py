@@ -10,7 +10,10 @@ spec gives, stopping at the first broken binding. Mirrors helix-sdk-js
 
  1. schema (``malformed_proof``);
  2. ``kid`` names a key of ``did`` (``kid_did_mismatch``);
- 3. the signing key resolved from ``did``'s document (``key_unresolvable``);
+ 3. the signing key resolved from ``did``'s document (``key_unresolvable``;
+    a document older than one already seen, ``did_document_stale``), and
+    (story C-E) valid at ``created``: never ``revoked`` (``key_revoked``), not
+    past its ``validUntil`` (``key_superseded``);
  4. its RFC 7638 thumbprint is among the keys the DID publishes
     (``kid_not_in_did_document``; no ``resolve_did_keys`` seam fails closed
     with ``did_membership_unverifiable``);
@@ -37,7 +40,9 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from ..crypto.jws import base64url_decode_strict, select_assertion_method, verification_method_to_jwk
 from ..errors import InvalidJWSError
+from ..key_validity import KeyValidityReasons, key_validity_problem
 from .codes import ReasonCodes
+from .rotation import StaleDidDocumentError
 from .request_proof import (
     DEFAULT_PROOF_SKEW_SECONDS,
     MAX_PROOF_TTL_SECONDS,
@@ -48,6 +53,12 @@ from .request_proof import (
     verify_detached_jws,
     window_problems,
 )
+
+_KEY_VALIDITY_CODES = {
+    KeyValidityReasons.KEY_REVOKED: ReasonCodes.KEY_REVOKED,
+    KeyValidityReasons.KEY_SUPERSEDED: ReasonCodes.KEY_SUPERSEDED,
+    KeyValidityReasons.KEY_VALIDITY_MALFORMED: ReasonCodes.KEY_VALIDITY_MALFORMED,
+}
 
 CNF_PRESENT_BUT_TOKEN_UNFUSED = "cnf_present_but_token_unfused"
 """The non-fatal diagnostic of section 8.6: the proof carries ``cnf`` but no token ``cnf`` was given to fuse it with."""
@@ -133,14 +144,21 @@ def verify_request_proof(
         return _refused_at(ReasonCodes.ALG_UNSUPPORTED, f"proof alg {proof['alg']} is not EdDSA", proof)
     try:
         document = resolve_did(proof["did"])
+    except StaleDidDocumentError as exc:
+        return _refused_at(ReasonCodes.DID_DOCUMENT_STALE, str(exc), proof)
     except Exception as exc:  # noqa: BLE001 - a resolver that throws leaves the document unread
         return _refused_at(ReasonCodes.DID_UNRESOLVED, f"could not resolve {proof['did']}: {exc}", proof)
     if document is None:
         return _refused_at(ReasonCodes.DID_UNRESOLVED, f"{proof['did']} did not resolve", proof)
     try:
-        jwk = verification_method_to_jwk(select_assertion_method(document, proof["did"], proof["kid"]))
+        method = select_assertion_method(document, proof["did"], proof["kid"])
+        jwk = verification_method_to_jwk(method)
     except InvalidJWSError as exc:
         return _refused_at(ReasonCodes.KEY_UNRESOLVABLE, f"{exc.reason}: {exc}", proof)
+    # 3b. Story C-E point 3: the key kid names was valid when the proof was created (a revoked key never is).
+    validity = key_validity_problem(method, proof["created"] * 1000, clock())
+    if validity is not None:
+        return _refused_at(_KEY_VALIDITY_CODES[validity.reason], validity.message, proof)
     public_key = base64url_decode_strict(jwk["x"])
     key_jwk = {"kty": "OKP", "crv": "Ed25519", "x": jwk["x"], "kid": proof["kid"]}
 

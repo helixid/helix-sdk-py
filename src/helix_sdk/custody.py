@@ -78,7 +78,8 @@ CustodyStatus = Literal["pending_key", "pending_resolution", "active"]
 class CustodyKeyView(TypedDict):
     kid: str
     location: KeyCustodyMode
-    status: Literal["active", "retiring", "revoked"]
+    # "retired": superseded, kept in the DID document with validUntil; "revoked": compromised (story C-E).
+    status: Literal["active", "retiring", "retired", "revoked"]
     createdAt: str
     retiresAt: Optional[str]
     revokedAt: Optional[str]
@@ -131,9 +132,18 @@ class SignResponse(TypedDict):
     signature: str
 
 
+class PendingIssuerHop(TypedDict):
+    hopId: str
+    issuer: str
+
+
 class HopReissue(TypedDict, total=False):
+    """What a rotation did to the agent's delegation hops (story C-E point 4)."""
+
     reissued: int
     pending: bool
+    reissuedHops: Dict[str, str]
+    pendingIssuers: List[PendingIssuerHop]
     note: str
 
 
@@ -141,6 +151,7 @@ class ChangeCustodyResult(CustodyView, total=False):
     previousKid: str
     previousKeyShredded: bool
     retiresAt: str
+    rotationSequence: int
     hopReissue: HopReissue
     documents: PublishedDocuments
     publishRequired: bool
@@ -184,6 +195,8 @@ __all__ = [
     "base64url_decode",
     "base64url_encode",
     "change_to_self_custody",
+    "rotate_key",
+    "PendingIssuerHop",
     "check_own_hosting",
     "enrollment_proof_message",
     "helix_init",
@@ -382,7 +395,19 @@ class HelixCustodyClient:
         return self.request("POST", f"{self._subject(did, kind)}/custody", input)
 
     def finalize_rotation(self, did: str, force: bool = False, kind: str = "agent") -> Dict[str, Any]:
+        """Ends a rotation's overlap now: the old key is retired (kept in the DID document with validUntil)."""
         return self.request("POST", f"{self._subject(did, kind)}/custody/finalize", {"force": force})
+
+    def rotate_key(self, did: str, kind: str = "agent", **input: Any) -> ChangeCustodyResult:
+        """Story C-E: rotates the key in place. A self-custody key sends only the
+        new public half and its proof; with ``currentKeyProof`` the current key
+        authorises the rotation itself. A custodial subject sends nothing and
+        Helix rotates inside its KeyStore."""
+        return self.request("POST", f"{self._subject(did, kind)}/keys/rotate", input)
+
+    def revoke_key(self, did: str, kid: str, kind: str = "agent") -> Dict[str, Any]:
+        """Story C-E point 5: a compromised superseded key is revoked at once."""
+        return self.request("POST", f"{self._subject(did, kind)}/keys/revoke", {"kid": kid})
 
     def defaults(self) -> Dict[str, Any]:
         return self.request("GET", "/v1/custody/defaults")
@@ -643,6 +668,13 @@ def change_to_self_custody(
     if overlap_seconds is not None:
         body["overlapSeconds"] = overlap_seconds
     result = client.change_custody(did, subject, **body)
+    files = _write_key_files(out_dir, did, full_kid, fragment, env_var, seed, public_key_jwk, result)
+    return {"result": result, "files": files}
+
+
+def _write_key_files(
+    out_dir: str, did: str, full_kid: str, fragment: str, env_var: str, seed: bytes, public_key_jwk: Mapping[str, Any], result: Mapping[str, Any]
+) -> Dict[str, str]:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     files = _files(out)
@@ -664,6 +696,49 @@ def change_to_self_custody(
     if result.get("publishRequired"):
         _write_json(files["did_document"], documents.get("didDocument"))
         _write_json(files["card"], documents.get("card"))
+    return files
+
+
+def rotate_key(
+    client: HelixCustodyClient,
+    did: str,
+    out_dir: str,
+    current_signer: Optional[Signer] = None,
+    subject: str = "agent",
+    kid: Optional[str] = None,
+    overlap_seconds: Optional[int] = None,
+    env_var: str = DEFAULT_SIGNING_KEY_ENV_VAR,
+    generate_key: Optional[Callable[[], AgentKey]] = None,
+    now: Optional[Callable[[], str]] = None,
+) -> Dict[str, Any]:
+    """``rotate_key()`` (KYA-OS story C-E point 1): a new key for a self-custody
+    agent, generated here; only its public half goes to Helix (stories rule 7)
+    with a proof of possession, and ``current_signer`` (the current key) signs
+    the same message to authorise the change without an account key. Helix
+    lists both keys for the overlap, then keeps the old one with
+    ``validUntil``; the agent's leaf hops are reissued bound to the new key
+    (``result["hopReissue"]``; ``pendingIssuers`` names hops a self-custody
+    issuer must reissue). The new private key goes to ``signing-key.env``."""
+    fragment = kid_fragment(did, kid or f"key-{_base36(int(time.time() * 1000))}")
+    full_kid = f"{did}#{fragment}"
+    key = (generate_key or generate_agent_key)()
+    seed = bytes(_normalize_ed25519_private_key(key.private_key_hex))
+    public_key_jwk = to_public_key_jwk(key.public_key_hex)
+    issued_at = now() if now is not None else _now_iso()
+    message = rotation_proof_message(did, full_kid, issued_at)
+    body: Dict[str, Any] = {
+        "publicKeyJwk": public_key_jwk,
+        "kid": fragment,
+        "proof": {"issuedAt": issued_at, "signature": base64url_encode(nacl.signing.SigningKey(seed).sign(message).signature)},
+    }
+    if current_signer is not None:
+        if current_signer.did != did:
+            raise ValueError(f"rotate_key: the current signer is {current_signer.did}, not {did}")
+        body["currentKeyProof"] = {"signature": base64url_encode(bytes(current_signer.sign(message)))}
+    if overlap_seconds is not None:
+        body["overlapSeconds"] = overlap_seconds
+    result = client.rotate_key(did, subject, **body)
+    files = _write_key_files(out_dir, did, full_kid, fragment, env_var, seed, public_key_jwk, result)
     return {"result": result, "files": files}
 
 

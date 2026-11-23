@@ -32,6 +32,7 @@ from helix_sdk.custody import (
     kid_fragment,
     INIT_FILES,
     main,
+    rotate_key,
     rotation_proof,
     rotation_proof_message,
 )
@@ -482,6 +483,61 @@ def test_change_to_self_custody_sends_only_the_public_key_and_a_proof(tmp_path: 
     second = change_to_self_custody(HelixCustodyClient("https://h", http=helix_hosted), DID, str(tmp_path / "svc"), subject="service")
     assert second["result"]["kid"].startswith(f"{DID}#key-")
     assert not (tmp_path / "svc" / "did.json").exists()
+
+
+# ---------------------------------------------------------- rotate_key (C-E)
+
+CURRENT_HEX = "17" * 32
+
+
+def test_rotate_key_sends_only_the_public_key_its_proof_and_the_current_keys_signature(tmp_path: Path) -> None:
+    sent: Dict[str, Any] = {}
+
+    def rotate(body: Dict[str, Any]) -> Any:
+        sent.update(body)
+        kid = f"{DID}#{body['kid']}"
+        return {
+            "did": DID,
+            "kid": kid,
+            "didHosting": "helix",
+            "rotationSequence": 2,
+            "hopReissue": {"reissued": 1, "pending": False, "pendingIssuers": [{"hopId": "c", "issuer": "did:web:issuer.example"}]},
+            "publishRequired": False,
+            "documents": documents_for(DID, kid, body["publicKeyJwk"]["x"], "https://helix.example"),
+        }
+
+    api = FakeApi({f"POST /v1/agents/{DID}/keys/rotate": rotate})
+    current = EnvSigner(DID, kid="key-1", env_var="K", env={"K": CURRENT_HEX})
+    out = rotate_key(HelixCustodyClient("https://helix.example", http=api), DID, str(tmp_path), current_signer=current, kid="key-2", overlap_seconds=3600, generate_key=fixed_key, now=lambda: "2026-11-23T00:00:00.000Z")
+    assert out["result"]["rotationSequence"] == 2
+    assert out["result"]["hopReissue"]["pendingIssuers"] == [{"hopId": "c", "issuer": "did:web:issuer.example"}]
+    assert sorted(sent) == ["currentKeyProof", "kid", "overlapSeconds", "proof", "publicKeyJwk"]
+    message = rotation_proof_message(DID, f"{DID}#key-2", "2026-11-23T00:00:00.000Z")
+    nacl.signing.VerifyKey(bytes.fromhex(PUBLIC_HEX)).verify(message, base64url_decode(sent["proof"]["signature"]))
+    current_public = bytes(nacl.signing.SigningKey(bytes.fromhex(CURRENT_HEX)).verify_key)
+    nacl.signing.VerifyKey(current_public).verify(message, base64url_decode(sent["currentKeyProof"]["signature"]))
+    api.assert_no_private_material_sent()
+    assert all(CURRENT_HEX not in (call["body"] or "") for call in api.calls)
+    assert "authorization" not in api.calls[0]["headers"]
+    assert f"HELIX_SIGNING_KEY={SEED_HEX}" in (tmp_path / "signing-key.env").read_text()
+    assert not (tmp_path / "did.json").exists()
+
+
+def test_rotate_key_with_the_account_key_writes_own_hosted_documents_and_refuses_a_foreign_signer(tmp_path: Path) -> None:
+    api = FakeApi(
+        {
+            f"POST /v1/agents/{DID}/keys/rotate": lambda body: {"did": DID, "kid": f"{DID}#{body['kid']}", "didHosting": "own", "publishRequired": True, "documents": documents_for(DID, f"{DID}#{body['kid']}", "x", "https://owner.example")},
+            f"POST /v1/agents/{DID}/keys/revoke": lambda body: {"revokedKid": f"{DID}#{body['kid']}", "revokedHops": [], "rotationSequence": 3},
+        }
+    )
+    client = HelixCustodyClient("https://helix.example", api_key="acct", http=api)
+    out = rotate_key(client, DID, str(tmp_path))
+    assert out["result"]["kid"].startswith(f"{DID}#key-")
+    assert "currentKeyProof" not in json.loads(api.calls[0]["body"])
+    assert json.loads((tmp_path / "did.json").read_text())["id"] == DID
+    with pytest.raises(ValueError, match="not did:web:helix.example"):
+        rotate_key(client, DID, str(tmp_path), current_signer=EnvSigner("did:web:other.example", env_var="K", env={"K": CURRENT_HEX}))
+    assert client.revoke_key(DID, "key-1")["rotationSequence"] == 3
 
 
 # ------------------------------------------------------------- command line

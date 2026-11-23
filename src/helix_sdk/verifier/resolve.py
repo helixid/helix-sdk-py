@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 
 from ..crypto.jws import base64url_decode_strict, base64url_encode, verification_method_to_jwk
 from ..crypto.common import base58btc_decode
+from .rotation import RotationSequenceGuard
 
 _ED25519_MULTICODEC = b"\xed\x01"
 _ED25519_KEY_LENGTH = 32
@@ -108,9 +109,19 @@ def _default_fetch(url: str) -> Any:
         return json.loads(response.read().decode("utf-8"))
 
 
-def create_did_resolver(fetch_json: Optional[JsonFetch] = None, rewrite_url: Optional[Callable[[str], str]] = None) -> Callable[[str], Optional[Mapping[str, Any]]]:
-    """A ``resolve_did`` seam: did:key offline, did:web through ``fetch_json`` (``url -> parsed JSON``)."""
+def create_did_resolver(
+    fetch_json: Optional[JsonFetch] = None,
+    rewrite_url: Optional[Callable[[str], str]] = None,
+    sequence_guard: Optional[RotationSequenceGuard] = None,
+) -> Callable[[str], Optional[Mapping[str, Any]]]:
+    """A ``resolve_did`` seam: did:key offline, did:web through ``fetch_json`` (``url -> parsed JSON``).
+
+    Story C-E point 2: a did:web document whose ``rotationSequence`` is lower
+    than one this resolver has seen raises StaleDidDocumentError. Default a
+    guard of its own, in memory; pass one over a shared store so every
+    instance refuses the same replay."""
     do_fetch = fetch_json or _default_fetch
+    guard = sequence_guard if sequence_guard is not None else RotationSequenceGuard()
 
     def resolve(did: str) -> Optional[Mapping[str, Any]]:
         if did.startswith("did:key:"):
@@ -121,6 +132,7 @@ def create_did_resolver(fetch_json: Optional[JsonFetch] = None, rewrite_url: Opt
         document = do_fetch(rewrite_url(url) if rewrite_url else url)
         if not isinstance(document, Mapping) or document.get("id") != did:
             return None
+        guard.assert_current(did, document)
         return document
 
     return resolve
