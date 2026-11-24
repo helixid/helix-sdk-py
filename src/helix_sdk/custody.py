@@ -358,7 +358,10 @@ class HelixCustodyClient:
         """``POST /v1/agents``: name, scopes, keyCustody, didHosting, did, ownerDid,
         expiry, requestedDomains (bare hosts or http(s) URLs, published as
         ``#domain-N`` LinkedDomains entries) and maxDelegationDepth (0 to 5,
-        default 0, written on the identity credential), passed as given."""
+        default 0; kept on Helix's custody record, never on a credential: how
+        many hops may sit below the agent in a chain, enforced on the hops
+        Helix signs, POST /v1/grants and /v1/grants/:id/hops; 0 means the agent
+        cannot delegate), passed as given."""
         _assert_own_did(input)
         return self.request("POST", "/v1/agents", input)
 
