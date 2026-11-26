@@ -1,31 +1,43 @@
-# Copyright 2026 DgVerse LLP
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#    http://www.apache.org/licenses/LICENSE-2.0
 """Finds the caller's credential, ported from helix-sdk-js's
-mcp-middleware/src/credentials.ts."""
+mcp-middleware/src/credentials.ts: a KYA-OS request proof (with the chain the
+request carries) in ``_meta``, or an OAuth bearer token. A bearer token next to
+a proof is the proof's sender constraint, fused through ``cnf.jkt`` (story C-C,
+SPEC-ENTITY-CARD.md section 8.6). The Helix VP is retired with no backward
+compatibility: its carriers are no longer read."""
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, List, Mapping, Optional
+from typing import Any, List, Literal, Mapping, Optional, Sequence, Union
 
-from helix_sdk.errors import VPInvalidStructureError
-from helix_sdk.vp_transport import HELIX_VP_META_KEY
+from helix_sdk.verifier import read_carried_chain, read_request_proof
 
 from .errors import CREDENTIAL_CONFLICT, MCPAuthError
 
-_VP_HEADER = "x-helix-vp"
+TrustedIssuers = Union[Literal["*"], Sequence[str]]
+"""KYA-OS story C-B: which issuers' capability attestations a verifier counts.
+``"*"`` trusts every issuer; a list trusts exactly those DIDs. Shipped as
+allow-all (stories rule 9); the setting stays so a service can set a list.
+See :func:`helix_mcp_middleware.trusted_issuers.is_trusted_issuer`."""
+
+DEFAULT_TRUSTED_ISSUERS: TrustedIssuers = "*"
+
 _AUTH = re.compile(r"^(\S+)\s+(\S+)$")
 
 
 @dataclass(frozen=True)
 class ExtractedCredential:
     kind: str
-    """'vp' (value is the base64url-encoded VP) or 'oauth' (value is the bearer token)."""
-    value: str
+    """'proof' (a KYA-OS request proof and/or a carried chain) or 'oauth' (a bearer token alone)."""
+    token: Optional[str] = None
+    """The bearer token, for 'oauth'."""
+    proof: Any = None
+    """The request proof as carried, for 'proof'; None for a chain sent without one (story C-C)."""
+    chain: Any = None
+    """The carried delegation chain, when the request has one."""
+    bearer: Optional[str] = None
+    """For 'proof': a bearer token sent with the proof, its sender constraint (``cnf`` fusion, section 8.6)."""
 
 
 def _header_values(headers: Any, name: str) -> List[str]:
@@ -46,7 +58,7 @@ def _header_values(headers: Any, name: str) -> List[str]:
     return [v.strip() for v in out if isinstance(v, str) and v.strip()]
 
 
-def _meta_mapping(meta: Any) -> Mapping[str, Any]:
+def meta_mapping(meta: Any) -> Mapping[str, Any]:
     """`_meta` as a mapping. Accepts a dict or the MCP Python SDK's own
     RequestParams.Meta object (what a tool handler holds); anything else,
     including a string or list a client might send, is treated as absent."""
@@ -60,20 +72,17 @@ def _meta_mapping(meta: Any) -> Mapping[str, Any]:
 
 
 def extract_credential(headers: Any = None, meta: Any = None) -> Optional[ExtractedCredential]:
-    """`Authorization: HelixVP <vp>`, the legacy `X-Helix-VP` header, or MCP
-    `_meta["x-helix-vp"]` (stdio) for a HelixID VP, or
-    `Authorization: Bearer <token>` for OAuth. Tool arguments are never read.
+    """The request proof at ``_meta["org.kya-os/request-proof"]`` (or the
+    legacy ``org.kya-os/proof@1`` key, the canonical one winning when both are
+    present), with the carried chain at ``_meta["org.kya-os/delegation-chain"]``;
+    or ``Authorization: Bearer <token>`` for OAuth. Tool arguments are never read.
 
-    Ambiguity is rejected, never resolved by picking one: two different VPs,
-    two Authorization headers, or a VP together with a bearer token all raise
-    CREDENTIAL_CONFLICT. The same VP repeated in several places is accepted."""
-    vps: List[str] = []
+    A proof with a bearer token is one credential: the token is the proof's
+    sender constraint (``bearer``). A chain without a proof is a KYA-OS
+    credential too (it verifies at L2 at most, story C-C). Ambiguity is
+    rejected, never resolved by picking one: two Authorization headers, or a
+    chain without a proof together with a bearer token, raise CREDENTIAL_CONFLICT."""
     bearer: Optional[str] = None
-
-    def add(vp: str) -> None:
-        if vp not in vps:
-            vps.append(vp)
-
     authorization = _header_values(headers, "authorization")
     if len(authorization) > 1:
         raise MCPAuthError(CREDENTIAL_CONFLICT, "Multiple Authorization headers were provided")
@@ -81,30 +90,19 @@ def extract_credential(headers: Any = None, meta: Any = None) -> Optional[Extrac
         match = _AUTH.match(authorization[0])
         if not match:
             raise MCPAuthError(CREDENTIAL_CONFLICT, "Malformed Authorization header")
-        scheme, credential = match.group(1).lower(), match.group(2)
-        if scheme == "helixvp":
-            add(credential)
-        elif scheme == "bearer":
-            bearer = credential
+        if match.group(1).lower() == "bearer":
+            bearer = match.group(2)
         # Any other scheme is not ours; treated as no credential.
 
-    for value in _header_values(headers, _VP_HEADER):
-        add(value)
-
-    raw = _meta_mapping(meta).get(HELIX_VP_META_KEY)
-    if raw is not None and raw != "":
-        if not isinstance(raw, str):
-            raise VPInvalidStructureError(f'_meta["{HELIX_VP_META_KEY}"] must be a base64url-encoded string')
-        add(raw.strip())
-
-    if len(vps) > 1:
-        raise MCPAuthError(CREDENTIAL_CONFLICT, "Conflicting VPs were provided in more than one location")
-    if vps and bearer is not None:
+    fields = meta_mapping(meta)
+    proof = read_request_proof(fields)
+    chain = read_carried_chain(fields)
+    if proof is None and chain is not None and bearer is not None:
         raise MCPAuthError(
-            CREDENTIAL_CONFLICT, "Both a HelixID VP and an OAuth bearer token were provided; send exactly one"
+            CREDENTIAL_CONFLICT, "A delegation chain without a request proof and an OAuth bearer token were both provided; send one"
         )
-    if vps:
-        return ExtractedCredential("vp", vps[0])
+    if proof is not None or chain is not None:
+        return ExtractedCredential("proof", proof=proof, chain=chain, bearer=bearer)
     if bearer is not None:
-        return ExtractedCredential("oauth", bearer)
+        return ExtractedCredential("oauth", token=bearer)
     return None

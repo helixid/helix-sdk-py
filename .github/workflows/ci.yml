@@ -32,7 +32,7 @@ jobs:
 
       # tests/test_golden_vectors.py is the cross-language parity safety
       # net; tests/test_client.py pins HelixClient's custodial routes
-      # (onboard/sign_vp/delegate_authority) against a stubbed HTTP layer;
+      # (onboard/sign_vp) against a stubbed HTTP layer;
       # tests/test_wallet.py covers AgentWallet persistence and VPBuilder;
       # tests/test_framework_adapters.py exercises helix_mcp_middleware/
       # helix_langchain/helix_crewai against the real installed

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from . import errors as _errors
@@ -51,8 +51,9 @@ class HttpErrorResponse:
     status: int
     headers: Dict[str, str]
     """{'WWW-Authenticate': ...}"""
-    body: Dict[str, str]
-    """{'error': ..., 'error_description': ...}"""
+    body: Dict[str, Any]
+    """{'error': ..., 'error_description': ...}, and the KYA-OS denied proof
+    as '_meta': {'org.kya-os/response-proof': ...} when one was given."""
 
 
 # Only errors that describe the *caller's* credentials map to HTTP auth
@@ -60,13 +61,22 @@ class HttpErrorResponse:
 # authorization server being down) is a server fault and must not be reported
 # to the caller as a 401.
 _MAPPED: Dict[str, Tuple[int, str]] = {
-    "VP_MISSING": (401, ""),
-    "VP_INVALID_STRUCTURE": (401, "invalid_token"),
-    "VP_VERIFICATION_FAILED": (401, "invalid_token"),
+    # KYA-OS request proofs (story F-2): absent, or refused by the local verifier.
+    _errors.PROOF_MISSING: (401, ""),
+    _errors.PROOF_INVALID: (401, "invalid_token"),
+    # Story C-C: a verified call below its tool's minimum Card level (RFC 9470's step-up error).
+    _errors.PROOF_LEVEL_INSUFFICIENT: (401, "insufficient_user_authentication"),
     _errors.OAUTH_TOKEN_INVALID: (401, "invalid_token"),
     _errors.CREDENTIAL_CONFLICT: (400, "invalid_request"),
     "INSUFFICIENT_SCOPE": (403, "insufficient_scope"),
     _errors.TOOL_NOT_PERMITTED: (403, "insufficient_scope"),
+    _errors.RESOURCE_NOT_PERMITTED: (403, "insufficient_scope"),
+    _errors.PROMPT_NOT_PERMITTED: (403, "insufficient_scope"),
+    # KYA-OS session layer (story L2-A): a session id that is unknown, expired, malformed or another agent's.
+    "KYAOS_REJECTED": (400, "invalid_request"),
+    # KYA-OS story L3-E: the challenge (hosts without the signing runtime answer it here, unsigned) and a refused retry.
+    "NEEDS_AUTHORIZATION": (403, "needs_authorization"),
+    "RESUME_REFUSED": (403, "insufficient_scope"),
 }
 
 # RFC 6750 section 3: error_description and scope are limited to %x20-21 / %x23-5B / %x5D-7E.
@@ -77,12 +87,16 @@ def _challenge(scheme: str, params: List[Tuple[str, str]]) -> str:
     return f"{scheme} " + ", ".join(f'{k}="{_NOT_ALLOWED.sub(" ", v)}"' for k, v in params)
 
 
-def to_http_error_response(error: Any, resource_metadata_url: str) -> Optional[HttpErrorResponse]:
+def to_http_error_response(
+    error: Any, resource_metadata_url: str, proof: Optional[Mapping[str, Any]] = None
+) -> Optional[HttpErrorResponse]:
     """Turns an error raised by the middleware into an HTTP auth response: 401
-    with `WWW-Authenticate` challenges for both `Bearer` and `HelixVP` (each
-    pointing at the RFC 9728 metadata), 400 for ambiguous credentials, 403
-    for scope failures. Returns None for errors that are not the caller's
-    fault, so the host can answer 5xx."""
+    with `WWW-Authenticate` challenges for both `Bearer` and `KyaOS` (each
+    pointing at the RFC 9728 metadata), 400 for ambiguous credentials or a
+    refused KYA-OS session, 403 for scope failures. Returns None for errors
+    that are not the caller's fault, so the host can answer 5xx. ``proof`` is
+    the KYA-OS ``denied`` proof of this refusal (story L2-A), carried in the
+    body as ``_meta["org.kya-os/response-proof"]``."""
     code = getattr(error, "code", None)
     mapped = _MAPPED.get(code) if isinstance(code, str) else None
     if mapped is None:
@@ -104,6 +118,12 @@ def to_http_error_response(error: Any, resource_metadata_url: str) -> Optional[H
     params.append(("resource_metadata", resource_metadata_url))
     return HttpErrorResponse(
         status=status,
-        headers={"WWW-Authenticate": f"{_challenge('Bearer', params)}, {_challenge('HelixVP', params)}"},
-        body={"error": name or "unauthorized", "error_description": message},
+        headers={"WWW-Authenticate": f"{_challenge('Bearer', params)}, {_challenge('KyaOS', params)}"},
+        body={
+            "error": name or "unauthorized",
+            "error_description": message,
+            **{key: value for key, value in (("derivedLevel", getattr(error, "derived_level", None)), ("requiredLevel", getattr(error, "required_level", None))) if isinstance(value, str)},
+            **(dict(getattr(error, "challenge", None) or {}) if code == "NEEDS_AUTHORIZATION" else {}),
+            **({"_meta": {"org.kya-os/response-proof": dict(proof)}} if proof is not None else {}),
+        },
     )

@@ -17,7 +17,7 @@ and onboarding endpoints hand back.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import quote, urlencode
 
 from . import jwt as helix_jwt
@@ -167,7 +167,7 @@ class HelixClient:
     # -- Service Providers ---------------------------------------------------
     # Services hold no keys: the server mints the service DID, keeps its key,
     # and signs consent grants on the service's behalf -- the same custody
-    # model as agents (onboard_agent / sign_vp / delegate_authority).
+    # model as agents (onboard_agent).
 
     def create_service(
         self,
@@ -188,55 +188,9 @@ class HelixClient:
             body["apiEndpoint"] = api_endpoint
         return self._http_required().post("/v1/services", body)
 
-    def issue_service_delegation_grant(
-        self,
-        service_did: str,
-        agent_did: str,
-        user_did: str,
-        scopes: List[str],
-        durability: str = "standing",
-        revoke_existing: bool = False,
-        allow_delegation: Optional[bool] = None,
-    ) -> Dict[str, Any]:
-        """Issues a DelegationGrantCredential from `service_did` to `agent_did`
-        on `user_did`'s behalf: built, signed with the service's server-held
-        key and stored with a revocable status-list entry, in one call.
-        `user_did` is recorded as given, never resolved.
-
-        One grant per (user, agent, service, scope set): consenting again to
-        exactly the scopes an active grant carries refreshes that grant; a
-        different scope set is a new grant beside the existing ones, unless
-        `revoke_existing` asks for those to be revoked too. sign_vp() finds
-        and presents every active grant for the triple, so the caller need
-        not hold the returned VC. Revoke one with revoke_vc().
-
-        `scopes` may only hold scopes the agent was onboarded with (plus
-        `accept-terms`); see get_agent_scopes(). `allow_delegation` says
-        whether the consent also covers agents this agent delegates to;
-        None leaves the grant without the flag, which verifiers treat as
-        allowed."""
-        body = {
-            "serviceDid": service_did,
-            "agentDid": agent_did,
-            "userDid": user_did,
-            "scopes": scopes,
-            "durability": durability,
-        }
-        if revoke_existing:
-            body["revokeExisting"] = True
-        if allow_delegation is not None:
-            body["allowDelegation"] = allow_delegation
-        result = self._http_required().post("/v1/service-delegation-grants", body)
-        return result["grantVC"]
-
-    def get_agent_scopes(self, service_did: str, agent_did: str) -> Dict[str, Any]:
-        """The scopes `agent_did` holds as itself, from its own active
-        onboarding credentials (never those delegated to it), for
-        `service_did`'s consent screen. Grant issuance refuses any scope
-        outside this set. Returns {"agentDid": ..., "scopes": [...]}."""
-        self._assert_api_configured()
-        qs = _query_string({"serviceDid": service_did, "agentDid": agent_did})
-        return self._http_required().get(f"/v1/service-delegation-grants/agent-scopes{qs}")
+    # Consent is not a grant a service signs for its user any more: since KYA-OS
+    # story L3-H the user's own did:key signs the root hop on Helix's consent
+    # page (helix_sdk.consent).
 
     # -- Status lists ---------------------------------------------------------
 
@@ -254,42 +208,37 @@ class HelixClient:
         event_type: Optional[str] = None,
         since: Optional[str] = None,
         limit: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
-        qs = _query_string({"eventType": event_type, "since": since, "limit": limit})
+        family: Optional[str] = None,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """``GET /v1/audit-log``: one page, ``{"items": [...], "nextCursor": str | None}``,
+        newest first. Pass ``nextCursor`` back as ``cursor`` for the next page
+        (``None`` on the last). On helix-core each item is a row ``{id,
+        recordedAt, eventDigest, event, ledgerId, ledgerEpochId, sequence,
+        entryDigest, receipt}``, ``event`` the typed KYA-OS producer event
+        (helix_sdk.audit); a hosted deployment's account view answers the same
+        page shape with the event at the account's tier."""
+        qs = _query_string({"eventType": event_type, "family": family, "since": since, "cursor": cursor, "limit": limit})
         return self._http_required().get(f"/v1/audit-log{qs}")
 
-    def record_consent_granted_audit(self, **entry: Any) -> None:
-        """Best-effort consent-grant audit. A failure here must never
-        surface to the caller -- see AgentWallet.add_credential()."""
+    def record_audit_event(self, event: Dict[str, Any]) -> None:
+        """Records one typed producer event (``POST /v1/audit-log/events``):
+        the body is the event exactly as an ``AuditTrail`` built it, validated
+        strictly by the API. A no-op without an API key (audit writes need
+        one). Errors propagate: a producer that must not fail on an audit
+        write (the wallet) catches them."""
         if not self._api_audit_enabled:
             return
-        try:
-            self._http_required().post(
-                "/v1/audit-log/consent-granted",
-                {**entry, "subjectDid": entry.get("agentDid"), "eventType": "CONSENT_GRANTED"},
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        self._http_required().post("/v1/audit-log/events", event)
 
-    # -- Verification -------------------------------------------------------
+    def audit_sink(self) -> Any:
+        """An ``AuditSink`` (helix_sdk.audit) for an ``AuditTrail`` whose
+        events this client should report to the API."""
+        from .audit import CallbackAuditSink
 
-    def verify_vp(
-        self,
-        vp: Dict[str, Any],
-        expected_target_service: Optional[str] = None,
-        allow_self_signed: Optional[bool] = None,
-    ) -> Dict[str, Any]:
-        """Verifies a VP via POST /v1/vp/verify. Signature check,
-        delegation-chain walk, expiry, target service, and revocation all
-        happen server-side, with VP_VERIFIED/VP_REJECTED audit logging
-        handled there too -- there is no local fallback, by design (see
-        the SDK-API-only design)."""
-        body: Dict[str, Any] = {"signedVP": vp}
-        if expected_target_service is not None:
-            body["expectedTargetService"] = expected_target_service
-        if allow_self_signed is not None:
-            body["allowSelfSigned"] = allow_self_signed
-        return self._http_required().post("/v1/vp/verify", body)
+        return CallbackAuditSink(lambda entry: self.record_audit_event(entry.event))
+
+    # -- Sessions ------------------------------------------------------------
 
     def fetch_session_public_key(self) -> str:
         response = self._http_required().get("/v1/sessions/public-key")
@@ -313,71 +262,6 @@ class HelixClient:
             {"enrollmentToken": enrollment_token, "domains": domains or []},
         )
 
-    def sign_vp(
-        self,
-        did: str,
-        target_service: str,
-        user_did: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Signs a VP on behalf of a server-custody agent -- the caller
-        never has, and never can have, the private key, so this is an API
-        call instead of local VPBuilder signing. The server picks the
-        credentials from the DIDs alone: every active HelixAgentCredential
-        the agent holds (its own, plus any delegated to it).
-
-        `target_service` is the DID of the service the VP is for. With a
-        `user_did` the agent is acting on that user's behalf, and the server
-        attaches every active DelegationGrantCredential that service issued
-        to this agent for that user; none at all raises
-        CONSENT_GRANT_NOT_FOUND, meaning the user has not consented yet.
-
-        Enterprise mode (self._api_key set): custodial signing is
-        account-scoped, so this targets /v1/custodial-agents/:did/vp instead
-        of core's admin-key-gated /v1/agents/:did/vp. The bearer token itself
-        is sent by HttpAdapter, like every other call."""
-        self._assert_api_configured()
-        body: Dict[str, Any] = {"targetService": target_service}
-        if user_did is not None:
-            body["userDid"] = user_did
-
-        route = "custodial-agents" if self._api_key else "agents"
-        result = self._http_required().post(f"/v1/{route}/{quote(did, safe='')}/vp", body)
-        return result["signedVP"]
-
-    def delegate_authority(
-        self,
-        did: str,
-        to: str,
-        scopes: List[str],
-        expires_in: int,
-        vc_id: Optional[str] = None,
-        revoke_existing: bool = False,
-    ) -> Dict[str, Any]:
-        """Delegates a slice of a server-custody agent's authority to another
-        DID -- the custodial counterpart to a wallet-based delegate(), which
-        needed the delegator's own private key and so has nothing legitimate
-        to call since agent self-custody was retired. Same trust boundary as
-        sign_vp(): this is an API call that authorizes HelixID to sign on the
-        delegator's behalf, not a local signature.
-
-        Mirrors sign_vp()'s two modes: enterprise (self._api_key set) hits
-        the account-scoped custodial route; core/OSS hits the admin-key-gated
-        route. Auth is the adapter's job either way. Pass vc_id to pin which
-        of the delegator's active credentials to delegate from.
-
-        Same rule as every stored credential: delegating the same scopes
-        again refreshes the earlier delegation, other scopes stand beside
-        it, `revoke_existing` clears the others."""
-        self._assert_api_configured()
-        body: Dict[str, Any] = {"to": to, "scopes": scopes, "expiresIn": expires_in}
-        if vc_id is not None:
-            body["vcId"] = vc_id
-        if revoke_existing:
-            body["revokeExisting"] = True
-
-        route = "custodial-agents" if self._api_key else "agents"
-        result = self._http_required().post(f"/v1/{route}/{quote(did, safe='')}/delegate", body)
-        return result["delegatedVC"]
 
     def request_user_challenge(self, user_did: str) -> Dict[str, Any]:
         return self._http_required().post("/v1/challenges", {"did": user_did, "purpose": "user_verification"})

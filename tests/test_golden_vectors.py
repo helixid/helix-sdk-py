@@ -24,9 +24,8 @@ from pathlib import Path
 import pytest
 
 from helix_sdk.keys import derive_public_key
-from helix_sdk.proof import create_ed25519_proof
-from helix_sdk.vp_builder import VPBuilder, VPBuilderSignOverrides
-from helix_sdk.vp_crypto import hash_canonical_payload, sign_bytes, to_canonical_json
+from helix_sdk.proof import create_ed25519_proof, verify_ed25519_proof
+from helix_sdk.crypto.common import base58btc_encode, hash_canonical_payload, sign_bytes, to_canonical_json
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "golden-vectors"
 
@@ -60,46 +59,25 @@ class TestSigning:
         assert vector["verifies"] is True
 
 
-class TestVPBuilder:
-    @pytest.mark.parametrize("vector", _load("vp-builder.json")["vectors"], ids=lambda v: v["name"])
-    def test_signed_vp_matches_exactly(self, vector: dict) -> None:
-        inp = vector["input"]
-        overrides = vector["overrides"]
-
-        builder = VPBuilder(
-            credentials=inp["credentials"],
-            holder_did=inp["holderDid"],
-            target_service=inp["targetService"],
-            user_did=inp.get("userDid"),
-        )
-        result = builder.sign(
-            vector["private_key_hex"],
-            vector["verification_method"],
-            VPBuilderSignOverrides(
-                id=overrides["id"],
-                nonce=overrides["nonce"],
-                expires_at=_parse_iso(overrides["expiresAt"]),
-                proof_created_at=_parse_iso(overrides["proofCreatedAt"]),
-            ),
-        )
-
-        # Compare via canonical JSON rather than dict equality so key
-        # ordering differences (which carry no semantic weight) can't
-        # cause a false failure -- the actual wire-compatibility contract
-        # is the JSON content, not Python dict insertion order.
-        assert to_canonical_json(result) == to_canonical_json(vector["signed_vp"])
-
-
 class TestProof:
-    def test_create_ed25519_proof_matches_vp_builder_vector(self) -> None:
-        """Sanity check that proof.create_ed25519_proof() alone (not just
-        through VPBuilder) produces the same proof block, since
-        VPBuilder.sign() is a thin wrapper around it."""
-        vectors = _load("vp-builder.json")["vectors"]
-        vector = vectors[0]
-        payload = {k: v for k, v in vector["signed_vp"].items() if k != "proof"}
-        created_at = _parse_iso(vector["overrides"]["proofCreatedAt"])
-        proof = create_ed25519_proof(
-            payload, vector["private_key_hex"], vector["verification_method"], created_at
-        )
-        assert proof == vector["signed_vp"]["proof"]
+    @pytest.mark.parametrize("vector", _load("signing.json")["vectors"], ids=lambda v: v["name"])
+    def test_create_ed25519_proof_carries_the_vector_signature(self, vector: dict) -> None:
+        """proof.create_ed25519_proof() signs the canonical hash with the vector's key: its
+        proofValue is the vector's signature, base58btc, and it verifies. (The VP vector,
+        vp-builder.json, is gone with the Helix VP, KYA-OS story C-C.)"""
+        created_at = _parse_iso("2026-01-01T00:00:00.000Z")
+        proof = create_ed25519_proof(vector["input"], vector["private_key_hex"], "did:key:z6Mk#key-1", created_at)
+        assert proof == {
+            "type": "Ed25519Signature2020",
+            "created": "2026-01-01T00:00:00.000Z",
+            "verificationMethod": "did:key:z6Mk#key-1",
+            "proofPurpose": "assertionMethod",
+            "proofValue": base58btc_encode(bytes.fromhex(vector["signature_hex"])),
+        }
+        assert verify_ed25519_proof(vector["input"], proof, vector["public_key_hex"])
+
+
+def test_base58btc_keeps_leading_zero_bytes_as_ones() -> None:
+    # Each leading zero byte is a leading "1" (the alphabet's zero), whatever the data.
+    assert base58btc_encode(b"\x00\x00\x01") == "112"
+    assert base58btc_encode(b"") == ""

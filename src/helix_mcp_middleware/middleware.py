@@ -9,8 +9,10 @@ mcp-middleware/src/middleware.ts.
 
 Call it for every incoming tool call with the tool name, the MCP request's
 `_meta` and, over HTTP, the request headers. It identifies the caller (a
-HelixID VP, or an OAuth bearer token), checks the tool's scopes, records the
-decision, and returns the call or raises. Tool arguments are never consulted.
+KYA-OS request proof, verified in-process by the local verifier, story F-2;
+or an OAuth bearer token), checks the tool's scopes and then its minimum Card
+level (story C-C), records the decision, and returns the call or raises. Tool arguments are never consulted, and the
+Helix API is never asked about a credential.
 """
 
 from __future__ import annotations
@@ -18,53 +20,78 @@ from __future__ import annotations
 import asyncio
 import inspect
 from contextvars import ContextVar
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
 
-from helix_sdk import verify_vp
-from helix_sdk.errors import HelixError, VPMissingError, VPVerificationFailedError
-from helix_sdk.vp_transport import decode_helix_vp
+from helix_sdk.verifier import read_carried_chain, read_request_proof
 
-from .credentials import extract_credential
+from .credentials import extract_credential, meta_mapping
+from .delegation.headers import has_delegation_headers
+from .delegation.inbound import verify_inbound_delegation_headers
+from .delegation.verification_cache import VerificationCache
 from .errors import (
+    CREDENTIAL_CONFLICT,
     OAUTH_TOKEN_INVALID,
+    PROMPT_NOT_PERMITTED,
+    PROOF_INVALID,
+    PROOF_MISSING,
+    RESOURCE_NOT_PERMITTED,
     TOOL_NOT_PERMITTED,
     AuthorizationServerUnavailableError,
+    LevelError,
     MCPAuthError,
+    ProofError,
     ToolScopeError,
 )
-from .oauth import AuthResult, create_oauth_validator
+from .gate import DEFAULT_OPEN_METHODS, PROMPT_METHODS, RESOURCE_METHODS, claimed_did_of, claimed_issuer_of, header_of, method_of, refusal_code_of, target_of
+from .level import LevelPolicy, assert_level_policy, derived_level_of, meets_minimum_level, minimum_level_for
+from .oauth import AuthResult, cnf_jkt_of, create_oauth_validator
+from .needs_authorization_guard import challenge_for, consent_failure_of, resume_retry
 from .types import MCPMiddlewareOptions, MCPToolCall
-
-# The HelixID API reports a bad credential the way the local verifier does: as
-# a typed error (VC_REVOKED, VP_EXPIRED, VP_SIGNATURE_INVALID, a target
-# service mismatch, ...), not as `valid: false`. Those are the caller's fault
-# and become a 401. Anything else from the API (our own API key refused, the
-# API down) is a server fault and is passed through unmapped.
-_CREDENTIAL_FAULT_PREFIXES = ("VP_", "VC_", "DELEGATION_", "CONSENT_GRANT_")
-_CREDENTIAL_FAULT_CODES = {
-    "DID_NOT_FOUND",
-    "INVALID_DID_FORMAT",
-    "UNSUPPORTED_DID_METHOD",
-    "SELF_SIGNED_VC_NOT_ALLOWED",
-    "MAX_DELEGATION_DEPTH_EXCEEDED",
-    "SCOPE_ESCALATION_DENIED",
-    "CREDENTIAL_NOT_FOR_THIS_AGENT",
-    "SERVICE_NOT_FOUND",
-    "VALIDATION_ERROR",
-}
+from .verify_locally import LocalVerifier, LocalVerifierOptions, create_local_verifier
 
 
-# Codes to_http_error_response() answers as the caller's fault. If the API uses
-# one of them about this server's own request, it must not reach the caller as such.
-_CALLER_FACING_CODES = {"INSUFFICIENT_SCOPE"}
+@dataclass(frozen=True)
+class AuthorizedCaller:
+    """Who a tool call came from, once the gate has identified and authorized
+    them: what ``middleware.authorize(tool_call)`` returns (the KYA-OS proof's
+    ``clientDid`` comes from ``agent_did``). Mirrors helix-sdk-js's AuthorizedCaller."""
+
+    auth_method: str
+    """'kyaos' or 'oauth'; 'none' for an open method (``open_methods``), let through without checking anyone."""
+    scopes: List[str] = field(default_factory=list)
+    agent_did: Optional[str] = None
+    oauth_subject: Optional[str] = None
+    level: Optional[str] = None
+    """KYA-OS callers: the level the local verifier derived (story F-2)."""
+    proof_assurance: Optional[str] = None
+    fresh: Optional[bool] = None
+    """KYA-OS callers: whether every status the level relies on was read live."""
+    proof_floor: Optional[bool] = None
+    """KYA-OS callers (story C-C): True when a request proof verified; False for a chain verified without one."""
+    cnf_diagnostics: Optional[List[str]] = None
+    """KYA-OS callers: the ``cnf`` diagnostics (``cnf_present_but_token_unfused``)."""
+    chain: Optional[List[Any]] = None
+    """KYA-OS callers with a delegation (story L3-D): the verified chain, root first, which ``delegation_context_of`` forwards."""
+    forwarded_by: Optional[str] = None
+    """Downstream calls (story L3-D): the service that forwarded the agent's authority (the delegation proof's ``iss``)."""
 
 
-def _is_credential_fault(err: BaseException) -> bool:
-    code = getattr(err, "code", None)
-    return isinstance(code, str) and (code.startswith(_CREDENTIAL_FAULT_PREFIXES) or code in _CREDENTIAL_FAULT_CODES)
-
+def _caller_of(caller: Dict[str, Any]) -> AuthorizedCaller:
+    return AuthorizedCaller(
+        auth_method=caller["authMethod"],
+        scopes=list(caller["scopes"]),
+        agent_did=caller.get("agentDid"),
+        oauth_subject=caller.get("oauthSubject"),
+        level=caller.get("level"),
+        proof_assurance=caller.get("proofAssurance"),
+        fresh=caller.get("fresh"),
+        proof_floor=caller.get("proofFloor"),
+        cnf_diagnostics=list(caller["cnfDiagnostics"]) if caller.get("cnfDiagnostics") else None,
+        chain=list(caller["chain"]) if caller.get("chain") else None,
+        forwarded_by=caller.get("forwardedBy"),
+    )
 
 class _AsyncCallbackError(TypeError):
     """A configuration error (an async callback behind the sync gate), never a verdict on a token."""
@@ -85,11 +112,36 @@ def _as_auth_result(value: Any) -> Optional[AuthResult]:
     if isinstance(value, AuthResult):
         return value
     if isinstance(value, dict):
-        return AuthResult(sub=value.get("sub"), scopes=value.get("scopes") or [], client_id=value.get("client_id"))  # type: ignore[arg-type]
+        claims = value.get("claims")
+        cnf_jkt = value.get("cnf_jkt") or value.get("cnfJkt") or cnf_jkt_of(claims)
+        return AuthResult(sub=value.get("sub"), scopes=value.get("scopes") or [], client_id=value.get("client_id"), claims=claims, cnf_jkt=cnf_jkt)  # type: ignore[arg-type]
     return None
 
 
+def _is_local_verifier(value: Any) -> bool:
+    return callable(getattr(value, "verify_call", None))
+
+
+def _build_verifier(options: MCPMiddlewareOptions, service_did: Optional[str]) -> Any:
+    """The local verifier the gate runs: the one given, or one built from its settings."""
+    settings = options.verifier
+    if settings is None or _is_local_verifier(settings):
+        return settings
+    if not isinstance(settings, LocalVerifierOptions):
+        raise TypeError("`verifier` must be a LocalVerifier or LocalVerifierOptions")
+    catalog = settings.catalog
+    if catalog is None and options.tool_scopes is not None:
+        catalog = list(dict.fromkeys(scope for scopes in options.tool_scopes.values() for scope in scopes))
+    return create_local_verifier(replace(settings, service_did=settings.service_did or service_did, catalog=catalog))
+
+
 def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCall], MCPToolCall]:
+    """The gate: call it with a tool call; it returns the call unchanged once
+    the caller is identified and allowed to run the tool, and raises
+    otherwise. ``middleware.authorize(tool_call)`` does the same and returns
+    the AuthorizedCaller instead, for hosts that need to know who called (the
+    KYA-OS proof's ``clientDid``, say). ``middleware.verifier`` is the local
+    verifier the gate runs, when one is configured."""
     if options.oauth is not None and options.validate_oauth_token is not None:
         raise ValueError("Provide either `oauth` or `validate_oauth_token`, not both")
     for name in ("validate_oauth_token", "audit_sink"):
@@ -98,9 +150,54 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
     validate_oauth = options.validate_oauth_token or (
         create_oauth_validator(options.oauth) if options.oauth is not None else None
     )
+    # Story C-C: the minimum Card level per tool, checked after the scopes. A typo in a level raises here, never lowers a bar.
+    level_policy = LevelPolicy(options.minimum_level, options.tools, options.l3_minus_satisfies_l3)
+    assert_level_policy(level_policy)
+    l3_minus_satisfies_l3 = options.l3_minus_satisfies_l3 if options.l3_minus_satisfies_l3 is not None else True
     service_did = options.service_did or options.expected_target_service
+    # The verifier runs in-process (story F-2): nothing here ever asks the Helix API about a credential.
+    local_verifier = _build_verifier(options, service_did)
+    # Story L3-D: downstream calls carrying KYA-OS delegation headers, verified by the same local verifier.
+    inbound_on = options.inbound_delegation is not False
+    inbound = options.inbound_delegation if inbound_on and options.inbound_delegation is not True else None
+    inbound_cache: Any = None
+    if inbound_on and local_verifier is not None and getattr(inbound, "cache", None) is not False:
+        given_cache = getattr(inbound, "cache", None)
+        status_cache = getattr(local_verifier, "status_cache", None)
+        if given_cache is not None:
+            inbound_cache = given_cache
+        elif status_cache is not None:
+            inbound_cache = VerificationCache.for_status_cache(status_cache)
+        else:
+            inbound_cache = VerificationCache()
 
-    def audit(caller: Dict[str, Any], tool_name: Optional[str], denied: Optional[Dict[str, str]]) -> None:
+    open_methods = frozenset(options.open_methods if options.open_methods is not None else DEFAULT_OPEN_METHODS)
+    # Own authority: the agent's attested capabilities count as far as this service offers them, across its
+    # tools, resources and prompts (each gated method checks its own map below).
+    offered_scopes = [scopes for scopes in (options.tool_scopes, options.resource_scopes, options.prompt_scopes) if scopes is not None]
+    own_authority_catalog: Optional[List[str]] = (
+        list(dict.fromkeys(scope for scopes in offered_scopes for values in scopes.values() for scope in values)) if offered_scopes else None
+    )
+
+    def request_fields(ctx: Dict[str, Any]) -> Dict[str, Any]:
+        fields: Dict[str, Any] = {"method": ctx["method"]}
+        for key in ("resourceUri", "promptName", "clientIp", "userAgent"):
+            if ctx.get(key) is not None:
+                fields[key] = ctx[key]
+        return fields
+
+    def deliver(event: Dict[str, Any]) -> None:
+        if options.audit_sink is None:
+            return
+        try:
+            _refuse_awaitable(options.audit_sink(event), "audit_sink")
+        except Exception as exc:  # noqa: BLE001 - a failing sink never blocks a call
+            if options.on_audit_error is not None:
+                options.on_audit_error(exc)
+
+    def audit(ctx: Dict[str, Any], caller: Dict[str, Any], denied: Optional[Dict[str, str]]) -> None:
+        ctx["audited"] = True
+        tool_name = ctx["toolName"]
         if options.audit_sink is None:
             return
         event: Dict[str, Any] = {
@@ -110,9 +207,15 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
             "authMethod": caller["authMethod"],
             "effectiveScopes": list(caller["scopes"]),
         }
-        for key in ("agentDid", "oauthSubject", "vpId"):
+        for key in ("agentDid", "oauthSubject", "level", "fresh", "proofAssurance"):
             if caller.get(key) is not None:
                 event[key] = caller[key]
+        if caller["authMethod"] == "kyaos" and caller.get("level") is not None:
+            event["l3Minus"] = caller["level"] == "L3" and caller.get("proofAssurance") == "L3-minus"
+        if caller.get("cnfDiagnostics"):
+            event["cnfDiagnostics"] = list(caller["cnfDiagnostics"])
+        if denied and denied.get("requiredLevel") is not None:
+            event["requiredLevel"] = denied["requiredLevel"]
         if tool_name is not None:
             event["toolName"] = tool_name
         if denied:
@@ -121,87 +224,256 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
             event["reason"] = denied["reason"]
         if service_did is not None:
             event["serviceDid"] = service_did
-        try:
-            _refuse_awaitable(options.audit_sink(event), "audit_sink")
-        except Exception as exc:  # noqa: BLE001 - a failing sink never blocks a call
-            if options.on_audit_error is not None:
-                options.on_audit_error(exc)
+        if denied and denied.get("reasonCode") is not None:
+            event["reasonCode"] = denied["reasonCode"]
+        event.update(request_fields(ctx))
+        deliver(event)
 
-    def middleware(tool_call: MCPToolCall) -> MCPToolCall:
-        # Credentials come from Authorization / X-Helix-VP / _meta only; tool
-        # arguments are never consulted. Ambiguous credentials raise.
-        credential = extract_credential(tool_call.get("headers"), tool_call.get("_meta"))
-        if credential is None:
-            raise VPMissingError(
-                'No credentials: send Authorization: HelixVP, X-Helix-VP, MCP _meta["x-helix-vp"]'
-                + (", or Authorization: Bearer" if validate_oauth else "")
+    def audit_unidentified(ctx: Dict[str, Any], tool_call: MCPToolCall, reason_code: str) -> None:
+        """A refusal of a caller the gate could not identify: what is known, the claims marked unverified, no actor."""
+        event: Dict[str, Any] = {
+            "event": "AUTHZ_DENIED",
+            "result": "denied",
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "authMethod": "none",
+            "effectiveScopes": [],
+            "reason": reason_code,
+            "reasonCode": reason_code,
+        }
+        if ctx["toolName"] is not None:
+            event["toolName"] = ctx["toolName"]
+        if service_did is not None:
+            event["serviceDid"] = service_did
+        event.update(request_fields(ctx))
+        oauth_issuer = claimed_issuer_of(tool_call.get("headers"))
+        claimed_did = claimed_did_of(meta_mapping(tool_call.get("_meta")), read_request_proof)
+        if oauth_issuer is not None:
+            event["oauthIssuer"] = oauth_issuer
+        if claimed_did is not None:
+            event["claimedDid"] = claimed_did
+        if oauth_issuer is not None or claimed_did is not None:
+            event["claimedVerified"] = False
+        deliver(event)
+
+    def validate_bearer(token: str) -> AuthResult:
+        if validate_oauth is None:
+            raise MCPAuthError(OAUTH_TOKEN_INVALID, "Bearer tokens are not accepted by this server")
+        try:
+            auth = _as_auth_result(_refuse_awaitable(validate_oauth(token), "validate_oauth_token"))
+        except (MCPAuthError, AuthorizationServerUnavailableError, _AsyncCallbackError):
+            # Our own verdicts pass through; the authorization server being
+            # down is a server fault, not a bad token.
+            raise
+        except Exception:  # noqa: BLE001 - anything else came from a custom callback and means "rejected"
+            raise MCPAuthError(OAUTH_TOKEN_INVALID, "The access token was rejected") from None
+        if auth is None or not isinstance(auth.sub, str) or not auth.sub:
+            raise MCPAuthError(OAUTH_TOKEN_INVALID, "The access token has no subject")
+        return auth
+
+    def authorize(tool_call: MCPToolCall) -> AuthorizedCaller:
+        """Every request goes through here. An open method (``open_methods``)
+        passes unchecked; any other needs a verified caller, and every refusal is
+        audited, including those of a caller the gate could not identify."""
+        method = method_of(tool_call)
+        if method in open_methods:
+            return AuthorizedCaller(auth_method="none")
+        target = target_of(method, tool_call)
+        client_ip = tool_call.get("clientIp", tool_call.get("client_ip"))
+        ctx: Dict[str, Any] = {
+            "method": method,
+            "toolName": target if method == "tools/call" else None,
+            "resourceUri": target if method in RESOURCE_METHODS else None,
+            "promptName": target if method in PROMPT_METHODS else None,
+            "clientIp": client_ip if isinstance(client_ip, str) else None,
+            "userAgent": header_of(tool_call.get("headers"), "user-agent"),
+            "audited": False,
+        }
+        try:
+            return authorize_request(tool_call, ctx)
+        except Exception as error:
+            reason_code = None if ctx["audited"] else refusal_code_of(error)
+            if reason_code is not None:
+                audit_unidentified(ctx, tool_call, reason_code)
+            raise
+
+    def proof_request_of(tool_call: MCPToolCall, method: str) -> Any:
+        """The proof binds the JSON-RPC request: the one received, else rebuilt (``tools/call`` by the verifier; another method here)."""
+        if tool_call.get("request") is not None or method == "tools/call":
+            return tool_call.get("request")
+        params: Dict[str, Any] = dict(tool_call.get("input") or {})
+        if tool_call.get("_meta") is not None:
+            params["_meta"] = tool_call["_meta"]
+        return {"method": method, "params": params}
+
+    def authorize_request(tool_call: MCPToolCall, ctx: Dict[str, Any]) -> AuthorizedCaller:
+        # Credentials come from Authorization or `_meta` only; tool arguments
+        # are never consulted. Ambiguous credentials raise.
+        tool_name = ctx["toolName"]
+        proof_request = proof_request_of(tool_call, ctx["method"])
+        forwarded = inbound_on and has_delegation_headers(tool_call.get("headers"))
+        if forwarded:
+            meta = meta_mapping(tool_call.get("_meta"))
+            if read_request_proof(meta) is not None or read_carried_chain(meta) is not None:
+                raise MCPAuthError(CREDENTIAL_CONFLICT, "Downstream delegation headers and a KYA-OS request proof or chain were both provided; send one")
+        credential = None if forwarded else extract_credential(tool_call.get("headers"), tool_call.get("_meta"))
+        if credential is None and not forwarded:
+            raise ProofError(
+                PROOF_MISSING,
+                'No credentials: send a KYA-OS request proof in _meta["org.kya-os/request-proof"]'
+                + (", or Authorization: Bearer" if validate_oauth else ""),
             )
 
         caller: Dict[str, Any]
-        if credential.kind == "vp":
-            if options.client is None:
-                raise ValueError("helixid_mcp_middleware: `client` is required to verify HelixID VPs")
-            vp = decode_helix_vp(credential.value)
-            try:
-                result = verify_vp(
-                    vp,
-                    options.client,
-                    expected_target_service=options.expected_target_service,
-                    allow_self_signed=options.allow_self_signed,
-                )
-            except Exception as exc:  # noqa: BLE001 - classified by its code, whatever its type
-                if _is_credential_fault(exc):
-                    raise VPVerificationFailedError(str(exc)) from exc
-                if getattr(exc, "code", None) in _CALLER_FACING_CODES:
-                    # About this server's own access to the API, not the caller: keep
-                    # it from being answered as the caller's 401 / 403.
-                    raise RuntimeError(f"The HelixID API refused the verification request: {exc}") from exc
-                raise
-            if not result.get("valid"):
-                error_message = result.get("error")
-                raise VPVerificationFailedError(error_message) if error_message else VPVerificationFailedError()
+        if forwarded:
+            if local_verifier is None:
+                raise ValueError("helixid_mcp_middleware: `verifier` is required to verify KYA-OS delegation headers")
+            inbound_result = verify_inbound_delegation_headers(
+                tool_call.get("headers"),
+                local_verifier,
+                audience=getattr(inbound, "audience", None),
+                forwarders=getattr(inbound, "forwarders", None),
+                cache=inbound_cache,
+                live_status=minimum_level_for(level_policy, tool_name) == "L3",
+            )
+            if not inbound_result.ok:
+                if inbound_result.agent_did is not None:
+                    audit(
+                        ctx,
+                        {"authMethod": "kyaos", "scopes": [], "agentDid": inbound_result.agent_did, "level": inbound_result.level, "fresh": inbound_result.fresh},
+                        {"reason": ",".join(inbound_result.reasons)},
+                    )
+                raise ProofError(PROOF_INVALID, f"The delegation headers were refused: {', '.join(inbound_result.reasons)}", inbound_result.reasons)
             caller = {
-                "authMethod": "helixvp",
-                "scopes": list(result.get("effectiveScopes") or []),
-                "agentDid": result.get("agentDid"),
-                "vpId": result.get("vpId"),
+                "authMethod": "kyaos",
+                "scopes": list(inbound_result.effective_scopes),
+                "agentDid": inbound_result.agent_did,
+                "level": inbound_result.level,
+                "fresh": inbound_result.fresh,
+                "proofFloor": False,
+                "chain": inbound_result.chain,
+                "forwardedBy": inbound_result.forwarder,
             }
+        elif credential is not None and credential.kind == "proof":
+            if local_verifier is None:
+                raise ValueError("helixid_mcp_middleware: `verifier` is required to verify KYA-OS request proofs")
+            # A bearer token next to a proof is its sender constraint: its cnf.jkt fuses with the proof's for L3 (section 8.6).
+            token_cnf_jkt: Optional[str] = None
+            if credential.bearer is not None:
+                bearer_auth = validate_bearer(credential.bearer)
+                token_cnf_jkt = bearer_auth.cnf_jkt or cnf_jkt_of(bearer_auth.claims)
+            # A chain may come without a proof (story C-C): it verifies, at most at L2, and the level check below decides.
+            call: Dict[str, Any] = {"name": tool_name, "input": tool_call.get("input"), "_meta": tool_call.get("_meta"), "require_proof": False}
+            # A tool that demands L3 needs fresh revocation status: its lists are read live, past the status cache (story L3-C).
+            if minimum_level_for(level_policy, tool_name) == "L3":
+                call["live_status"] = True
+            if proof_request is not None:
+                call["request"] = proof_request
+            if token_cnf_jkt is not None:
+                call["token_cnf_jkt"] = token_cnf_jkt
+            if getattr(local_verifier, "allow_own_authority", False) and own_authority_catalog is not None:
+                call["own_authority_catalog"] = own_authority_catalog
+            result = local_verifier.verify_call(call)
+            if result is None:  # pragma: no cover - extract_credential found a proof, so verify_call reads one
+                raise ProofError(PROOF_MISSING, "The request carries no KYA-OS request proof")
+            if not result.ok:
+                refused = ProofError(PROOF_INVALID, f"The request proof was refused: {', '.join(result.reasons)}", result.reasons)
+                if result.proof_did is not None:
+                    audit(
+                        ctx,
+                        {"authMethod": "kyaos", "scopes": [], "agentDid": result.proof_did, "level": result.level, "fresh": result.fresh},
+                        {"reason": ",".join(result.reasons)},
+                    )
+                raise refused
+            cnf_diagnostics = [warning for warning in result.warnings if warning.startswith("cnf_")]
+            caller = {
+                "authMethod": "kyaos",
+                "scopes": list(result.effective_scopes),
+                "agentDid": result.agent_did,
+                "level": result.level,
+                "proofAssurance": result.proof_assurance,
+                "fresh": result.fresh,
+                "proofFloor": result.proof_floor,
+            }
+            if cnf_diagnostics:
+                caller["cnfDiagnostics"] = cnf_diagnostics
+            if isinstance(credential.chain, list) and credential.chain:
+                caller["chain"] = credential.chain
         else:
-            if validate_oauth is None:
-                raise MCPAuthError(OAUTH_TOKEN_INVALID, "Bearer tokens are not accepted by this server")
-            try:
-                auth = _as_auth_result(_refuse_awaitable(validate_oauth(credential.value), "validate_oauth_token"))
-            except (MCPAuthError, AuthorizationServerUnavailableError, _AsyncCallbackError):
-                # Our own verdicts pass through; the authorization server being
-                # down is a server fault, not a bad token.
-                raise
-            except Exception:  # noqa: BLE001 - anything else came from a custom callback and means "rejected"
-                raise MCPAuthError(OAUTH_TOKEN_INVALID, "The access token was rejected") from None
-            if auth is None or not isinstance(auth.sub, str) or not auth.sub:
-                raise MCPAuthError(OAUTH_TOKEN_INVALID, "The access token has no subject")
+            assert credential is not None and credential.token is not None
+            auth = validate_bearer(credential.token)
             caller = {"authMethod": "oauth", "scopes": list(auth.scopes or []), "oauthSubject": auth.sub}
 
-        # Authorization. With a tool_scopes map the default is deny: an
-        # unlisted tool (or a call with no tool name) never runs.
-        name = tool_call.get("name")
-        tool_name = name if isinstance(name, str) else None
+        # Authorization, by method. With a tool_scopes map the default is deny:
+        # an unlisted tool (or a call with no tool name) never runs. Resources and
+        # prompts are deny by default: only what resource_scopes / prompt_scopes list.
+        # Any other method (resources/list, prompts/list, ping, ...) needs the verified caller only.
         required: List[str]
-        if options.tool_scopes is not None:
-            if tool_name is None or tool_name not in options.tool_scopes:
-                audit(caller, tool_name, {"reason": "tool is not in toolScopes"})
-                raise MCPAuthError(TOOL_NOT_PERMITTED, "This tool is not permitted")
-            required = list(options.tool_scopes[tool_name] or [])
+        method = ctx["method"]
+        if method == "tools/call":
+            if options.tool_scopes is not None:
+                if tool_name is None or tool_name not in options.tool_scopes:
+                    audit(ctx, caller, {"reason": "tool is not in toolScopes"})
+                    raise MCPAuthError(TOOL_NOT_PERMITTED, "This tool is not permitted")
+                required = list(options.tool_scopes[tool_name] or [])
+            else:
+                required = list(options.required_scopes or [])
+        elif method in RESOURCE_METHODS or method in PROMPT_METHODS:
+            resource = method in RESOURCE_METHODS
+            scopes = options.resource_scopes if resource else options.prompt_scopes
+            target = ctx["resourceUri"] if resource else ctx["promptName"]
+            kind = "resource" if resource else "prompt"
+            if scopes is None or target is None or target not in scopes:
+                audit(ctx, caller, {"reason": f"{kind} is not in {kind}Scopes", "reasonCode": f"{kind}_not_permitted"})
+                raise MCPAuthError(RESOURCE_NOT_PERMITTED if resource else PROMPT_NOT_PERMITTED, f"This {kind} is not permitted")
+            required = list(scopes[target] or [])
         else:
-            required = list(options.required_scopes or [])
+            required = []
 
+        # A tool marked require_delegation is not covered by the agent's own authority: only what a chain grants
+        # (the user's consent, say) counts, so a call without one is challenged when needs_authorization is set.
+        tool_settings = (options.tools or {}).get(tool_name) if tool_name is not None else None
+        if isinstance(tool_settings, Mapping) and tool_settings.get("require_delegation") is True and caller["authMethod"] == "kyaos" and caller.get("chain") is None:
+            caller = {**caller, "scopes": []}
+        # KYA-OS story L3-E: a retry after consent carries its resume token and credential (needs_authorization_guard.py).
+        retry = resume_retry(options.needs_authorization, caller, tool_call, tool_name, required)
+        if retry is not None:
+            caller = retry
         missing = next((scope for scope in required if scope not in caller["scopes"]), None)
         if missing is not None:
-            audit(caller, tool_name, {"scope": missing, "reason": "insufficient scope"})
+            # KYA-OS story L3-E: an identified caller without the authority gets a signed challenge instead of the plain 403.
+            try:
+                challenge = challenge_for(options.needs_authorization, caller, tool_name, required) if retry is None else None
+            except Exception as error:
+                # The consent request behind the challenge failed at Helix: the caller's refusal is a 403, Helix's outage a 503.
+                failure = consent_failure_of(error)
+                if failure is None:
+                    raise
+                if failure["kind"] == "unavailable":
+                    raise AuthorizationServerUnavailableError(f"Helix's consent service is unavailable: {failure['message']}") from error
+                audit(ctx, caller, {"scope": missing, "reason": f"consent_refused: {failure['helixCode']}"})
+                raise ToolScopeError(missing, required, f"Required scope: {' '.join(required)}. {failure['message']}") from error
+            if challenge is not None:
+                raise challenge
+            audit(ctx, caller, {"scope": missing, "reason": "insufficient scope"})
             raise ToolScopeError(missing, required)
 
-        audit(caller, tool_name, None)
+        # The level, after the scopes (story C-C): how sure we are the caller is that agent right now.
+        if caller["authMethod"] == "kyaos":
+            required_level = minimum_level_for(level_policy, tool_name)
+            derived = derived_level_of(caller.get("level") or "L1", caller.get("proofAssurance"))
+            if not meets_minimum_level(derived, required_level, l3_minus_satisfies_l3):
+                audit(ctx, caller, {"reason": f"level_insufficient: {derived} < {required_level}", "requiredLevel": required_level})
+                raise LevelError(derived, required_level)
+
+        audit(ctx, caller, None)
+        return _caller_of(caller)
+
+    def middleware(tool_call: MCPToolCall) -> MCPToolCall:
+        authorize(tool_call)
         return tool_call
 
+    middleware.authorize = authorize  # type: ignore[attr-defined]
+    middleware.verifier = local_verifier  # type: ignore[attr-defined]
     return middleware
 
 
@@ -231,22 +503,37 @@ def _on_loop(callback: Callable[..., Any]) -> Callable[..., Any]:
 def async_helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCall], Awaitable[MCPToolCall]]:
     """The same gate for async MCP servers: runs the (blocking, network-bound)
     check in a worker thread so the event loop stays free. `validate_oauth_token`,
-    `audit_sink` and `on_audit_error` may be sync or async here."""
+    `audit_sink`, `on_audit_error` and the verifier settings'
+    `report_verification` may be sync or async here, as may the
+    `needs_authorization` layer's store, authorizer and audit sink (story L3-E).
+    ``await middleware.authorize(tool_call)`` returns the AuthorizedCaller."""
     if options.oauth is not None and options.validate_oauth_token is not None:
         raise ValueError("Provide either `oauth` or `validate_oauth_token`, not both")
+    verifier = options.verifier
+    if isinstance(verifier, LocalVerifierOptions) and verifier.report_verification is not None:
+        verifier = replace(verifier, report_verification=_on_loop(verifier.report_verification))
     bridged = replace(
         options,
+        verifier=verifier,
         validate_oauth_token=_on_loop(options.validate_oauth_token) if options.validate_oauth_token else None,
         audit_sink=_on_loop(options.audit_sink) if options.audit_sink else None,
         on_audit_error=_on_loop(options.on_audit_error) if options.on_audit_error else None,
+        needs_authorization=options.needs_authorization.bridged(_on_loop) if options.needs_authorization is not None else None,
     )
     gate = helixid_mcp_middleware(bridged)
 
-    async def middleware(tool_call: MCPToolCall) -> MCPToolCall:
+    async def authorize(tool_call: MCPToolCall) -> AuthorizedCaller:
         token = _LOOP.set(asyncio.get_running_loop())
         try:
-            return await asyncio.to_thread(gate, tool_call)  # to_thread copies the context, so the bridge sees the loop
+            # to_thread copies the context, so the bridge sees the loop
+            return await asyncio.to_thread(gate.authorize, tool_call)  # type: ignore[attr-defined, no-any-return]
         finally:
             _LOOP.reset(token)
 
+    async def middleware(tool_call: MCPToolCall) -> MCPToolCall:
+        await authorize(tool_call)
+        return tool_call
+
+    middleware.authorize = authorize  # type: ignore[attr-defined]
+    middleware.verifier = gate.verifier  # type: ignore[attr-defined]
     return middleware

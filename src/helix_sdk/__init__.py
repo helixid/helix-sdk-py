@@ -10,9 +10,11 @@ surface (see src/index.ts there).
 SDK-API-only architecture (the SDK-API-only design): every SDK,
 in every language, depends only on the HelixID API -- never on a shared
 "core" package -- except for private-key operations that must stay local:
-keygen, sign, canonical-hash, VPBuilder.sign(). verify_vp(), delegation-VC
-building, DID resolution, and status checks are all API calls made through
-HelixClient.
+keygen, sign, canonical-hash. Delegation-VC building, DID resolution, and
+status checks are API calls made through HelixClient. The Helix VP is gone
+(KYA-OS story C-C): an agent signs each request itself
+(kyaos.with_request_proof), and a service verifies it in-process
+(helix_sdk.verifier.verify, or helix_mcp_middleware).
 
 Agent self-custody has been retired: onboarding (HelixClient.onboard_agent())
 is server-side keygen now, no local keypair, no wallet file. AgentWallet and
@@ -24,11 +26,27 @@ from __future__ import annotations
 
 # Agent
 from .wallet import AgentWallet, WalletCredential
-from .vp_builder import VPBuilder, VPBuilderSignOverrides
+# KYA-OS story F-1: the credential split (identity, capability attestations, delegation hops).
+from .credential_store import (
+    BitstringStatusEntry,
+    CapabilityAttestation,
+    CredentialSigner,
+    CredentialStore,
+    CredentialStoreData,
+    DataIntegrityProof,
+    DelegationHop,
+    PresentedChain,
+    SignAttestationsOptions,
+    StoredCredential,
+    sign_attestation_document,
+)
+from .credentials import (
+    CAPABILITY_ATTESTATION_TYPE,
+    DELEGATION_CREDENTIAL_TYPE,
+    IDENTITY_CREDENTIAL_TYPE,
+    reissue_hop,
+)
 
-# Verifier
-from .verify import verify_vp
-from .scope import check_scope, require_scope
 from .session_manager import SessionManager, SessionClaims, DelegationLink
 
 # Enrollment / issuer API operations
@@ -45,9 +63,99 @@ from .keys import (
     multibase_to_public_key_hex,
 )
 
+# KYA-OS story L1-A: the agent's own Ed25519 key, generated client side; only
+# its public half (JWK, did:key) ever leaves the process. Resolution of did:web
+# and did:key to that key never touches a Helix database.
+from .agent_key import (
+    DEFAULT_AGENT_KEY_ID,
+    AgentKey,
+    AgentPublicKeyJwk,
+    agent_public_key,
+    assert_no_private_material,
+    decode_base58btc,
+    encode_base58btc,
+    generate_agent_key,
+    public_key_from_did_key,
+    public_key_jwk_bytes,
+    to_did_key,
+    to_public_key_jwk,
+)
+from .did_resolver import ResolvedKey, did_key_document, resolve_did, resolve_did_key, resolve_did_web
+# KYA-OS story C-A: Entity Card discovery through a SafeFetch, the strict card schema and the
+# server.json projection, the same names helix-sdk-js's index exports, Python style.
+from .entity_card import (
+    ENTITY_TYPES,
+    KYA_OS_CARD_META_KEY,
+    KYA_OS_CARD_REF_KEY,
+    KYA_OS_CARD_SERVICE_ID,
+    KYA_OS_CARD_SERVICE_TYPE,
+    KYA_OS_CARD_WELL_KNOWN_PATH,
+    PROOF_PROFILE_V1,
+    SAFE_FETCH_MAX_BYTES,
+    SAFE_FETCH_MAX_REDIRECTS,
+    SAFE_FETCH_TIMEOUT_SECONDS,
+    EntityCardError,
+    ResolvedEntityCard,
+    SafeFetchRefusedError,
+    SafeFetchResponse,
+    build_entity_card,
+    capability_name,
+    card_endpoint_of,
+    create_safe_fetch,
+    default_outbound_fetch,
+    did_web_card_url,
+    did_web_document_url,
+    did_web_for,
+    is_raw_did_web_host,
+    own_did_web_problem,
+    entity_card_summary,
+    fetch_entity_card,
+    is_loopback_host,
+    is_public_unicast_address,
+    kya_os_card_service_entry,
+    node_transport,
+    normalize_did,
+    parse_did_web,
+    parse_entity_card,
+    requests_transport,
+    resolve_entity_card,
+    resolve_entity_card_from_server_meta,
+    same_did,
+    server_card_meta,
+    validate_entity_card,
+)
+
+# KYA-OS story F-3: custody preference. helix_init (self-custody onboarding),
+# HelixCustodialSigner (custodial agents sign through the API), the custody
+# API client; the agent runtime takes any Signer (a request proof: helix_sdk.verifier.sign_request_proof).
+from . import custody  # noqa: F401  (helix-sdk-js exports it as the `custody` namespace)
+from .custody import (
+    CustodyApiError,
+    CustodyLabel,
+    DidHostingMode,
+    EnvSigner,
+    HelixCustodialSigner,
+    HelixCustodyClient,
+    HelixInitResult,
+    KeyCustodyMode,
+    Signer,
+    activate_agent,
+    change_to_self_custody,
+    rotate_key,
+    check_own_hosting,
+    helix_init,
+    rotation_proof,
+    verification_method_of,
+)
+
 # Errors
 from .errors import (  # noqa: F401
     HelixError,
+    InvalidJWSError,
+    AuditEventInvalidError,
+    AuditEvidenceError,
+    ResponseProofError,
+    NeedsAuthorizationError,
     map_api_error,
     ValidationError,
     InternalError,
@@ -86,7 +194,6 @@ from .errors import (  # noqa: F401
     VCNotYetValidError,
     VCSignatureInvalidError,
     SelfSignedVCNotAllowedError,
-    VPMissingError,
     VPExpiredError,
     VPVerificationFailedError,
     VPSignatureInvalidError,
@@ -101,33 +208,26 @@ from .errors import (  # noqa: F401
     InsufficientScopeError,
 )
 from . import codes  # noqa: F401
-from .vp_transport import (
-    HELIX_VP_HEADER,
-    HELIX_VP_META_KEY,
-    encode_helix_vp,
-    decode_helix_vp,
-    helix_vp_headers,
-    read_helix_vp_header,
-    read_helix_vp_meta,
-)
 
 __version__ = "2.1.0"  # x-release-please-version
 
 __all__ = [
-    "HELIX_VP_HEADER",
-    "HELIX_VP_META_KEY",
-    "encode_helix_vp",
-    "decode_helix_vp",
-    "helix_vp_headers",
-    "read_helix_vp_header",
-    "read_helix_vp_meta",
     "AgentWallet",
     "WalletCredential",
-    "VPBuilder",
-    "VPBuilderSignOverrides",
-    "verify_vp",
-    "check_scope",
-    "require_scope",
+    "CredentialStore",
+    "sign_attestation_document",
+    "CredentialSigner",
+    "BitstringStatusEntry",
+    "DataIntegrityProof",
+    "StoredCredential",
+    "CapabilityAttestation",
+    "DelegationHop",
+    "CredentialStoreData",
+    "PresentedChain",
+    "SignAttestationsOptions",
+    "IDENTITY_CREDENTIAL_TYPE",
+    "CAPABILITY_ATTESTATION_TYPE",
+    "DELEGATION_CREDENTIAL_TYPE",
     "SessionManager",
     "SessionClaims",
     "DelegationLink",
@@ -139,7 +239,89 @@ __all__ = [
     "verify_signature",
     "public_key_to_multibase",
     "multibase_to_public_key_hex",
+    # KYA-OS story L1-A: the same names helix-sdk-js's index exports, Python style.
+    "DEFAULT_AGENT_KEY_ID",
+    "AgentKey",
+    "AgentPublicKeyJwk",
+    "agent_public_key",
+    "assert_no_private_material",
+    "decode_base58btc",
+    "encode_base58btc",
+    "generate_agent_key",
+    "public_key_from_did_key",
+    "public_key_jwk_bytes",
+    "to_did_key",
+    "to_public_key_jwk",
+    "ResolvedKey",
+    "did_key_document",
+    "resolve_did",
+    "resolve_did_key",
+    "resolve_did_web",
     "HelixError",
     "map_api_error",
     "codes",
+    "custody",
+    "CustodyApiError",
+    "CustodyLabel",
+    "DidHostingMode",
+    "EnvSigner",
+    "HelixCustodialSigner",
+    "HelixCustodyClient",
+    "HelixInitResult",
+    "KeyCustodyMode",
+    "Signer",
+    "activate_agent",
+    "change_to_self_custody",
+    "rotate_key",
+    "reissue_hop",
+    "check_own_hosting",
+    "helix_init",
+    "rotation_proof",
+    "verification_method_of",
+    # KYA-OS story C-A: Entity Cards (helix_sdk.entity_card).
+    "ENTITY_TYPES",
+    "KYA_OS_CARD_META_KEY",
+    "KYA_OS_CARD_REF_KEY",
+    "KYA_OS_CARD_SERVICE_ID",
+    "KYA_OS_CARD_SERVICE_TYPE",
+    "KYA_OS_CARD_WELL_KNOWN_PATH",
+    "PROOF_PROFILE_V1",
+    "SAFE_FETCH_MAX_BYTES",
+    "SAFE_FETCH_MAX_REDIRECTS",
+    "SAFE_FETCH_TIMEOUT_SECONDS",
+    "EntityCardError",
+    "ResolvedEntityCard",
+    "SafeFetchRefusedError",
+    "SafeFetchResponse",
+    "build_entity_card",
+    "capability_name",
+    "card_endpoint_of",
+    "create_safe_fetch",
+    "default_outbound_fetch",
+    "did_web_card_url",
+    "did_web_document_url",
+    "did_web_for",
+    "is_raw_did_web_host",
+    "own_did_web_problem",
+    "entity_card_summary",
+    "fetch_entity_card",
+    "is_loopback_host",
+    "is_public_unicast_address",
+    "kya_os_card_service_entry",
+    "node_transport",
+    "normalize_did",
+    "parse_did_web",
+    "parse_entity_card",
+    "requests_transport",
+    "resolve_entity_card",
+    "resolve_entity_card_from_server_meta",
+    "same_did",
+    "server_card_meta",
+    "validate_entity_card",
+    "kyaos",
 ]
+
+# KYA-OS (story L2-A): canonical JSON hashing, EdDSA JWS and the Signer, the
+# session handshake and the client side of the detached response proof, as
+# one namespace like helix-sdk-js's `kyaos` export.
+from . import kyaos  # noqa: E402

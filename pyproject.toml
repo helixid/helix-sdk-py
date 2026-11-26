@@ -23,8 +23,18 @@ dev = [
     "langchain-core>=0.3; python_version >= '3.10'",
     "crewai>=1.0; python_version >= '3.10'",
 ]
+# MCP Python SDK 2.x (MCPServer, formerly FastMCP); helix_mcp_middleware itself imports only mcp.types.
 mcp-middleware = [
-    "mcp>=1.9,<2; python_version >= '3.10'",
+    "mcp>=2.3,<3; python_version >= '3.10'",
+    # /.well-known/mcp: the discovery document is validated against the KYA-OS schema (story L1-D).
+    "jsonschema>=4.18",
+]
+# KYA-OS replay store clients for helix_mcp_middleware (KYAOS_NONCE_STORE=redis / dynamo).
+redis = [
+    "redis>=5.0",
+]
+dynamo = [
+    "boto3>=1.28",
 ]
 langchain = [
     "langchain-core>=0.3; python_version >= '3.10'",
@@ -33,10 +43,17 @@ crewai = [
     "crewai>=1.0; python_version >= '3.10'",
 ]
 all = [
-    "mcp>=1.9,<2; python_version >= '3.10'",
+    "mcp>=2.3,<3; python_version >= '3.10'",
+    "jsonschema>=4.18",
+    "redis>=5.0",
+    "boto3>=1.28",
     "langchain-core>=0.3; python_version >= '3.10'",
     "crewai>=1.0; python_version >= '3.10'",
 ]
+
+[project.scripts]
+# KYA-OS story F-3: helix-custody init|activate|take
+helix-custody = "helix_sdk.custody:main"
 
 [project.urls]
 Homepage = "https://github.com/helixid/helix-sdk-py"
@@ -52,7 +69,7 @@ where = ["src"]
 helix_sdk = ["py.typed"]
 helix_langchain = ["py.typed"]
 helix_crewai = ["py.typed"]
-helix_mcp_middleware = ["py.typed"]
+helix_mcp_middleware = ["py.typed", "schemas/*.json"]
 
 [tool.pytest.ini_options]
 addopts = [

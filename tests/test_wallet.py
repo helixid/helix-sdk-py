@@ -4,7 +4,7 @@
 # You may obtain a copy of the License at
 #    http://www.apache.org/licenses/LICENSE-2.0
 """
-AgentWallet / VPBuilder tests.
+AgentWallet tests.
 
 Split out of the old test_delegation_flow_mocked.py: that file's
 TestDelegateFlow class tested the wallet-based delegate() function, which
@@ -12,7 +12,8 @@ has been removed (agent self-custody is retired, so nothing produces a
 wallet holding a real agent key to delegate with). AgentWallet itself
 remains -- for other actors' key storage (e.g. an issuer's own key
 material), not for agent onboarding -- so its encrypted persistence and
-local-signing behavior (used by VPBuilder) still need coverage.
+local-signing behavior still need coverage. (VPBuilder is gone with the
+Helix VP, KYA-OS story C-C.)
 """
 
 from __future__ import annotations
@@ -27,13 +28,12 @@ import pytest
 from helix_sdk import (
     AgentWallet,
     HelixClient,
-    VPBuilder,
     generate_key_pair,
     public_key_to_multibase,
     verify_signature,
 )
 from helix_sdk.errors import CredentialAlreadyInWalletError, CredentialNotForThisAgentError
-from helix_sdk.vp_crypto import hash_canonical_payload
+from helix_sdk.crypto.common import hash_canonical_payload
 
 
 def _build_agent_vc(did: str, scopes: List[str], max_delegation_depth: int = 0) -> Dict[str, Any]:
@@ -75,9 +75,9 @@ def _build_grant_vc(agent_did: str, issuer_did: str, user_did: str, scopes: List
 
 
 def _decode_proof_value(proof_value: str) -> str:
-    from helix_sdk.vp_crypto import base58btc_decode
+    from helix_sdk.crypto.common import base58btc_decode
 
-    # VPBuilder writes the signature as plain base58btc, with no multibase "z"
+    # create_ed25519_proof writes the signature as plain base58btc, with no multibase "z"
     # prefix. Do not strip a leading "z": about 1 signature in 280 happens to
     # start with one, and dropping it corrupts the value (this test used to
     # fail at that rate).
@@ -90,11 +90,13 @@ def wallet_dir():
         yield d
 
 
-class TestVPBuilderAgainstWalletCredentials:
-    def test_build_and_verify_signed_vp_round_trip(self, wallet_dir: str) -> None:
-        """No server needed for this one: VPBuilder.sign() is local, and
-        we verify the resulting proof with the same local primitives a
+class TestLocalSigningWithWalletCredentials:
+    def test_sign_and_verify_a_linked_data_proof_round_trip(self, wallet_dir: str) -> None:
+        """No server needed for this one: signing with the wallet's key is local,
+        and we verify the resulting proof with the same local primitives a
         verifier's DID-resolution step would end up using."""
+        from helix_sdk.proof import create_ed25519_proof
+
         client = HelixClient()  # SDK-only mode
         key_pair = generate_key_pair()
         did = f"did:key:{public_key_to_multibase(key_pair.public_key)}"
@@ -107,15 +109,13 @@ class TestVPBuilderAgainstWalletCredentials:
 
         wallet.wallet_credentials.append(WalletCredential.from_vc(vc["id"], vc))
 
-        vp = VPBuilder(
-            credentials=wallet.credentials, holder_did=did, target_service="https://svc.example.invalid"
-        ).sign(wallet.get_private_key_hex(), f"{did}#key-1")
+        payload = {"holder": did, "verifiableCredential": wallet.credentials}
+        proof = create_ed25519_proof(payload, wallet.get_private_key_hex(), f"{did}#key-1")
 
-        payload = {k: v for k, v in vp.items() if k != "proof"}
         payload_hash = hash_canonical_payload(payload)
         assert verify_signature(
             payload_hash,
-            _decode_proof_value(vp["proof"]["proofValue"]),
+            _decode_proof_value(proof["proofValue"]),
             key_pair.public_key,
         )
 
@@ -194,3 +194,67 @@ class TestWalletCredentialQueries:
         assert latest_grant.vc_id == grant_vc["id"]
 
         assert wallet.get_latest_credential("NoSuchType") is None
+
+
+class TestConsentGrantAudit:
+    def test_storing_a_grant_records_a_typed_consent_approved_event(self, wallet_dir: str) -> None:
+        recorded: List[Dict[str, Any]] = []
+
+        class FakeClient:
+            def record_audit_event(self, event: Dict[str, Any]) -> None:
+                recorded.append(event)
+
+            def audit_sink(self) -> Any:
+                from helix_sdk.audit import CallbackAuditSink
+
+                return CallbackAuditSink(lambda entry: self.record_audit_event(entry.event))
+
+        key_pair = generate_key_pair()
+        agent_did = f"did:key:{public_key_to_multibase(key_pair.public_key)}"
+        wallet = AgentWallet(private_key_hex=key_pair.private_key, did_value=agent_did, client=FakeClient())  # type: ignore[arg-type]
+        grant = _build_grant_vc(agent_did, "did:web:sp.example.com", "did:key:zUser", ["read:orders"])
+        wallet.add_credential(grant)
+        wallet.add_credential(_build_agent_vc(agent_did, ["read:orders"]))  # not a grant: nothing recorded
+        assert len(recorded) == 1
+        event = recorded[0]
+        from helix_sdk.audit import AUDIT_BINDING_MCP, validate_audit_event
+
+        assert validate_audit_event(event) == (True, event)
+        assert event["eventType"] == "consent.approved" and event["binding"] == AUDIT_BINDING_MCP
+        assert event["actor"] == {"kind": "pairwise_did", "did": agent_did}
+        assert event["responsibleParty"] == {"kind": "public_did", "did": "did:key:zUser"}
+        assert event["resource"] == {"kind": "public_did", "did": "did:web:sp.example.com"}
+        assert event["action"] == {"category": "consent"} and event["outcome"] == "succeeded"
+        assert event["details"] == {"family": "consent", "phase": "approved", "consentRef": grant["id"]}
+        assert event["source"] == {"producer": {"kind": "pairwise_did", "did": agent_did}, "sourceId": f"helix-sdk-py:{agent_did}", "sourceSequence": "1"}
+        assert event["tenantRef"] == {"kind": "pairwise_did", "did": agent_did}
+        # One source per wallet: the next grant is sequence 2 and names the first as its predecessor.
+        from helix_sdk.audit import audit_event_digest
+
+        wallet.add_credential(_build_grant_vc(agent_did, "did:web:sp.example.com", "did:key:zUser", ["write:orders"]))
+        assert len(recorded) == 2
+        assert recorded[1]["source"]["sourceSequence"] == "2"
+        assert recorded[1]["source"]["previousSourceEventDigest"] == audit_event_digest(event)
+
+    def test_audit_failures_and_odd_shapes_never_surface(self, wallet_dir: str) -> None:
+        class BrokenClient:
+            def record_audit_event(self, event: Dict[str, Any]) -> None:
+                raise RuntimeError("API down")
+
+            def audit_sink(self) -> Any:
+                from helix_sdk.audit import CallbackAuditSink
+
+                return CallbackAuditSink(lambda entry: self.record_audit_event(entry.event))
+
+        key_pair = generate_key_pair()
+        agent_did = f"did:key:{public_key_to_multibase(key_pair.public_key)}"
+        wallet = AgentWallet(private_key_hex=key_pair.private_key, did_value=agent_did, client=BrokenClient())  # type: ignore[arg-type]
+        grant = _build_grant_vc(agent_did, "did:web:sp.example.com", "did:key:zUser", ["read:orders"])
+        wallet.add_credential(grant)
+        # An issuer object and no userDid are fine too; the credential is stored either way.
+        odd = _build_grant_vc(agent_did, "did:web:sp.example.com", "did:key:zUser", ["read:orders"])
+        odd["issuer"] = {"id": "did:web:sp.example.com"}
+        del odd["credentialSubject"]["userDid"]
+        wallet.add_credential(odd)
+        assert [c.vc_id for c in wallet.wallet_credentials] == [grant["id"], odd["id"]]
+

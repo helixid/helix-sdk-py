@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, TypeVar
 
-from helix_sdk.tool_vp import get_agent_scopes
+from helix_sdk.agent_scopes import get_agent_scopes
 
 if TYPE_CHECKING:
     from helix_sdk import HelixClient

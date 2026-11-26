@@ -19,7 +19,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 from urllib.parse import quote_plus, urlsplit
 
 from cryptography.exceptions import InvalidSignature
@@ -39,6 +39,18 @@ class AuthResult:
     scopes: Sequence[str] = ()
     client_id: Optional[str] = None
     claims: Optional[Dict[str, Any]] = None
+    cnf_jkt: Optional[str] = None
+    """The token's RFC 9449 ``cnf.jkt`` when it is sender-constrained: fused with a
+    KYA-OS request proof's ``cnf`` for L3 (story C-C, SPEC-ENTITY-CARD section 8.6)."""
+
+
+def cnf_jkt_of(claims: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """``claims["cnf"]["jkt"]`` when it is a non-empty string, else None."""
+    cnf = claims.get("cnf") if isinstance(claims, Mapping) else None
+    if not isinstance(cnf, Mapping):
+        return None
+    jkt = cnf.get("jkt")
+    return jkt if isinstance(jkt, str) and jkt else None
 
 
 @dataclass
@@ -244,7 +256,7 @@ def _check_standard_claims(
         sub = client_id if sub_from_client_id else None
     if not sub:
         raise _invalid("Token has no subject")
-    return AuthResult(sub=sub, scopes=_parse_scopes(claims, options.scope_claims), client_id=client_id, claims=claims)
+    return AuthResult(sub=sub, scopes=_parse_scopes(claims, options.scope_claims), client_id=client_id, claims=claims, cnf_jkt=cnf_jkt_of(claims))
 
 
 def _public_key(jwk: Dict[str, Any]) -> Any:
