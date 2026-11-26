@@ -617,12 +617,22 @@ def _activate(result: HelixInitResult, enrollment_token: str, client: HelixCusto
     active = client.activate(result.did, enrollment_token)
     result.status = active.get("status", result.status)
     result.vc_id = active.get("vcId") or result.vc_id
-    # The card now carries the agent's attestations; the owner republishes it.
+    # Helix issues an own-hosted agent's credentials at enrollment, so the card
+    # written then is final and activation returns the same one. An older Helix
+    # issues them only now: the card changes and the owner republishes it.
     card = (active.get("documents") or {}).get("card")
-    if card is not None:
+    if card is not None and not _same_json_file(result.files["card"], card):
         _write_json(result.files["card"], card)
         result.card_updated = True
     return result
+
+
+def _same_json_file(path: str, value: Any) -> bool:
+    """Whether the JSON file at ``path`` holds ``value`` (False when it cannot be read)."""
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8")) == value
+    except (OSError, ValueError):
+        return False
 
 
 def activate_agent(
@@ -789,12 +799,13 @@ def _print_init(result: HelixInitResult, out_dir: str, out: TextIO) -> None:
     _report(result, out)
     _print_republish(result, out)
     if result.status == "pending_resolution":
-        out.write("\nPublish the two documents, then activate:\n")
+        out.write("\nPublish the two documents on your domain:\n")
         out.write(f"  {result.files['did_document']}  ->  {result.did_document_url}\n")
         out.write(f"  {result.files['card']}  ->  {result.card_url}\n")
         if result.resolution and not result.resolution.get("ok"):
             out.write(f"  (not resolving yet: {result.resolution.get('reason')})\n")
-        out.write(f"  helix-custody activate --token <token> --out {out_dir}\n")
+        out.write("Helix activates the agent once both resolve: it checks in the background, and in the console when the agent is open.\n")
+        out.write(f"To check now: helix-custody activate --token <token> --out {out_dir}\n")
 
 
 def _print_activate(result: HelixInitResult, out: TextIO) -> None:
