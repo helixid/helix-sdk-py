@@ -390,8 +390,30 @@ def test_helix_init_on_own_hosting_then_activate(tmp_path: Path) -> None:
     assert later.status == "pending_resolution" and later.resolution is None
 
 
+def test_activation_keeps_a_final_card_json(tmp_path: Path) -> None:
+    """A Helix that issues the credentials at enrollment returns the same card on activation: card.json is final, not rewritten."""
+    did = "did:web:owner.example:agents:final"
+    origin = "https://owner.example/agents/final"
+    served: Dict[str, Any] = {}
+
+    def fetch_json(url: str) -> Any:
+        if url not in served:
+            raise RuntimeError(f"404 {url}")
+        return served[url]
+
+    helix_init("https://helix.example", "enroll:t", str(tmp_path), did=did, http=init_api(did, "own", origin, "pending_resolution"), fetch_json=fetch_json, generate_key=fixed_key)
+    written = json.loads((tmp_path / "card.json").read_text())
+    before = (tmp_path / "card.json").stat().st_mtime_ns
+    served[f"{origin}/did.json"] = json.loads((tmp_path / "did.json").read_text())
+    served[f"{origin}/card.json"] = written
+    active = activate_agent("https://helix.example", "enroll:t", str(tmp_path), http=init_api(did, "own", origin, "pending_resolution", activated_card=written), fetch_json=fetch_json)
+    assert (active.status, active.card_updated) == ("active", False)
+    assert (tmp_path / "card.json").stat().st_mtime_ns == before
+    assert json.loads((tmp_path / "card.json").read_text()) == written
+
+
 def test_activation_rewrites_card_json_with_the_card_helix_returns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """F-3 parity: on activation the card comes back with the agent's attestations, for the owner to republish."""
+    """F-3 parity, an older Helix: on activation the card comes back with the agent's attestations, for the owner to republish."""
     did = "did:web:owner.example:agents:carded"
     origin = "https://owner.example/agents/carded"
     carded = {"id": did, "entityType": "agent", "name": "Bot", "capabilities": [{"name": "orders:read", "attestations": [{"vc": {"id": "att:1"}}]}], "responsibleParty": "did:web:helix.example"}
@@ -425,6 +447,8 @@ def test_activation_rewrites_card_json_with_the_card_helix_returns(tmp_path: Pat
     code, out, _ = _run("activate", "--token", "enroll:t", "--out", str(out_dir), "--api-url", "https://h")
     assert code == 0
     assert out == f"\u2713 Agent active: {did}\n\ncard.json now carries the attestations Helix issued; republish it:\n  {out_dir / 'card.json'}  ->  {origin}/card.json\n"
+    # --json carries the flag; card.json is back to the enrollment card, so the activation changes it again.
+    (out_dir / "card.json").write_text(json.dumps(card), encoding="utf-8")
     code, out, _ = _run("activate", "--token", "enroll:t", "--out", str(out_dir), "--api-url", "https://h", "--json")
     assert json.loads(out)["cardUpdated"] is True
 
@@ -604,10 +628,12 @@ def test_cli_own_hosting_pending_then_activate(tmp_path: Path, monkeypatch: pyte
     code, out, _ = _run("init", "--token", "enroll:t", "--out", str(tmp_path / "b"), "--api-url", "https://h", "--did", did)
     assert code == 0
     assert out.startswith(f"\u26a0 Agent enrolled, waiting for its documents on your domain: {did}")
-    assert "Publish the two documents, then activate:" in out
+    assert "Publish the two documents on your domain:" in out
+    assert "Helix activates the agent once both resolve" in out
+    assert "then activate" not in out
     assert f"{tmp_path / 'b' / 'did.json'}  ->  https://owner.example/agents/bot/did.json" in out
     assert "(not resolving yet: not published)" in out
-    assert f"helix-custody activate --token <token> --out {tmp_path / 'b'}" in out
+    assert f"To check now: helix-custody activate --token <token> --out {tmp_path / 'b'}" in out
 
     code, out, _ = _run("activate", "--token", "enroll:t", "--out", str(tmp_path / "b"), "--api-url", "https://h")
     assert (code, out) == (0, "\u26a0 Not active yet: not published\n")
