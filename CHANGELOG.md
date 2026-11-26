@@ -1,5 +1,13 @@
 # Changelog
 
+## [3.1.0](https://github.com/helixid/helix-sdk-py/compare/helixid-sdk-py-v3.0.0...helixid-sdk-py-v3.1.0) (2026-11-26)
+
+
+### Features
+
+* **custody:** keep a final card.json on activation; say Helix activates on its own ([93d53e5](https://github.com/helixid/helix-sdk-py/commit/93d53e5e38aff7127d04940aae52bf6c27726539))
+* **custody:** keep the final card.json; Helix activates on its own ([3da7dd2](https://github.com/helixid/helix-sdk-py/commit/3da7dd24310de907bb09a6df5da0794ad3afc838))
+
 ## [3.0.0](https://github.com/helixid/helix-sdk-py/compare/helixid-sdk-py-v2.1.0...helixid-sdk-py-v3.0.0) (2026-11-26)
 
 
