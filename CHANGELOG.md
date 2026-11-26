@@ -1,5 +1,22 @@
 # Changelog
 
+## [3.0.0](https://github.com/helixid/helix-sdk-py/compare/helixid-sdk-py-v2.1.0...helixid-sdk-py-v3.0.0) (2026-11-26)
+
+
+### ⚠ BREAKING CHANGES
+
+* VP-based verification and the delegate-authority APIs are removed; agents sign each call with a KYA-OS request proof.
+
+### Features
+
+* KYA-OS conformance ([ada0f04](https://github.com/helixid/helix-sdk-py/commit/ada0f046841ad8f1e81ac0d6f6a755bea9d88476))
+* **mcp-middleware:** MCP SDK 2, one-line ASGI gate, parity with sdk-js ([2d22454](https://github.com/helixid/helix-sdk-py/commit/2d2245452b9ceba7d1b75ce636379cd86373ffbe))
+
+
+### Documentation
+
+* services bind the Helix issuer to its status list (Harish's pick (i)) ([c70efcb](https://github.com/helixid/helix-sdk-py/commit/c70efcbc184ab69b7310238c1e4d2fe04e2937b9))
+
 ## [2.1.0](https://github.com/helixid/helix-sdk-py/compare/helixid-sdk-py-v2.0.0...helixid-sdk-py-v2.1.0) (2026-11-15)
 
 
