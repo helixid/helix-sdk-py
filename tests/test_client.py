@@ -6,9 +6,10 @@
 """
 HelixClient tests against a stubbed HTTP layer.
 
-With agent self-custody retired, onboard_agent()/sign_vp()/
-delegate_authority() are the whole agent-side surface: the server holds the
-key, and the client only shapes requests and unwraps responses. These pin
+With agent self-custody retired, onboard_agent() is the custodial
+agent-side surface: the server holds the key, and the client only shapes
+requests and unwraps responses. sign_vp()/verify_vp() are gone with the
+Helix VP (KYA-OS story C-C), delegate_authority() with F-1's follow-up. These pin
 the routes, auth headers, and bodies for both core (admin key) and
 enterprise (account API key) modes, plus how API errors surface. No network
 access or running helix-api instance needed.
@@ -94,8 +95,6 @@ class TestSdkOnlyMode:
         "call",
         [
             lambda c: c.onboard_agent("token"),
-            lambda c: c.sign_vp(AGENT_DID, "orders"),
-            lambda c: c.delegate_authority(AGENT_DID, "did:key:z6Mkchild", ["read:orders"], 3600),
             lambda c: c.list_vcs(),
         ],
     )
@@ -117,16 +116,33 @@ class TestCoreMode:
         assert call.json == {"enrollmentToken": "enroll-token", "domains": ["https://agent.example.com"]}
         assert call.headers["x-admin-api-key"] == "admin"
 
-    def test_sign_vp_hits_the_admin_route_with_optional_fields(self, http) -> None:
-        http.respond(200, {"signedVP": {"id": "vp-1"}})
+    def test_the_helix_vp_methods_are_gone(self) -> None:
         client = HelixClient(BASE_URL, admin_api_key="admin")
+        assert not hasattr(client, "sign_vp") and not hasattr(client, "verify_vp")
 
-        vp = client.sign_vp(AGENT_DID, "orders", user_did="did:web:user")
-
-        assert vp == {"id": "vp-1"}
-        call = http.calls[0]
-        assert call.url == f"{BASE_URL}/v1/agents/did%3Aweb%3Ahelix.test%3Aagents%3Aa1/vp"
-        assert call.json == {"targetService": "orders", "userDid": "did:web:user"}
+    def test_did_lifecycle_calls(self, http) -> None:
+        client = HelixClient(BASE_URL, admin_api_key="admin")
+        http.respond(201, {"did": "did:web:helix.test:agents:new", "didDocument": {"id": "did:web:helix.test:agents:new"}, "hederaTransactionId": "tx"})
+        created = client.create_did("agent", domains=["https://a.example"])
+        assert created["did"] == "did:web:helix.test:agents:new" and created["hederaTransactionId"] == "tx"
+        assert http.calls[-1].json["subjectType"] == "agent" and http.calls[-1].json["domains"] == ["https://a.example"]
+        http.respond(201, {"didDocument": {"id": "did:web:x"}})
+        assert client.create_did("user")["did"] == "did:web:x"
+        http.respond(200, {"didDocument": {"id": AGENT_DID}})
+        assert client.resolve_did(AGENT_DID, live=True) == {"did": AGENT_DID, "didDocument": {"id": AGENT_DID}, "source": "hedera"}
+        assert http.calls[-1].url.endswith("?live=true")
+        http.respond(200, {"id": AGENT_DID})
+        assert client.resolve_did(AGENT_DID)["source"] == "cache"
+        http.respond(200, {"id": AGENT_DID, "service": [{"id": "#s"}]})
+        assert client.add_service_endpoint(AGENT_DID, {"id": "#s"})["didDocument"]["service"] == [{"id": "#s"}]
+        http.respond(200, {"id": AGENT_DID})
+        assert client.remove_service_endpoint(AGENT_DID, "#s")["did"] == AGENT_DID
+        assert http.calls[-1].method == "DELETE" and http.calls[-1].url.endswith("/services/%23s")
+        http.respond(200, {})
+        assert client.deactivate_did(AGENT_DID, "retired") == {"did": AGENT_DID, "deactivated": True}
+        http.respond(201, {"id": "vc-1"})
+        assert client.issue_vc(subjectDid=AGENT_DID)["id"] == "vc-1"
+        assert http.calls[-1].json["expiresInSeconds"] == 7_776_000
 
     def test_create_service_posts_to_v1_services(self, http) -> None:
         http.respond(201, {"serviceDid": "did:web:helix.test:services:s1", "serviceName": "orders"})
@@ -139,84 +155,6 @@ class TestCoreMode:
         assert (call.method, call.url) == ("POST", f"{BASE_URL}/v1/services")
         assert call.json == {"serviceName": "orders", "displayName": "Orders", "verifiedDomain": "https://orders.example"}
 
-    def test_issue_service_delegation_grant_unwraps_the_grant(self, http) -> None:
-        http.respond(201, {"grantVC": {"id": "vc:helix:grant:1", "issuer": "did:web:helix.test:services:s1"}})
-        client = HelixClient(BASE_URL, admin_api_key="admin")
-
-        grant = client.issue_service_delegation_grant(
-            "did:web:helix.test:services:s1", AGENT_DID, "did:web:mock.local:users:alice", ["read:calendar"]
-        )
-
-        assert grant["id"] == "vc:helix:grant:1"
-        call = http.calls[0]
-        assert (call.method, call.url) == ("POST", f"{BASE_URL}/v1/service-delegation-grants")
-        assert call.json == {
-            "serviceDid": "did:web:helix.test:services:s1",
-            "agentDid": AGENT_DID,
-            "userDid": "did:web:mock.local:users:alice",
-            "scopes": ["read:calendar"],
-            "durability": "standing",
-        }
-
-    def test_issue_service_delegation_grant_sends_revoke_existing_only_when_asked(self, http) -> None:
-        http.respond(201, {"grantVC": {"id": "vc:helix:grant:2"}})
-        client = HelixClient(BASE_URL, admin_api_key="admin")
-
-        client.issue_service_delegation_grant(
-            "did:web:helix.test:services:s1",
-            AGENT_DID,
-            "did:web:mock.local:users:alice",
-            ["read:calendar"],
-            revoke_existing=True,
-        )
-
-        assert http.calls[0].json["revokeExisting"] is True
-
-    def test_issue_service_delegation_grant_sends_allow_delegation_only_when_given(self, http) -> None:
-        http.respond(201, {"grantVC": {"id": "vc:helix:grant:3"}})
-        http.respond(201, {"grantVC": {"id": "vc:helix:grant:4"}})
-        client = HelixClient(BASE_URL, admin_api_key="admin")
-
-        client.issue_service_delegation_grant(
-            "did:web:helix.test:services:s1", AGENT_DID, "did:web:mock.local:users:alice", ["read:calendar"],
-            allow_delegation=False,
-        )
-        client.issue_service_delegation_grant(
-            "did:web:helix.test:services:s1", AGENT_DID, "did:web:mock.local:users:alice", ["read:calendar"],
-        )
-
-        assert http.calls[0].json["allowDelegation"] is False
-        assert "allowDelegation" not in http.calls[1].json
-
-    def test_get_agent_scopes_reads_the_agent_scopes_for_a_service(self, http) -> None:
-        http.respond(200, {"agentDid": AGENT_DID, "scopes": ["read:calendar"]})
-        client = HelixClient(BASE_URL, admin_api_key="admin")
-
-        result = client.get_agent_scopes("did:web:helix.test:services:s1", AGENT_DID)
-
-        assert result == {"agentDid": AGENT_DID, "scopes": ["read:calendar"]}
-        call = http.calls[0]
-        assert call.method == "GET"
-        assert call.url.startswith(f"{BASE_URL}/v1/service-delegation-grants/agent-scopes?")
-        assert "serviceDid=did%3Aweb%3Ahelix.test%3Aservices%3As1" in call.url
-        assert f"agentDid={AGENT_DID.replace(':', '%3A')}" in call.url
-
-    def test_sign_vp_omits_unset_optional_fields(self, http) -> None:
-        http.respond(200, {"signedVP": {"id": "vp-1"}})
-        HelixClient(BASE_URL, admin_api_key="admin").sign_vp(AGENT_DID, "orders")
-        assert http.calls[0].json == {"targetService": "orders"}
-
-    def test_delegate_authority_returns_the_delegated_vc(self, http) -> None:
-        http.respond(200, {"delegatedVC": {"id": "vc-child"}})
-        client = HelixClient(BASE_URL, admin_api_key="admin")
-
-        vc = client.delegate_authority(AGENT_DID, "did:key:z6Mkchild", ["read:orders"], 3600, vc_id="vc-1")
-
-        assert vc == {"id": "vc-child"}
-        call = http.calls[0]
-        assert call.url == f"{BASE_URL}/v1/agents/did%3Aweb%3Ahelix.test%3Aagents%3Aa1/delegate"
-        assert call.json == {"to": "did:key:z6Mkchild", "scopes": ["read:orders"], "expiresIn": 3600, "vcId": "vc-1"}
-
     @pytest.mark.parametrize(
         "code, error_type",
         [
@@ -227,9 +165,7 @@ class TestCoreMode:
     def test_delegation_refusals_map_to_typed_errors(self, http, code, error_type) -> None:
         http.respond(400, {"error": {"code": code, "message": "refused"}})
         with pytest.raises(error_type):
-            HelixClient(BASE_URL, admin_api_key="admin").delegate_authority(
-                AGENT_DID, "did:key:z6Mkchild", ["read:orders"], 3600
-            )
+            HelixClient(BASE_URL, admin_api_key="admin").get_vc("vc-1")
 
     def test_unknown_error_code_keeps_code_and_status(self, http) -> None:
         http.respond(418, {"error": {"code": "SOMETHING_NEW", "message": "teapot"}})
@@ -274,34 +210,21 @@ class TestCoreMode:
 
 class TestEnterpriseMode:
     def test_api_key_alone_defaults_to_the_hosted_api(self, http) -> None:
-        http.respond(200, {"signedVP": {"id": "vp-1"}})
-        HelixClient(api_key="hak_test").sign_vp(AGENT_DID, "orders")
-        assert http.calls[0].url.startswith("https://api.helixid.dev/v1/custodial-agents/")
-
-    def test_sign_vp_uses_the_custodial_route_and_bearer_token(self, http) -> None:
-        http.respond(200, {"signedVP": {"id": "vp-1"}})
-        client = HelixClient(BASE_URL, api_key="hak_test")
-
-        vp = client.sign_vp(AGENT_DID, "orders")
-
-        assert vp == {"id": "vp-1"}
-        call = http.calls[0]
-        assert call.url == f"{BASE_URL}/v1/custodial-agents/did%3Aweb%3Ahelix.test%3Aagents%3Aa1/vp"
-        assert call.headers["authorization"] == "Bearer hak_test"
-        assert call.json == {"targetService": "orders"}
+        http.respond(200, [])
+        HelixClient(api_key="hak_test").list_vcs(subject_did=AGENT_DID)
+        assert http.calls[0].url.startswith("https://api.helixid.dev/v1/")
 
     def test_every_call_carries_the_bearer_token_not_an_admin_header(self, http) -> None:
-        # The grant route and the VC lifecycle routes used to go out with no
-        # credential at all in enterprise mode (only the custodial routes
-        # set the bearer token), so enterprise answered 403.
-        http.respond(201, {"grantVC": {"id": "vc-grant"}})
+        # The VC lifecycle routes used to go out with no credential at all in
+        # enterprise mode (only the custodial routes set the bearer token), so
+        # enterprise answered 403.
+        http.respond(200, {"vcId": "vc-grant", "revoked": True})
         client = HelixClient(BASE_URL, api_key="hak_test")
 
-        vc = client.issue_service_delegation_grant("did:web:sp", AGENT_DID, "did:key:z6Mkuser", ["read:orders"])
+        client.revoke_vc("vc-grant")
 
-        assert vc == {"id": "vc-grant"}
         call = http.calls[0]
-        assert call.url == f"{BASE_URL}/v1/service-delegation-grants"
+        assert call.url.startswith(f"{BASE_URL}/v1/vcs/")
         assert call.headers["authorization"] == "Bearer hak_test"
         assert "x-admin-api-key" not in call.headers
 
@@ -322,22 +245,10 @@ class TestEnterpriseMode:
         HelixClient(BASE_URL, api_key="hak_test").renew_vc("vc-1")
         assert http.calls[0].headers["authorization"] == "Bearer hak_test"
 
-    def test_delegate_authority_uses_the_custodial_route(self, http) -> None:
-        http.respond(200, {"delegatedVC": {"id": "vc-child"}})
-        client = HelixClient(BASE_URL, api_key="hak_test")
-
-        vc = client.delegate_authority(AGENT_DID, "did:key:z6Mkchild", ["read:orders"], 3600)
-
-        assert vc == {"id": "vc-child"}
-        call = http.calls[0]
-        assert call.url == f"{BASE_URL}/v1/custodial-agents/did%3Aweb%3Ahelix.test%3Aagents%3Aa1/delegate"
-        assert call.headers["authorization"] == "Bearer hak_test"
-
     @pytest.mark.parametrize(
         "method",
         [
-            lambda c: c.sign_vp(AGENT_DID, "orders"),
-            lambda c: c.delegate_authority(AGENT_DID, "did:key:z6Mkchild", ["read:orders"], 3600),
+            lambda c: c.list_vcs(subject_did=AGENT_DID),
         ],
     )
     def test_custodial_route_errors_are_mapped(self, http, method) -> None:
@@ -348,11 +259,47 @@ class TestEnterpriseMode:
     @pytest.mark.parametrize(
         "method",
         [
-            lambda c: c.sign_vp(AGENT_DID, "orders"),
-            lambda c: c.delegate_authority(AGENT_DID, "did:key:z6Mkchild", ["read:orders"], 3600),
+            lambda c: c.list_vcs(subject_did=AGENT_DID),
         ],
     )
     def test_custodial_route_error_without_json_is_internal(self, http, method) -> None:
         http.respond(500)
         with pytest.raises(InternalError):
             method(HelixClient(BASE_URL, api_key="hak_test"))
+
+
+class TestAuditLog:
+    def test_get_audit_log_returns_one_page_and_passes_filters_and_cursor(self, http) -> None:
+        page = {"items": [{"id": "1", "recordedAt": "t", "eventDigest": "sha256:" + "0" * 64, "event": {"eventType": "consent.approved"}}], "nextCursor": "abc_-1"}
+        http.respond(200, page)
+        client = HelixClient(BASE_URL, api_key="hak")
+        assert client.get_audit_log(event_type="consent.approved", since="2026-01-01", limit=5, family="consent", cursor="prev") == page
+        assert http.calls[0].url == BASE_URL + "/v1/audit-log?eventType=consent.approved&family=consent&since=2026-01-01&cursor=prev&limit=5"
+        http.respond(200, {"items": [], "nextCursor": None})
+        assert client.get_audit_log() == {"items": [], "nextCursor": None} and http.calls[1].url == BASE_URL + "/v1/audit-log"
+
+    def test_record_audit_event_posts_the_event_and_lets_a_refusal_propagate(self, http) -> None:
+        event = {"eventType": "consent.approved", "schema": "x"}
+        http.respond(201, {"recorded": True})
+        HelixClient(BASE_URL, api_key="hak").record_audit_event(event)
+        assert (http.calls[0].method, http.calls[0].url, http.calls[0].json) == ("POST", BASE_URL + "/v1/audit-log/events", event)
+        assert http.calls[0].headers["authorization"] == "Bearer hak"
+        # A refusal propagates (as in the JS client): a producer that must not fail catches it.
+        http.respond(400, {"error": {"code": "AUDIT_EVENT_INVALID", "message": "bad"}})
+        with pytest.raises(HelixError) as refused:
+            HelixClient(BASE_URL, admin_api_key="admin").record_audit_event(event)
+        assert refused.value.code == "AUDIT_EVENT_INVALID"
+        assert len(http.calls) == 2
+        # Without a key (or without an API) it is a no-op.
+        HelixClient(BASE_URL).record_audit_event(event)
+        HelixClient().record_audit_event(event)
+        assert len(http.calls) == 2
+
+    def test_audit_sink_reports_each_entry_through_record_audit_event(self, http) -> None:
+        from helix_sdk.audit import AuditTrail, pairwise_did
+
+        http.respond(201, {"recorded": True})
+        trail = AuditTrail(sink=HelixClient(BASE_URL, api_key="hak").audit_sink(), source_id="s", producer=pairwise_did("did:key:zA"), tenant_ref=pairwise_did("did:key:zA"))
+        entry = trail.record({"eventType": "session.established", "action": {"category": "session"}, "outcome": "succeeded", "details": {"family": "session", "phase": "established"}})
+        assert (http.calls[0].url, http.calls[0].json) == (BASE_URL + "/v1/audit-log/events", entry.event)
+

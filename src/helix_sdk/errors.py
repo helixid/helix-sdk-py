@@ -15,7 +15,7 @@ caller already knows from the JS SDK or from helix-api's error responses.
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 from . import codes
 
@@ -295,11 +295,6 @@ class InsufficientScopeError(HelixError):
         super().__init__(codes.INSUFFICIENT_SCOPE, f"Required scope: {required_scope}", 403)
 
 
-class VPMissingError(HelixError):
-    def __init__(self, message: str = 'No Verifiable Presentation in the X-Helix-VP header or MCP _meta["x-helix-vp"]') -> None:
-        super().__init__(codes.VP_MISSING, message, 401)
-
-
 class VPNotFoundError(HelixError):
     def __init__(self, message: str = "VP not found") -> None:
         super().__init__(codes.VP_NOT_FOUND, message, 404)
@@ -361,6 +356,52 @@ class VPMultipleActiveVCError(HelixError):
 class InvalidJWTError(HelixError):
     def __init__(self, message: str = "JWT is invalid") -> None:
         super().__init__(codes.JWT_INVALID, message, 400)
+
+
+class InvalidJWSError(HelixError):
+    """A compact JWS that does not verify (KYA-OS L1.3 to L1.5). ``reason`` is
+    one of helix_sdk.crypto.jws.JwsReasons, the same strings helix-core uses."""
+
+    def __init__(self, reason: str, message: str = "JWS is invalid") -> None:
+        super().__init__(codes.JWS_INVALID, message, 400, {"reason": reason})
+        self.reason = reason
+
+
+class ResponseProofError(HelixError):
+    """A KYA-OS detached response proof that does not bind the call it answers
+    (story L2-A). ``reason`` is one of helix_sdk.response_proof.ProofReasons."""
+
+    def __init__(self, reason: str, message: str = "Response proof is invalid") -> None:
+        super().__init__(codes.RESPONSE_PROOF_INVALID, message, 400, {"reason": reason})
+        self.reason = reason
+
+
+class NeedsAuthorizationError(HelixError):
+    """A KYA-OS ``needs_authorization`` challenge that cannot be acted on
+    (story L3-E): the proof verified but is not a challenge's, or the
+    challenge is malformed, its authorizationUrl is not http(s), or it has
+    expired. ``reason`` is one of helix_sdk.needs_authorization.ChallengeReasons."""
+
+    def __init__(self, reason: str, message: str = "needs_authorization challenge is invalid") -> None:
+        super().__init__(codes.NEEDS_AUTHORIZATION_INVALID, message, 400, {"reason": reason})
+        self.reason = reason
+
+
+class ConsentFlowError(HelixError):
+    """A step of the consent flow (KYA-OS story L3-H) that did not go through: a
+    consent request, the signed root hop the consent page returned, a renewal or
+    a withdrawal. ``reason`` is one of helix_sdk.consent.ConsentReasons
+    (``step_up_required`` among them), ``status`` the HTTP status Helix answered
+    with, when it answered."""
+
+    def __init__(self, reason: str, message: str = "consent flow failed", status: int = 400, helix_code: Optional[str] = None) -> None:
+        details: Dict[str, Any] = {"reason": reason}
+        if helix_code is not None:
+            details["helixCode"] = helix_code
+        super().__init__(codes.CONSENT_FLOW_FAILED, message, status, details)
+        self.reason = reason
+        #: The error code Helix answered with (``CONSENT_GRANT_SCOPE_NOT_ALLOWED``, say), when it answered with one.
+        self.helix_code = helix_code
 
 
 class JWTExpiredError(HelixError):
@@ -564,6 +605,31 @@ class CaptchaFailedError(HelixError):
         super().__init__(codes.CAPTCHA_FAILED, message, 400)
 
 
+class AuditEventInvalidError(HelixError):
+    """A value that is not a KYA-OS producer audit event (helix_sdk.audit).
+    ``issues`` are ``{"path", "message"}`` dicts naming each offending member,
+    the first of which the message repeats; the path is dotted (``''`` is the
+    top level), the same strings helix-core reports."""
+
+    def __init__(self, issues: Sequence[Mapping[str, str]]) -> None:
+        first = issues[0] if issues else None
+        message = (
+            f"Audit event is invalid at {first['path'] or '$'}: {first['message']}"
+            if first is not None
+            else "Audit event is invalid"
+        )
+        super().__init__(codes.AUDIT_EVENT_INVALID, message, 400, {"issues": [dict(issue) for issue in issues]})
+        self.issues = [dict(issue) for issue in issues]
+
+
+class AuditEvidenceError(HelixError):
+    """An evidence object or reference that cannot be used: no vault, another
+    key, bytes that do not match their reference, failed AEAD verification."""
+
+    def __init__(self, message: str, details: Optional[Mapping[str, Any]] = None) -> None:
+        super().__init__(codes.AUDIT_EVIDENCE_INVALID, message, 400, details)
+
+
 # ── API error mapping ───────────────────────────────────────────────────────
 
 _CODE_TO_ERROR = {
@@ -603,7 +669,6 @@ _CODE_TO_ERROR = {
     codes.VC_NOT_YET_VALID: VCNotYetValidError,
     codes.VC_SIGNATURE_INVALID: VCSignatureInvalidError,
     codes.SELF_SIGNED_VC_NOT_ALLOWED: SelfSignedVCNotAllowedError,
-    codes.VP_MISSING: VPMissingError,
     codes.VP_EXPIRED: VPExpiredError,
     codes.VP_VERIFICATION_FAILED: VPVerificationFailedError,
     codes.VP_SIGNATURE_INVALID: VPSignatureInvalidError,

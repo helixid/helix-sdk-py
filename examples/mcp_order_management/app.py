@@ -9,35 +9,97 @@ tool call gated by helix_mcp_middleware.
 The gate runs at the HTTP layer, in front of the MCP transport, so a missing
 or invalid credential gets a real HTTP 401 with `WWW-Authenticate` pointing
 at the RFC 9728 metadata (which is how OAuth clients discover the
-authorization server), and a scope failure gets a 403. Only `tools/call` is
-gated: `initialize` and `tools/list` stay open, so HelixID clients that send
-their VP in `params._meta` (not a header) keep working, and a VP is verified
-once per tool call, not once per request."""
+authorization server), and a scope failure gets a 403. Every request goes
+through the gate, which decides: its open methods (``initialize``,
+``notifications/initialized`` and ``tools/list`` by default, so a client can
+see what is offered) pass, every other method needs a verified caller, and
+the middleware audits every refusal itself. A KYA-OS request proof (in
+`params._meta`) is verified once per call, in-process, over the JSON-RPC
+request exactly as received (story F-2).
+
+With an `audit` trail (McpAuditTrail), every gated tools/call is bracketed
+by typed KYA-OS audit events: `session.established` before the gate, the
+gate's own decision events (`proof.verified` or `proof.rejected` for a
+KYA-OS request proof, `authorization.approved` / `denied`), then `tool.call.started`
+and `tool.call.completed` / `tool.call.failed`, or `tool.call.denied` when
+the gate refused, all under one correlationId. A session that cannot be
+recorded fails the call (a 500) before the gate. Each tool runs through
+``audit_tool_handlers`` (A-2, as the JS sample): under required delivery a
+tool whose intent cannot be recorded does not run and answers
+``audit_delivery_failed``, and an answer whose completion cannot be recorded
+is marked degraded (``_meta["org.kya-os/audit"]``).
+
+With `kyaos` set, the same layer runs the KYA-OS session and proof flow (story
+L2-A): the `_kyaos_handshake` tool opens a session (credentials, when present,
+make it an authenticated one); every other tool call is started before the
+transport sees it (session lookup, authorization, control arguments stripped)
+and its JSON-RPC result is finished on the way out, where it is hashed and the
+proof signed into `_meta["org.kya-os/response-proof"]`. A refusal carries its
+`denied` proof in the 400/401/403 body.
+
+With `auth.needs_authorization` set (story L3-E), a caller whose delegation
+does not cover the tool gets the signed `needs_authorization` challenge as the
+call's result, and a retry carrying `_kyaos_resume` and `_kyaos_delegation` is
+verified through that layer before the tool runs."""
 
 from __future__ import annotations
 
-import json
-from dataclasses import replace
-from typing import Any, Callable, Optional, Sequence
+from dataclasses import fields
+from typing import Annotated, Any, Callable, Dict, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
-from starlette.datastructures import Headers
+from mcp.types import CallToolResult, TextContent
+from pydantic import Field, StrictInt
 from starlette.responses import JSONResponse
 
 from helix_mcp_middleware import (
-    AuthorizationServerUnavailableError,
+    AUTHENTICATED_AGENT_STATE_KEY,
+    HelixMcpGate,
+    HelixMcpGateOptions,
+    KyaOsRuntime,
+    McpAuditTrail,
     MCPMiddlewareOptions,
-    async_helixid_mcp_middleware,
-    build_protected_resource_metadata,
-    protected_resource_metadata_url,
-    to_http_error_response,
+    ServeIdentityOptions,
+    WellKnownMcp,
+    audit_tool_handlers,
+    serve_identity,
 )
 
+from .downstream import FORWARD_TOOL_SCOPES, DownstreamOptions, register_forward_tool
 from .orders import TOOL_SCOPES, OrderStore, create_order_store, register_order_tools
 
-MAX_BODY_BYTES = 1_000_000
+
+
+def _register_handshake(server: MCPServer, kyaos: KyaOsRuntime) -> None:
+    @server.tool(
+        name=kyaos.handshake_tool_name,
+        title="KYA-OS handshake",
+        description="Opens a KYA-OS session: a fresh nonce, this server as audience, the current Unix time.",
+    )
+    async def kyaos_handshake(
+        nonce: Annotated[str, Field(min_length=22)],
+        audience: Annotated[str, Field(min_length=1)],
+        timestamp: Annotated[StrictInt, Field(ge=0)],
+        ctx: Context,  # type: ignore[type-arg]
+        agentDid: Optional[str] = None,  # noqa: N803 - the wire names, shared with the JS sample
+        clientInfo: Optional[Dict[str, Any]] = None,  # noqa: N803
+        clientProtocolVersion: Optional[str] = None,  # noqa: N803
+        clientCapabilities: Optional[Dict[str, Any]] = None,  # noqa: N803
+    ) -> CallToolResult:
+        args = {
+            "nonce": nonce, "audience": audience, "timestamp": timestamp, "agentDid": agentDid,
+            "clientInfo": clientInfo, "clientProtocolVersion": clientProtocolVersion, "clientCapabilities": clientCapabilities,
+        }
+        request = ctx.request_context.request
+        verified = getattr(request.state, AUTHENTICATED_AGENT_STATE_KEY, None) if request is not None else None
+        result = await kyaos.handshake_tool_result({k: v for k, v in args.items() if v is not None}, authenticated_agent_did=verified)
+        return CallToolResult(
+            content=[TextContent(type="text", text=result["content"][0]["text"])],
+            structuredContent=result["structuredContent"],
+            isError=bool(result.get("isError", False)),
+        )
 
 
 def create_order_app(
@@ -46,27 +108,47 @@ def create_order_app(
     authorization_servers: Optional[Sequence[str]] = None,
     store: Optional[OrderStore] = None,
     on_server_error: Optional[Callable[[BaseException], None]] = None,
+    audit: Optional[McpAuditTrail] = None,
+    identity: Optional[ServeIdentityOptions] = None,
+    kyaos: Optional[KyaOsRuntime] = None,
+    revocation_webhook: Optional[Tuple[str, Callable[[Any, Any, Any], Any]]] = None,
+    well_known: Optional[WellKnownMcp] = None,
+    downstream: Optional[DownstreamOptions] = None,
 ) -> Any:
     """An ASGI app. `resource` is this server's MCP endpoint URL (MCP is
     served at its path); `auth` is everything except the scopes, which this
-    sample fixes in TOOL_SCOPES."""
+    sample fixes in TOOL_SCOPES. `audit` records each tool call as typed
+    events (pair it with `auth.audit_sink = audit.tool_audit_sink()`);
+    `identity` (KYA-OS story C-A) serves this server's own did.json and
+    card.json from its origin. `kyaos` turns on the KYA-OS layer (story
+    L2-A): the handshake tool, sessions, the replay store and a server-signed
+    proof on every tool call outcome. `well_known` serves the KYA-OS discovery
+    document at `/.well-known/mcp` (story L1-D, from create_well_known_mcp());
+    a disabled one answers 404. `revocation_webhook` (KYA-OS story L3-C) is
+    `(path, asgi_app)`: the RFC 8935 receiver of Helix's revocation signals
+    (`RevocationSignalClient.asgi_webhook()`), mounted at `path`. `downstream`
+    (KYA-OS story L3-D) adds `forward_lookup_order`, which calls another order
+    service on the agent's behalf, forwarding its delegation."""
     url = urlsplit(resource)
     if url.scheme not in ("http", "https") or not url.hostname:
         raise ValueError(f"resource must be an http(s) URL, got {resource!r}")
     host = f"[{url.hostname}]" if ":" in url.hostname else url.hostname  # lower-cased, no port or userinfo
     mcp_path = url.path or "/"
-    metadata_url = protected_resource_metadata_url(resource)
-    metadata_path = urlsplit(metadata_url).path
-    metadata = build_protected_resource_metadata(
-        resource,
-        authorization_servers=authorization_servers,
-        scopes_supported=list(dict.fromkeys(s for scopes in TOOL_SCOPES.values() for s in scopes)),
-        resource_name="Order Management (HelixID sample)",
-    )
-    gate = async_helixid_mcp_middleware(replace(auth, tool_scopes=TOOL_SCOPES, required_scopes=[]))
+    served_identity = serve_identity(identity) if identity is not None else None
+    tool_scopes = {**TOOL_SCOPES, **FORWARD_TOOL_SCOPES} if downstream is not None else TOOL_SCOPES
 
-    server = FastMCP(
-        "order-management",
+    # MCP Python SDK 2.x: MCPServer (FastMCP in 1.x); the HTTP settings go to streamable_http_app() below.
+    server = MCPServer("order-management")
+    if audit is not None:
+        # A-2: each tool runs audited, under the tool call the gate opens per request
+        # (the handshake, opened without one, runs unaudited).
+        audit_tool_handlers(server)
+    register_order_tools(server, store if store is not None else create_order_store())
+    if downstream is not None:
+        register_forward_tool(server, downstream)
+    if kyaos is not None:
+        _register_handshake(server, kyaos)
+    mcp_app = server.streamable_http_app(
         stateless_http=True,
         json_response=True,
         streamable_http_path=mcp_path,
@@ -82,94 +164,35 @@ def create_order_app(
             ],
         ),
     )
-    register_order_tools(server, store if store is not None else create_order_store())
-    mcp_app = server.streamable_http_app()
+
+    # The one line: everything HTTP-side of the HelixID check (helix_mcp_middleware.HelixMcpGate).
+    auth_options = {f.name: getattr(auth, f.name) for f in fields(MCPMiddlewareOptions)}
+    gate = HelixMcpGate(
+        mcp_app,
+        HelixMcpGateOptions(
+            **{**auth_options, "tool_scopes": tool_scopes, "required_scopes": []},
+            resource=resource,
+            authorization_servers=authorization_servers,
+            resource_name="Order Management (HelixID sample)",
+            audit=audit,
+            kyaos=kyaos,
+            on_server_error=on_server_error,
+        ),
+    )
 
     async def app(scope: Any, receive: Any, send: Any) -> None:
-        if scope["type"] != "http":  # lifespan: the MCP session manager starts and stops with the app
-            await mcp_app(scope, receive, send)
-            return
-
-        async def respond(status: int, body: Any, headers: Optional[dict] = None) -> None:
-            await JSONResponse(body, status_code=status, headers=headers)(scope, receive, send)
-
-        path, method = scope["path"], scope["method"]
-        if path == metadata_path and method == "GET":
-            await respond(200, metadata)
-            return
-        if path != mcp_path:
-            await respond(404, {"error": "not_found"})
-            return
-        if method != "POST":
-            # Stateless server: no SSE stream to open (GET) and no session to end (DELETE).
-            await respond(405, {"error": "method_not_allowed"}, {"allow": "POST"})
-            return
-
-        chunks, size, more = [], 0, True
-        while more:
-            message = await receive()
-            if message["type"] != "http.request":
-                return  # client went away
-            chunk = message.get("body", b"")
-            size += len(chunk)
-            if size > MAX_BODY_BYTES:
-                await respond(413, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Request body too large"}})
+        """The routes that are not the gate's (discovery, the revocation webhook, identity), then the gate."""
+        if scope["type"] == "http":
+            if well_known is not None and await well_known.handle(scope, receive, send):
                 return
-            chunks.append(chunk)
-            more = message.get("more_body", False)
-        raw = b"".join(chunks)
-        try:
-            body = json.loads(raw.decode("utf-8"))
-        except (ValueError, RecursionError):  # RecursionError: absurdly nested JSON
-            await respond(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Request body is not valid JSON"}})
-            return
-        if isinstance(body, list):
-            # The MCP Python transport refuses batches. Answer before the gate, or
-            # every entry would be verified and audited as granted for calls that never run.
-            await respond(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Batch requests are not supported"}})
-            return
-
-        headers = Headers(scope=scope)
-        for message in [body]:
-            if not isinstance(message, dict) or message.get("method") != "tools/call":
-                continue
-            params = message.get("params") if isinstance(message.get("params"), dict) else {}
-            try:
-                await gate({
-                    "name": params.get("name"),
-                    "input": params.get("arguments") if isinstance(params.get("arguments"), dict) else {},
-                    "_meta": params.get("_meta") if isinstance(params.get("_meta"), dict) else None,
-                    "headers": headers,
-                })
-            except Exception as error:  # noqa: BLE001
-                denial = to_http_error_response(error, metadata_url)
-                if denial is not None:
-                    await respond(denial.status, denial.body, {"www-authenticate": denial.headers["WWW-Authenticate"]})
-                    return
-                if on_server_error is not None:
-                    on_server_error(error)
-                if isinstance(error, AuthorizationServerUnavailableError):
-                    # The caller's token was not shown to be bad; its authorization
-                    # server could not be asked. Say so, and invite a retry.
-                    await respond(
-                        503,
-                        {"error": "temporarily_unavailable", "error_description": "The authorization server could not be reached"},
-                        {"retry-after": "5"},
-                    )
-                else:
-                    await respond(500, {"error": "server_error"})
+            if revocation_webhook is not None and scope["path"] == revocation_webhook[0]:
+                await revocation_webhook[1](scope, receive, send)
                 return
-
-        # Hand the request, body intact, to the MCP transport.
-        replayed = False
-
-        async def replay() -> Any:
-            nonlocal replayed
-            if not replayed:
-                replayed = True
-                return {"type": "http.request", "body": raw, "more_body": False}
-            return await receive()
-
-        await mcp_app(scope, replay, send)
+            if served_identity is not None and await served_identity.handle(scope, receive, send):
+                return
+            if scope["path"] not in (mcp_path, urlsplit(gate.metadata_url).path):
+                await JSONResponse({"error": "not_found"}, status_code=404)(scope, receive, send)
+                return
+        await gate(scope, receive, send)
 
     return app

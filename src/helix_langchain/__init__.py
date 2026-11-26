@@ -12,14 +12,14 @@ one real behavioral difference from the JS version).
 
 from __future__ import annotations
 
-from .middleware import helix_id_tool_wrapper, HelixIDCallbackHandler, encode_base64url_json_public
+from .middleware import HelixIDCallbackHandler, helix_id_tool_wrapper, sign_current_request
 from .scope_filter import filter_tools_by_scope
-from helix_sdk.tool_vp import current_helix_vp_headers
+from helix_sdk.tool_signing import RequestSigner
 
 __all__ = [
     "helix_id_tool_wrapper",
-    "current_helix_vp_headers",
+    "sign_current_request",
+    "RequestSigner",
     "HelixIDCallbackHandler",
-    "encode_base64url_json_public",
     "filter_tools_by_scope",
 ]

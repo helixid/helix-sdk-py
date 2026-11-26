@@ -14,7 +14,9 @@ import json
 from datetime import datetime, timezone
 from typing import Annotated, Any, Dict
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+# mcp 2.x: a ToolError's message reaches the caller; any other exception is reported as "Error executing tool <name>".
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
@@ -49,7 +51,7 @@ def create_order_store() -> OrderStore:
 OrderId = Annotated[str, Field(pattern=r"^ORD-\d{4,}$", description="An order id like ORD-1001")]
 
 
-def register_order_tools(server: FastMCP, store: OrderStore) -> None:
+def register_order_tools(server: MCPServer, store: OrderStore) -> None:
     @server.tool(
         title="Look up an order",
         description="Returns an order by id: customer, items, total and status.",
@@ -59,7 +61,7 @@ def register_order_tools(server: FastMCP, store: OrderStore) -> None:
     def lookup_order(orderId: OrderId) -> str:  # noqa: N803 - the wire name, shared with the JS sample
         order = store.get(orderId)
         if order is None:
-            raise ValueError(f"Order {orderId} not found")
+            raise ToolError(f"Order {orderId} not found")
         return json.dumps(order, indent=2)
 
     @server.tool(
@@ -71,9 +73,9 @@ def register_order_tools(server: FastMCP, store: OrderStore) -> None:
     def refund_order(orderId: OrderId, reason: Annotated[str, Field(min_length=1, max_length=200)]) -> str:  # noqa: N803
         order = store.get(orderId)
         if order is None:
-            raise ValueError(f"Order {orderId} not found")
+            raise ToolError(f"Order {orderId} not found")
         if order["status"] == "refunded":
-            raise ValueError(f"Order {orderId} was already refunded")
+            raise ToolError(f"Order {orderId} was already refunded")
         order.update(
             status="refunded",
             refundedAt=datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),

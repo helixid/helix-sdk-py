@@ -4,9 +4,10 @@
 # You may obtain a copy of the License at
 #    http://www.apache.org/licenses/LICENSE-2.0
 """
-Phase 1 of helix_mcp_middleware: credentials, per-tool scopes, OAuth (JWT,
-introspection, several issuers, discovery, presets), HTTP challenges and
-audit. The same cases as helix-sdk-js's mcp-middleware tests (auth.test.ts,
+helix_mcp_middleware: credentials (a KYA-OS request proof or an OAuth bearer
+token, story F-2), per-tool scopes, OAuth (JWT, introspection, several
+issuers, discovery, presets), HTTP challenges and audit. The local verifier
+itself is in test_mcp_verify_locally.py; here a stub stands in for it. The same cases as helix-sdk-js's mcp-middleware tests (auth.test.ts,
 oauth.test.ts, middleware.test.ts), with a fake HTTP client instead of a
 mocked fetch and real keys generated per test.
 """
@@ -17,26 +18,44 @@ import asyncio
 import base64
 import json
 import time
-from typing import Any, Callable, Dict, List, Optional
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import pytest
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
+from helix_sdk.audit import (
+    AUDIT_BINDING_MCP,
+    AuditEventInvalidError,
+    AuditTrail,
+    AuditTrailEntry,
+    MemoryAuditSink,
+    audit_event_digest,
+    keyed_commitment_value,
+    pairwise_did,
+    public_did,
+    validate_audit_event,
+)
 from helix_sdk.errors import HelixError
-from helix_sdk.vp_transport import encode_helix_vp
 from helix_mcp_middleware import (
+    OAUTH_SUBJECT_KEY_ID,
     AuthorizationServerUnavailableError,
     AuthResult,
+    McpAuditTrail,
     MCPMiddlewareOptions,
+    NeedsAuthorizationOptions,
     OAuthIntrospectionOptions,
     OAuthIssuerOptions,
     async_helixid_mcp_middleware,
     auth0,
     build_protected_resource_metadata,
+    create_helix_audit_reporter,
     create_helix_audit_sink,
+    create_mcp_audit_trail,
+    create_needs_authorization,
+    current_tool_call,
     create_introspection_validator,
     create_jwt_validator,
     create_oauth_validator,
@@ -147,19 +166,38 @@ def raises_invalid(fn: Callable[[], Any], message: Optional[str] = None) -> None
         assert str(excinfo.value) == message
 
 
-VP = encode_helix_vp({"id": "vp:helix:test"})
+PROOF = {"prf": "org.kya-os/proof.v1", "stub": True}
+PROOF_META = {"org.kya-os/request-proof": PROOF}
 
 
-def verifying_client(scopes: List[str], agent: str = "did:agent") -> MagicMock:
-    client = MagicMock()
-    client.verify_vp.return_value = {
-        "valid": True, "agentDid": agent, "privilegeScopes": scopes, "effectiveScopes": scopes,
-        "vpId": "vp:helix:test", "delegationChain": [],
-    }
-    return client
+class StubVerifier:
+    """Stands in for the local verifier: every proof verifies with ``scopes``,
+    or is refused with ``reasons``. Records every call it is given."""
+
+    def __init__(self, scopes: Sequence[str], agent: Optional[str] = "did:agent", reasons: Sequence[str] = ()) -> None:
+        self.scopes, self.agent, self.reasons = list(scopes), agent, list(reasons)
+        self.calls: List[Dict[str, Any]] = []
+        self.on_call: Optional[Callable[[], None]] = None
+
+    def verify_call(self, call: Dict[str, Any]) -> Any:
+        self.calls.append(call)
+        if self.on_call is not None:
+            self.on_call()
+        ok = not self.reasons
+        return SimpleNamespace(
+            ok=ok, effective_scopes=self.scopes if ok else [], proof_did=self.agent, level="L2" if ok else "L0",
+            fresh=ok, reasons=self.reasons, proof_assurance="proof", agent_did=self.agent if ok else None,
+            proof_floor=ok, warnings=[],
+        )
+
+
+def verifying(scopes: Sequence[str], agent: Optional[str] = "did:agent", reasons: Sequence[str] = ()) -> StubVerifier:
+    return StubVerifier(scopes, agent, reasons)
 
 
 def gate(**options: Any) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
+    # Levels are not the subject here (story C-C's gate is in test_mcp_levels.py): every level is accepted.
+    options.setdefault("minimum_level", "L1")
     return helixid_mcp_middleware(MCPMiddlewareOptions(**options))
 
 
@@ -173,10 +211,17 @@ def denied(fn: Callable[[], Any]) -> Any:
 
 
 class TestCredentials:
-    def test_authorization_helixvp_any_case_and_same_vp_in_several_places(self) -> None:
-        mw = gate(client=verifying_client(["read"]))
-        assert mw({"name": "t", "headers": {"Authorization": f"helixVP {VP}"}})["name"] == "t"
-        assert mw({"name": "t", "headers": {"authorization": f"HelixVP {VP}", "X-Helix-VP": VP}, "_meta": {"x-helix-vp": VP}})
+    def test_the_proof_under_the_canonical_or_legacy_key_with_its_chain(self) -> None:
+        verifier = verifying(["read"])
+        mw = gate(verifier=verifier)
+        chain = [{"hop": 1}]
+        assert mw({"name": "t", "input": {"a": 1}, "_meta": {**PROOF_META, "org.kya-os/delegation-chain": chain}})["name"] == "t"
+        assert mw({"name": "t", "_meta": {"org.kya-os/proof@1": PROOF}})
+        assert [c["_meta"] for c in verifier.calls][0]["org.kya-os/delegation-chain"] == chain
+        assert verifier.calls[0]["input"] == {"a": 1} and "request" not in verifier.calls[0]
+        request = {"method": "tools/call", "params": {"name": "t", "_meta": PROOF_META}}
+        mw({"name": "t", "_meta": PROOF_META, "request": request})
+        assert verifier.calls[-1]["request"] is request
 
     def test_multi_value_headers_object(self) -> None:
         class Headers:
@@ -186,28 +231,35 @@ class TestCredentials:
             def getlist(self, name: str) -> List[str]:
                 return [v for k, v in self.items if k.lower() == name]
 
-        mw = gate(client=verifying_client([]))
-        assert mw({"name": "t", "headers": Headers([("Authorization", f"HelixVP {VP}")])})
-        err = denied(lambda: mw({"name": "t", "headers": Headers([("authorization", f"HelixVP {VP}"), ("Authorization", "Bearer x")])}))
+        mw = gate(validate_oauth_token=lambda t: {"sub": "u", "scopes": []})
+        assert mw({"name": "t", "headers": Headers([("Authorization", "Bearer x")])})
+        err = denied(lambda: mw({"name": "t", "headers": Headers([("authorization", "Bearer a"), ("Authorization", "Bearer x")])}))
         assert err.code == "CREDENTIAL_CONFLICT"
 
     def test_conflicts_are_rejected_never_resolved(self) -> None:
-        mw = gate(client=verifying_client([]), validate_oauth_token=lambda t: {"sub": "u", "scopes": []})
-        other = encode_helix_vp({"id": "vp:other"})
+        mw = gate(verifier=verifying([]), validate_oauth_token=lambda t: {"sub": "u", "scopes": []})
         for call in (
-            {"headers": {"x-helix-vp": VP}, "_meta": {"x-helix-vp": other}},
-            {"headers": {"authorization": "Bearer tok", "x-helix-vp": VP}},
+            # A proof with a bearer token is one credential (cnf fusion, story C-C); a chain without a proof is not.
+            {"headers": {"authorization": "Bearer tok"}, "_meta": {"org.kya-os/delegation-chain": [{"hop": 1}]}},
             {"headers": {"authorization": ["Bearer a", "Bearer b"]}},
             {"headers": {"authorization": "Bearer"}},
         ):
             assert denied(lambda call=call: mw({"name": "t", **call})).code == "CREDENTIAL_CONFLICT"
 
-    def test_no_credentials_and_bearer_without_oauth(self) -> None:
-        mw = gate(client=verifying_client([]))
-        assert denied(lambda: mw({"name": "t"})).code == "VP_MISSING"
-        assert denied(lambda: mw({"name": "t", "input": {"x-helix-vp": VP}})).code == "VP_MISSING"
+    def test_no_credentials_retired_vp_and_bearer_without_oauth(self) -> None:
+        mw = gate(verifier=verifying([]))
+        assert denied(lambda: mw({"name": "t"})).code == "PROOF_MISSING"
+        # Story F-2 retired the Helix VP with no backward compatibility: none of its carriers is read.
+        for call in (
+            {"_meta": {"x-helix-vp": "eyJ2cCI6MX0"}},
+            {"headers": {"x-helix-vp": "eyJ2cCI6MX0"}},
+            {"headers": {"authorization": "HelixVP eyJ2cCI6MX0"}},
+            {"input": {"org.kya-os/request-proof": PROOF}},
+        ):
+            assert denied(lambda call=call: mw({"name": "t", **call})).code == "PROOF_MISSING"
         assert denied(lambda: mw({"name": "t", "headers": {"authorization": "Bearer x"}})).code == "OAUTH_TOKEN_INVALID"
-        assert denied(lambda: mw({"name": "t", "_meta": {"x-helix-vp": 5}})).code == "VP_INVALID_STRUCTURE"
+        assert "or Authorization: Bearer" not in str(denied(lambda: mw({"name": "t"})))
+        assert "or Authorization: Bearer" in str(denied(lambda: gate(validate_oauth_token=lambda t: None)({"name": "t"})))
 
 
 # ── scopes ───────────────────────────────────────────────────────────────────
@@ -215,8 +267,8 @@ class TestCredentials:
 
 class TestToolScopes:
     def test_listed_tool_with_scope_and_deny_by_default(self) -> None:
-        mw = gate(client=verifying_client(["read"]), tool_scopes={"query": ["read"], "update": ["write"]}, required_scopes=["never"])
-        call = {"_meta": {"x-helix-vp": VP}}
+        mw = gate(verifier=verifying(["read"]), tool_scopes={"query": ["read"], "update": ["write"]}, required_scopes=["never"])
+        call = {"_meta": PROOF_META}
         assert mw({"name": "query", **call})
         for name in ("drop", "__class__", "toString", None, 7):
             assert denied(lambda name=name: mw({"name": name, **call})).code == "TOOL_NOT_PERMITTED"
@@ -224,45 +276,54 @@ class TestToolScopes:
         assert (err.code, err.required_scope, err.required_scopes) == ("INSUFFICIENT_SCOPE", "write", ["write"])
 
     def test_required_scopes_is_the_fallback_and_empty_list_allows_any_caller(self) -> None:
-        call = {"name": "anything", "_meta": {"x-helix-vp": VP}}
-        assert gate(client=verifying_client(["read"]), required_scopes=["read"])(call)
-        assert denied(lambda: gate(client=verifying_client([]), required_scopes=["read"])(call)).code == "INSUFFICIENT_SCOPE"
-        assert gate(client=verifying_client([]), tool_scopes={"anything": []})(call)
+        call = {"name": "anything", "_meta": PROOF_META}
+        assert gate(verifier=verifying(["read"]), required_scopes=["read"])(call)
+        assert denied(lambda: gate(verifier=verifying([]), required_scopes=["read"])(call)).code == "INSUFFICIENT_SCOPE"
+        assert gate(verifier=verifying([]), tool_scopes={"anything": []})(call)
 
 
-# ── HelixID door ─────────────────────────────────────────────────────────────
+# ── KYA-OS door ──────────────────────────────────────────────────────────────
 
 
-class TestHelixVp:
-    def test_passes_target_service_and_rejects_invalid(self) -> None:
-        client = verifying_client(["read"])
-        gate(client=client, expected_target_service="did:web:svc")({"name": "t", "_meta": {"x-helix-vp": VP}})
-        assert client.verify_vp.call_args.kwargs["expected_target_service"] == "did:web:svc"
-        client.verify_vp.return_value = {"valid": False, "error": "bad signature"}
-        err = denied(lambda: gate(client=client)({"name": "t", "_meta": {"x-helix-vp": VP}}))
-        assert (err.code, str(err)) == ("VP_VERIFICATION_FAILED", "bad signature")
+class TestKyaOsProof:
+    def test_a_refused_proof_is_proof_invalid_with_the_reasons_and_is_audited(self) -> None:
+        events: List[Dict[str, Any]] = []
+        mw = gate(verifier=verifying([], agent="did:key:agent", reasons=["nonce_replayed", "status_revoked"]), audit_sink=events.append)
+        err = denied(lambda: mw({"name": "t", "_meta": PROOF_META}))
+        assert (err.code, err.reasons, str(err)) == ("PROOF_INVALID", ("nonce_replayed", "status_revoked"), "The request proof was refused: nonce_replayed, status_revoked")
+        assert [(e["event"], e["authMethod"], e["agentDid"], e["reason"], e["level"], e["fresh"]) for e in events] == [
+            ("AUTHZ_DENIED", "kyaos", "did:key:agent", "nonce_replayed,status_revoked", "L0", False)
+        ]
+        res = to_http_error_response(err, META_URL)
+        assert (res.status, res.body["error"]) == (401, "invalid_token")
 
-    def test_credential_errors_from_the_api_become_verification_failures(self) -> None:
-        for code in ("VC_REVOKED", "VP_EXPIRED", "VP_SIGNATURE_INVALID", "DELEGATION_CHAIN_INVALID", "DID_NOT_FOUND"):
-            client = MagicMock()
-            client.verify_vp.side_effect = HelixError(code, f"api said {code}", 400)
-            err = denied(lambda client=client: gate(client=client)({"name": "t", "_meta": {"x-helix-vp": VP}}))
-            assert (err.code, str(err)) == ("VP_VERIFICATION_FAILED", f"api said {code}"), code
+    def test_a_refusal_with_no_principal_is_audited_anonymously(self) -> None:
+        events: List[Dict[str, Any]] = []
+        mw = gate(verifier=verifying([], agent=None, reasons=["malformed_proof"]), audit_sink=events.append)
+        assert denied(lambda: mw({"name": "t", "_meta": PROOF_META})).code == "PROOF_INVALID"
+        # Gap 2: audited with what is known, no actor.
+        assert [(e["event"], e["authMethod"], e["reasonCode"], e["method"], e["toolName"]) for e in events] == [("AUTHZ_DENIED", "none", "malformed_proof", "tools/call", "t")]
+        assert "agentDid" not in events[0]
 
-    def test_api_failures_that_are_not_about_the_credential_pass_through(self) -> None:
-        for code in ("ACCESS_TOKEN_INVALID", "ADMIN_AUTH_REQUIRED", "INTERNAL_ERROR"):
-            client = MagicMock()
-            client.verify_vp.side_effect = HelixError(code, "x", 500)
-            err = denied(lambda client=client: gate(client=client)({"name": "t", "_meta": {"x-helix-vp": VP}}))
-            assert err.code == code
-            assert to_http_error_response(err, META_URL) is None
-        client = MagicMock()
-        client.verify_vp.side_effect = ConnectionError("down")
-        assert isinstance(denied(lambda: gate(client=client)({"name": "t", "_meta": {"x-helix-vp": VP}})), ConnectionError)
-
-    def test_vp_without_client_is_a_configuration_error(self) -> None:
+    def test_a_proof_without_a_verifier_is_a_configuration_error(self) -> None:
         mw = gate(validate_oauth_token=lambda t: {"sub": "u"})
-        assert isinstance(denied(lambda: mw({"name": "t", "_meta": {"x-helix-vp": VP}})), ValueError)
+        assert isinstance(denied(lambda: mw({"name": "t", "_meta": PROOF_META})), ValueError)
+
+    def test_the_gate_builds_its_verifier_from_settings(self) -> None:
+        from helix_mcp_middleware import LocalVerifier, LocalVerifierOptions
+
+        mw = gate(verifier=LocalVerifierOptions(), service_did="did:web:svc", tool_scopes={"a": ["read"], "b": ["read", "write"]})
+        built = mw.verifier  # type: ignore[attr-defined]
+        assert isinstance(built, LocalVerifier) and built.service_did == "did:web:svc"
+        assert built._base["catalog"] == ["read", "write"] and built._base["expected_audience"] == "did:web:svc"
+        own = gate(verifier=LocalVerifierOptions(service_did="did:web:own", catalog=["x"]), expected_target_service="did:web:svc")
+        assert own.verifier.service_did == "did:web:own" and own.verifier._base["catalog"] == ["x"]  # type: ignore[attr-defined]
+        shared = verifying([])
+        assert gate(verifier=shared).verifier is shared  # type: ignore[attr-defined]
+        with pytest.raises(ValueError, match="service_did"):
+            gate(verifier=LocalVerifierOptions())
+        with pytest.raises(TypeError):
+            gate(verifier={"service_did": "did:web:svc"})
 
 
 # ── OAuth callback ───────────────────────────────────────────────────────────
@@ -649,21 +710,22 @@ class TestHttp:
         assert build_protected_resource_metadata(AUD) == {"resource": AUD, "bearer_methods_supported": ["header"]}
 
     def test_missing_credentials_is_401_with_both_challenges_and_no_error(self) -> None:
-        res = to_http_error_response(denied(lambda: gate(client=MagicMock())({"name": "t"})), META_URL)
+        res = to_http_error_response(denied(lambda: gate(verifier=verifying([]))({"name": "t"})), META_URL)
         assert res.status == 401
-        assert res.headers["WWW-Authenticate"] == f'Bearer resource_metadata="{META_URL}", HelixVP resource_metadata="{META_URL}"'
+        assert res.headers["WWW-Authenticate"] == f'Bearer resource_metadata="{META_URL}", KyaOS resource_metadata="{META_URL}"'
         assert res.body["error"] == "unauthorized"
 
     def test_status_mapping(self) -> None:
         for code, status, name in (
-            ("OAUTH_TOKEN_INVALID", 401, "invalid_token"), ("VP_VERIFICATION_FAILED", 401, "invalid_token"),
-            ("VP_INVALID_STRUCTURE", 401, "invalid_token"), ("CREDENTIAL_CONFLICT", 400, "invalid_request"),
+            ("OAUTH_TOKEN_INVALID", 401, "invalid_token"), ("PROOF_INVALID", 401, "invalid_token"),
+            ("CREDENTIAL_CONFLICT", 400, "invalid_request"),
             ("INSUFFICIENT_SCOPE", 403, "insufficient_scope"), ("TOOL_NOT_PERMITTED", 403, "insufficient_scope"),
         ):
             res = to_http_error_response(HelixError(code, "x", 400), META_URL)
             assert (res.status, res.body["error"]) == (status, name)
             assert "scope=" not in res.headers["WWW-Authenticate"]
-        for error in (HelixError("ADMIN_AUTH_REQUIRED", "x", 403), RuntimeError("boom"), None):
+        # The retired VP codes are no longer answered as the caller's fault.
+        for error in (HelixError("ADMIN_AUTH_REQUIRED", "x", 403), HelixError("VP_VERIFICATION_FAILED", "x", 401), RuntimeError("boom"), None):
             assert to_http_error_response(error, META_URL) is None
 
     def test_403_lists_every_required_scope_and_header_charset_is_confined(self) -> None:
@@ -671,29 +733,38 @@ class TestHttp:
         res = to_http_error_response(denied(lambda: mw({"name": "t", "headers": {"authorization": "Bearer x"}})), META_URL)
         assert res.status == 403
         assert 'error="insufficient_scope", error_description="Required scope: admin", scope="read admin export"' in res.headers["WWW-Authenticate"]
-        odd = to_http_error_response(HelixError("VP_VERIFICATION_FAILED", 'bad é\u0007 "quote" \\slash', 400), META_URL)
+        odd = to_http_error_response(HelixError("PROOF_INVALID", 'bad é\u0007 "quote" \\slash', 401), META_URL)
         assert 'error_description="bad     quote   slash"' in odd.headers["WWW-Authenticate"]
 
 
 # ── audit ────────────────────────────────────────────────────────────────────
 
 
+def posted(call: Dict[str, Any]) -> Any:
+    """The JSON body of a recorded POST (the reporter sends the canonical event text)."""
+    return json.loads(call["data"].decode("utf-8"))
+
+
 class TestAudit:
-    def test_events_for_vp_callers(self) -> None:
+    def test_events_for_kyaos_callers(self) -> None:
         events: List[Dict[str, Any]] = []
-        mw = gate(client=verifying_client(["read"], agent="did:key:agent"), tool_scopes={"q": ["read"], "u": ["write"]}, audit_sink=events.append, expected_target_service="did:web:svc")
-        mw({"name": "q", "_meta": {"x-helix-vp": VP}})
-        denied(lambda: mw({"name": "u", "_meta": {"x-helix-vp": VP}}))
-        denied(lambda: mw({"name": "zzz", "_meta": {"x-helix-vp": VP}}))
+        mw = gate(verifier=verifying(["read"], agent="did:key:agent"), tool_scopes={"q": ["read"], "u": ["write"]}, audit_sink=events.append, expected_target_service="did:web:svc")
+        mw({"name": "q", "_meta": PROOF_META})
+        denied(lambda: mw({"name": "u", "_meta": PROOF_META}))
+        denied(lambda: mw({"name": "zzz", "_meta": PROOF_META}))
         assert [(e["event"], e["result"], e["toolName"], e.get("requiredScope"), e.get("reason")) for e in events] == [
             ("AUTHZ_GRANTED", "allowed", "q", None, None),
             ("AUTHZ_DENIED", "denied", "u", "write", "insufficient scope"),
             ("AUTHZ_DENIED", "denied", "zzz", None, "tool is not in toolScopes"),
         ]
-        assert all(e["agentDid"] == "did:key:agent" and e["vpId"] == "vp:helix:test" and e["serviceDid"] == "did:web:svc" and e["authMethod"] == "helixvp" for e in events)
+        assert all(
+            e["agentDid"] == "did:key:agent" and e["level"] == "L2" and e["fresh"] is True and e["serviceDid"] == "did:web:svc" and e["authMethod"] == "kyaos"
+            for e in events
+        )
+        assert all("vpId" not in e for e in events)
         assert events[0]["timestamp"].endswith("Z")
 
-    def test_unidentified_callers_are_not_logged_and_a_failing_sink_never_blocks(self) -> None:
+    def test_unidentified_callers_are_logged_anonymously_and_a_failing_sink_never_blocks(self) -> None:
         events: List[Any] = []
         errors: List[BaseException] = []
 
@@ -701,33 +772,351 @@ class TestAudit:
             events.append(event)
             raise RuntimeError("sink down")
 
-        mw = gate(client=verifying_client([]), audit_sink=failing, on_audit_error=errors.append)
+        mw = gate(verifier=verifying([]), audit_sink=failing, on_audit_error=errors.append)
         denied(lambda: mw({"name": "t"}))
-        assert events == []
-        assert mw({"name": "t", "_meta": {"x-helix-vp": VP}})
-        assert len(events) == 1 and str(errors[0]) == "sink down"
+        assert [(e["authMethod"], e["reasonCode"]) for e in events] == [("none", "proof_missing")]
+        assert mw({"name": "t", "_meta": PROOF_META})
+        assert len(events) == 2 and len(errors) == 2 and str(errors[0]) == "sink down"
 
-    def test_helix_audit_sink(self) -> None:
+    # -- create_helix_audit_reporter (JS: createHelixAuditReporter) -------------
+
+    def test_a_refused_request_proof_is_proof_rejected_by_its_first_reason(self) -> None:
+        memory = MemoryAuditSink()
+        sink = create_mcp_audit_trail(memory, "did:web:svc").tool_audit_sink()
+        sink({"event": "AUTHZ_DENIED", "result": "denied", "timestamp": "t", "authMethod": "kyaos", "agentDid": "did:key:a", "effectiveScopes": [], "reason": "proof_expired,status_unavailable"})
+        sink({"event": "AUTHZ_DENIED", "result": "denied", "timestamp": "t", "authMethod": "kyaos", "agentDid": "did:key:a", "effectiveScopes": [], "reason": " "})
+        assert memory.event_types == ["proof.rejected", "proof.rejected"]
+        assert memory.events[0]["reason"] == {"code": "proof_expired"} and memory.events[0]["outcome"] == "denied"
+        assert memory.events[0]["actor"] == {"kind": "pairwise_did", "did": "did:key:a"}
+        assert memory.events[1]["reason"] == {"code": "proof_invalid"}
+
+    def test_the_verification_code_names_the_level_and_a_cached_status(self) -> None:
+        memory = MemoryAuditSink()
+        sink = create_mcp_audit_trail(memory, "did:web:svc").tool_audit_sink()
+        sink({"event": "AUTHZ_GRANTED", "result": "allowed", "timestamp": "t", "authMethod": "kyaos", "agentDid": "did:key:a", "effectiveScopes": [], "level": "L2", "fresh": True})
+        sink({"event": "AUTHZ_GRANTED", "result": "allowed", "timestamp": "t", "authMethod": "kyaos", "agentDid": "did:key:a", "effectiveScopes": [], "level": "L3", "fresh": False})
+        assert [e["details"].get("verificationCode") for e in memory.events if e["eventType"] == "proof.verified"] == ["KYAOS_PROOF_L2", "KYAOS_PROOF_L3_CACHED"]
+
+    def test_an_l3e_needs_authorization_challenge_keeps_its_reason(self) -> None:
+        sink = MemoryAuditSink()
+        trail = create_mcp_audit_trail(sink, "did:web:orders.example")
+        layer = create_needs_authorization(
+            NeedsAuthorizationOptions(authorization_url="https://consent.example/authorize", audit_sink=trail.tool_audit_sink(), service_did="did:web:orders.example")
+        )
+        layer.challenge(agent_did="did:key:zAgent", tool="delete_order", scopes=["orders:admin"], effective_scopes=["orders:read"])
+        assert sink.event_types == ["proof.verified", "authorization.denied"]
+        denied = sink.events[1]
+        assert denied["outcome"] == "denied" and denied["reason"] == {"code": "needs_authorization"}
+        assert denied["authorization"]["decision"] == "denied" and denied["authorization"]["scopeId"] == "orders:admin"
+
+    def test_reporter_posts_the_canonical_event_text_with_the_bearer_key(self) -> None:
+        http = FakeHttp({"http://api.test/v1/audit-log/events": {}})
+        reporter = create_helix_audit_reporter("http://api.test/", "hak", timeout_seconds=2.5, http=http)
+        trail = AuditTrail(sink=reporter, source_id="s", producer=pairwise_did("did:web:svc"), tenant_ref=pairwise_did("did:web:svc"))
+        entry = trail.record({"eventType": "session.established", "action": {"category": "session"}, "outcome": "succeeded", "details": {"family": "session", "phase": "established"}})
+        assert http.calls == [{
+            "method": "POST",
+            "url": "http://api.test/v1/audit-log/events",
+            "data": entry.canonical.encode("utf-8"),
+            "headers": {"content-type": "application/json", "authorization": "Bearer hak"},
+            "timeout": 2.5,
+        }]
+        assert posted(http.calls[0]) == entry.event
+
+    def test_reporter_raises_on_a_non_2xx_answer(self) -> None:
+        entry = AuditTrailEntry(event={"eventType": "x"}, canonical="{}", event_digest="sha256:" + "0" * 64)
+        with pytest.raises(RuntimeError, match="responded 500"):
+            create_helix_audit_reporter("http://api.test", "hak", http=FakeHttp({"http://api.test/v1/audit-log/events": Response({}, 500)})).append(entry)
+
+    def test_reporter_uses_requests_and_a_5_s_timeout_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import requests
+
+        calls: List[Dict[str, Any]] = []
+        monkeypatch.setattr(requests, "post", lambda url, **kw: calls.append({"url": url, **kw}) or Response({}, 201))
+        create_helix_audit_reporter("http://api.test", "hak").append(AuditTrailEntry(event={"eventType": "x"}, canonical='{"eventType":"x"}', event_digest="sha256:" + "0" * 64))
+        assert calls[0]["url"] == "http://api.test/v1/audit-log/events" and calls[0]["data"] == b'{"eventType":"x"}' and calls[0]["timeout"] == 5.0
+
+    # -- create_helix_audit_sink (JS: createHelixAuditSink) ---------------------
+
+    def test_helix_audit_sink_posts_typed_events(self) -> None:
         http = FakeHttp({"http://api.test/v1/audit-log/events": {}})
         sink = create_helix_audit_sink("http://api.test/", "hak_1", service_did="did:web:svc", http=http)
         sink({"event": "AUTHZ_DENIED", "result": "denied", "timestamp": "t", "authMethod": "oauth", "effectiveScopes": ["read"], "oauthSubject": "u-9", "toolName": "refund", "requiredScope": "admin", "reason": "insufficient scope"})
+        assert len(http.calls) == 1
         call = http.calls[0]
-        assert call["headers"]["authorization"] == "Bearer hak_1"
-        assert call["json"] == {
-            "event": "AUTHZ_DENIED", "timestamp": "t", "effectiveScopes": ["read"], "result": "denied", "source": "mcp-middleware",
-            "serviceDid": "did:web:svc", "toolName": "refund", "requiredScope": "admin", "reason": "insufficient scope", "oauthSubject": "u-9",
-        }
-        with pytest.raises(ValueError):
-            create_helix_audit_sink("http://api.test", "k", http=http)({"event": "AUTHZ_GRANTED", "result": "allowed", "timestamp": "t", "effectiveScopes": []})
-        with pytest.raises(RuntimeError):
-            create_helix_audit_sink("http://api.test", "k", service_did="d", http=FakeHttp())({"event": "AUTHZ_GRANTED", "result": "allowed", "timestamp": "t", "effectiveScopes": []})
+        assert call["headers"]["authorization"] == "Bearer hak_1" and call["timeout"] == 5.0
+        event = posted(call)
+        assert validate_audit_event(event) == (True, event)
+        assert event["eventType"] == "authorization.denied" and event["outcome"] == "denied"
+        assert event["binding"] == AUDIT_BINDING_MCP
+        assert event["source"] == {"producer": {"kind": "pairwise_did", "did": "did:web:svc"}, "sourceId": "mcp-middleware:did:web:svc", "sourceSequence": "1"}
+        assert event["resource"] == {"kind": "public_did", "did": "did:web:svc"}
+        assert event["actor"]["kind"] == "keyed_commitment" and event["actor"]["keyId"] == "oauth-subject-v1"
+        assert event["reason"] == {"code": "insufficient_scope"}
+        assert event["authorization"] == {"source": "policy", "decision": "denied", "scopeId": "admin"}
+        assert event["details"] == {"family": "authorization", "phase": "denied"}
+        assert "name" not in event["action"]  # tool names are withheld by default
+        assert "u-9" not in json.dumps(event)
 
+        # A HelixID VP caller: proof.verified then authorization.approved, chained by the trail.
+        sink({"event": "AUTHZ_GRANTED", "result": "allowed", "timestamp": "t", "authMethod": "kyaos", "effectiveScopes": ["read"], "agentDid": "did:key:agent", "toolName": "q"})
+        events = [posted(c) for c in http.calls]
+        assert [e["eventType"] for e in events] == ["authorization.denied", "proof.verified", "authorization.approved"]
+        assert [e["source"]["sourceSequence"] for e in events] == ["1", "2", "3"]
+        assert events[2]["source"]["previousSourceEventDigest"] == audit_event_digest(events[1])
+        assert events[1]["actor"] == {"kind": "pairwise_did", "did": "did:key:agent"}
+        assert events[1]["details"] == {"family": "proof", "phase": "verified", "verificationCode": "KYAOS_PROOF"}
+
+    def test_helix_audit_sink_passes_source_id_and_include_tool_names_through(self) -> None:
+        http = FakeHttp({"http://api.test/v1/audit-log/events": {}})
+        sink = create_helix_audit_sink("http://api.test", "k", service_did="did:web:svc", http=http, source_id="srv-1", include_tool_names=True)
+        sink({"event": "AUTHZ_GRANTED", "result": "allowed", "timestamp": "t", "authMethod": "oauth", "oauthSubject": "s", "effectiveScopes": [], "toolName": "refund"})
+        event = posted(http.calls[0])
+        assert event["action"] == {"category": "authorization", "name": "refund"} and event["source"]["sourceId"] == "srv-1"
+
+    def test_helix_audit_sink_lets_a_failed_post_propagate_and_needs_the_server_did(self) -> None:
+        with pytest.raises(ValueError, match="service_did"):
+            create_helix_audit_sink("http://api.test", "k", http=FakeHttp())
+        with pytest.raises(RuntimeError, match="responded 404"):
+            create_helix_audit_sink("http://api.test", "k", service_did="did:web:d", http=FakeHttp())({"event": "AUTHZ_GRANTED", "result": "allowed", "timestamp": "t", "authMethod": "oauth", "oauthSubject": "s", "effectiveScopes": []})
+
+    # -- create_mcp_audit_trail (JS: createMcpAuditTrail) ------------------------
+
+    def test_trail_needs_a_server_did_or_a_producer(self) -> None:
+        with pytest.raises(ValueError, match="service_did"):
+            create_mcp_audit_trail(MemoryAuditSink())
+        assert create_mcp_audit_trail(MemoryAuditSink(), producer=public_did("did:web:p")).service_did is None
+
+    def test_trail_defaults(self) -> None:
+        memory = MemoryAuditSink()
+        audit = create_mcp_audit_trail(memory, "did:web:svc")
+        assert isinstance(audit, McpAuditTrail) and audit.service_did == "did:web:svc" and audit.include_tool_names is False
+        event = audit.session("established", True).event
+        assert event["source"]["producer"] == pairwise_did("did:web:svc") and event["source"]["sourceId"] == "mcp-middleware:did:web:svc"
+        assert event["tenantRef"] == pairwise_did("did:web:svc") and event["binding"] == AUDIT_BINDING_MCP
+        assert event["resource"] == public_did("did:web:svc")
+        assert event["eventId"].startswith("audit_")
+
+    def test_trail_takes_producer_tenant_source_clock_and_ids_and_has_no_resource_without_a_server_did(self) -> None:
+        memory = MemoryAuditSink()
+        ids = iter(["e-1", "e-2"])
+        audit = create_mcp_audit_trail(
+            memory,
+            producer=public_did("did:web:p"),
+            tenant_ref=public_did("did:web:t"),
+            source_id="src",
+            clock=lambda: 1750000000000,
+            new_event_id=lambda: next(ids),
+        )
+        event = audit.session("established", True).event
+        assert event["source"] == {"producer": public_did("did:web:p"), "sourceId": "src", "sourceSequence": "1"}
+        assert event["tenantRef"] == public_did("did:web:t") and event["occurredAt"] == 1750000000000 and event["eventId"] == "e-1"
+        assert "resource" not in event
+        assert create_mcp_audit_trail(MemoryAuditSink(), producer=public_did("did:web:p")).session("established", True).event["source"]["sourceId"] == "mcp-middleware:server"
+
+    # -- McpAuditTrail events -----------------------------------------------------
+
+    def test_session_an_expired_session_failed_a_rejected_one_was_denied(self) -> None:
+        audit = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc")
+        assert audit.session("expired", False).event["outcome"] == "failed"
+        rejected = audit.session("rejected", False, reason_code="replay").event
+        assert rejected["outcome"] == "denied" and rejected["reason"] == {"code": "replay"}
+        assert rejected["details"] == {"family": "session", "phase": "rejected", "reasonCode": "replay"}
+        assert audit.session("replay_rejected", False).event["outcome"] == "denied"
+
+    def test_proof_digest_verification_code_and_reason(self) -> None:
+        audit = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc")
+        event = audit.proof("rejected", "failed", proof_digest="sha256:" + "a" * 64, verification_code="VP_EXPIRED", reason_code="vp_expired").event
+        assert event["eventType"] == "proof.rejected" and event["action"] == {"category": "proof"} and event["outcome"] == "failed"
+        assert event["details"] == {"family": "proof", "phase": "rejected", "proofDigest": "sha256:" + "a" * 64, "verificationCode": "VP_EXPIRED"}
+        assert event["reason"] == {"code": "vp_expired"}
+        assert audit.proof("generated", "succeeded").event["details"] == {"family": "proof", "phase": "generated"}
+
+    def test_delegation_reference_parent_and_reason(self) -> None:
+        audit = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc")
+        event = audit.delegation("rejected", "urn:uuid:d", "denied", reason_code="chain_broken", parent_ref="urn:uuid:p").event
+        assert event["details"] == {"family": "delegation", "phase": "rejected", "delegationRef": "urn:uuid:d", "parentRef": "urn:uuid:p"}
+        assert event["reason"] == {"code": "chain_broken"} and event["action"] == {"category": "delegation"}
+        assert audit.delegation("issued", "urn:uuid:e", "succeeded").event["details"] == {"family": "delegation", "phase": "issued", "delegationRef": "urn:uuid:e"}
+
+    def test_authorization_every_phase_grant_used_the_grant_reference_and_the_tool_name_policy(self) -> None:
+        withheld = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc")
+        named = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc", include_tool_names=True)
+        for phase in ("evaluated", "approved", "denied", "step_up_required"):
+            assert withheld.authorization(phase, "succeeded").event["eventType"] == f"authorization.{phase}"
+        used = withheld.authorization("grant_used", "succeeded", grant_ref="vc:grant-1", tool_name="refund").event
+        assert used["eventType"] == "grant.used" and used["details"] == {"family": "authorization", "phase": "grant_used", "grantRef": "vc:grant-1"}
+        assert used["action"] == {"category": "authorization"}
+        assert named.authorization("approved", "succeeded", tool_name="refund").event["action"] == {"category": "authorization", "name": "refund"}
+        challenged = withheld.authorization("step_up_required", "challenged", reason_code="mfa").event
+        assert challenged["reason"] == {"code": "mfa"} and challenged["outcome"] == "challenged"
+
+    def test_tool_attempt_defaults_to_1_reason_and_the_tool_name_policy(self) -> None:
+        withheld = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc")
+        named = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc", include_tool_names=True)
+        assert withheld.tool("started", "unknown", tool_name="refund").event["details"] == {"family": "tool", "phase": "started", "attempt": "1"}
+        failed = withheld.tool("failed", "failed", tool_name="refund", attempt="2", reason_code="handler_error").event
+        assert failed["details"] == {"family": "tool", "phase": "failed", "attempt": "2"} and failed["reason"] == {"code": "handler_error"}
+        assert failed["action"] == {"category": "tool.call"}
+        assert named.tool("completed", "succeeded", tool_name="refund").event["action"] == {"category": "tool.call", "name": "refund"}
+
+    def test_copies_the_context_onto_the_event(self) -> None:
+        audit = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc")
+        context = {
+            "actor": pairwise_did("did:key:a"),
+            "responsibleParty": public_did("did:key:user"),
+            "correlationId": "c",
+            "causationId": "k",
+            "authorization": {"source": "policy", "decision": "allowed"},
+            "ignored": 1,
+        }
+        event = audit.session("established", True, context=context).event
+        assert event["actor"] == pairwise_did("did:key:a") and event["responsibleParty"] == public_did("did:key:user")
+        assert event["correlationId"] == "c" and event["causationId"] == "k"
+        assert event["authorization"] == {"source": "policy", "decision": "allowed"}
+        assert "ignored" not in event
+        with pytest.raises(AuditEventInvalidError):  # errors propagate: a call that cannot be recorded does not run
+            audit.tool("started", "unknown", attempt="x")
+        # Python only: on_error takes the failure instead, and the method returns None.
+        errors: List[BaseException] = []
+        reporting = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc", on_error=errors.append)
+        assert reporting.on_error is not None and reporting.tool("started", "unknown", attempt="x") is None
+        assert isinstance(errors[0], AuditEventInvalidError)
+
+    def test_commits_an_oauth_subject_under_the_trail_key(self) -> None:
+        def trail(key: Any = None) -> McpAuditTrail:
+            return create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc", oauth_subject_key=key)
+
+        fixed = trail(b"k" * 32)
+        assert fixed.oauth_actor("alice") == fixed.oauth_actor("alice") == trail(bytearray(b"k" * 32)).oauth_actor("alice")
+        assert fixed.oauth_actor("alice") != fixed.oauth_actor("bob")
+        assert fixed.oauth_actor("alice") != trail().oauth_actor("alice")  # a random key per trail
+        assert fixed.oauth_actor("alice") == {"kind": "keyed_commitment", "value": keyed_commitment_value(b"k" * 32, "alice"), "keyId": OAUTH_SUBJECT_KEY_ID}
+
+    # -- McpAuditTrail.tool_audit_sink (JS: toolAuditSink) ------------------------
+
+    def test_sink_a_helixid_caller_allowed(self) -> None:
+        memory = MemoryAuditSink()
+        sink = create_mcp_audit_trail(memory, "did:web:svc").tool_audit_sink()
+        sink({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "kyaos", "agentDid": "did:key:a", "effectiveScopes": ["read"], "toolName": "q"})
+        proof, approved = memory.events
+        assert memory.event_types == ["proof.verified", "authorization.approved"]
+        assert proof["actor"] == approved["actor"] == pairwise_did("did:key:a")
+        assert "authorization" not in proof and proof["details"] == {"family": "proof", "phase": "verified", "verificationCode": "KYAOS_PROOF"}
+        assert approved["authorization"] == {"source": "delegation", "decision": "allowed"} and approved["outcome"] == "succeeded"
+
+    def test_sink_a_helixid_caller_denied(self) -> None:
+        memory = MemoryAuditSink()
+        sink = create_mcp_audit_trail(memory, "did:web:svc").tool_audit_sink()
+        sink({"event": "AUTHZ_DENIED", "result": "denied", "authMethod": "kyaos", "agentDid": "did:key:a", "effectiveScopes": [], "requiredScope": "write"})
+        sink({"event": "AUTHZ_DENIED", "result": "denied", "authMethod": "kyaos", "agentDid": "did:key:a", "effectiveScopes": [], "reason": "tool is not in toolScopes"})
+        events = memory.events
+        assert memory.event_types == ["proof.verified", "authorization.denied", "proof.verified", "authorization.denied"]
+        assert events[1]["reason"] == {"code": "insufficient_scope"} and events[1]["authorization"] == {"source": "delegation", "decision": "denied", "scopeId": "write"}
+        assert events[3]["reason"] == {"code": "tool_not_permitted"} and events[3]["authorization"] == {"source": "delegation", "decision": "denied"}
+
+    def test_sink_an_oauth_caller(self) -> None:
+        memory = MemoryAuditSink()
+        audit = create_mcp_audit_trail(memory, "did:web:svc", oauth_subject_key=b"k" * 32)
+        audit.tool_audit_sink()({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "oauth", "oauthSubject": "u-1", "effectiveScopes": ["read"]})
+        assert memory.event_types == ["authorization.approved"]
+        event = memory.events[0]
+        assert event["actor"] == audit.oauth_actor("u-1") and event["authorization"] == {"source": "policy", "decision": "allowed"}
+        assert "u-1" not in json.dumps(event)
+
+    def test_sink_handles_odd_shapes_and_no_named_caller(self) -> None:
+        memory = MemoryAuditSink()
+        sink = create_mcp_audit_trail(memory, "did:web:svc").tool_audit_sink()
+        sink({"event": "AUTHZ_DENIED", "result": "denied", "authMethod": "oauth", "effectiveScopes": [], "toolName": 5, "requiredScope": 7, "delegation": "not-a-dict"})
+        sink({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "kyaos", "effectiveScopes": [], "correlationId": "given"})
+        events = memory.events
+        assert "actor" not in events[0] and events[0]["reason"] == {"code": "tool_not_permitted"} and events[0]["authorization"] == {"source": "policy", "decision": "denied"}
+        assert "actor" not in events[1] and events[1]["correlationId"] == "given" and events[2]["correlationId"] == "given"
+
+    def test_sink_records_the_tool_name_on_the_authorization_event_only_when_include_tool_names(self) -> None:
+        decision = {"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "oauth", "oauthSubject": "s", "effectiveScopes": [], "toolName": "refund"}
+        withheld, named = MemoryAuditSink(), MemoryAuditSink()
+        create_mcp_audit_trail(withheld, "did:web:svc").tool_audit_sink()(decision)
+        create_mcp_audit_trail(named, "did:web:svc", include_tool_names=True).tool_audit_sink()(decision)
+        assert withheld.events[0]["action"] == {"category": "authorization"}
+        assert named.events[0]["action"] == {"category": "authorization", "name": "refund"}
+
+    def test_sink_lets_a_reporter_failure_propagate(self) -> None:
+        class Failing:
+            def append(self, entry: AuditTrailEntry) -> None:
+                raise RuntimeError("reporter down")
+
+        with pytest.raises(RuntimeError, match="reporter down"):
+            create_mcp_audit_trail(Failing(), "did:web:svc").tool_audit_sink()({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "oauth", "oauthSubject": "s", "effectiveScopes": []})
+
+    # -- McpAuditTrail.begin_tool_call (JS: beginToolCall) -------------------------
+
+    def test_begin_tool_call_gives_an_audit_uuid_correlation_id_or_keeps_the_one_given(self) -> None:
+        audit = create_mcp_audit_trail(MemoryAuditSink(), "did:web:svc")
+        with audit.begin_tool_call("q") as call:
+            assert call.correlation_id.startswith("audit_") and len(call.correlation_id) == len("audit_") + 36
+        with audit.begin_tool_call("q", correlation_id="call-1") as call:
+            assert call.correlation_id == "call-1" and call.tool_name == "q"
+        assert current_tool_call() is None
+
+    def test_begin_tool_call_joins_the_gate_decision_and_the_lifecycle(self) -> None:
+        memory = MemoryAuditSink()
+        audit = create_mcp_audit_trail(memory, "did:web:svc", include_tool_names=True)
+        mw = gate(validate_oauth_token=lambda t: {"sub": "u-1", "scopes": ["read"]}, tool_scopes={"q": ["read"], "u": ["write"]}, audit_sink=audit.tool_audit_sink(), expected_target_service="did:web:svc")
+        with audit.begin_tool_call("q", correlation_id="call-1") as call:
+            assert current_tool_call() is call
+            mw({"name": "q", "headers": {"authorization": "Bearer tok"}})
+            started = call.started()
+            completed = call.completed()
+        assert started.event["eventType"] == "tool.call.started" and completed.event["outcome"] == "succeeded"
+        denied(lambda: mw({"name": "u", "headers": {"authorization": "Bearer tok"}}))
+        events = memory.events
+        assert memory.event_types == ["session.established", "authorization.approved", "tool.call.started", "tool.call.completed", "authorization.denied"]
+        assert all(e["correlationId"] == "call-1" for e in events[:4]) and "correlationId" not in events[4]
+        assert "actor" not in events[0]  # the caller is not known before the gate
+        assert all(e["actor"]["kind"] == "keyed_commitment" for e in events[1:])
+        assert events[1]["actor"] == events[2]["actor"] == events[4]["actor"] == call.actor  # learned from the gate's decision
+        assert events[2]["action"] == {"category": "tool.call", "name": "q"}
+        assert "u-1" not in json.dumps(events)
+
+    def test_begin_tool_call_keeps_a_given_actor_and_records_failed_and_denied(self) -> None:
+        memory = MemoryAuditSink()
+        audit = create_mcp_audit_trail(memory, "did:web:svc", source_id="s", tenant_ref=public_did("did:web:tenant"))
+        with audit.begin_tool_call(None, actor=pairwise_did("did:key:a")) as call:
+            assert call.tool_name is None
+            call.denied("vp_missing")
+        with audit.begin_tool_call("t") as call:
+            call.failed("handler_error")
+        with audit.begin_tool_call("t", actor=pairwise_did("did:key:given")):
+            # A decision that names no caller keeps the call's actor.
+            audit.tool_audit_sink()({"event": "AUTHZ_GRANTED", "result": "allowed", "authMethod": "kyaos", "effectiveScopes": []})
+        assert memory.events[-1]["actor"] == memory.events[-2]["actor"] == pairwise_did("did:key:given")
+        del memory.entries[4:]
+        events = memory.events
+        assert memory.event_types == ["session.established", "tool.call.denied", "session.established", "tool.call.failed"]
+        assert events[0]["correlationId"] == events[1]["correlationId"] != events[2]["correlationId"]
+        assert events[0]["actor"] == events[1]["actor"] == pairwise_did("did:key:a")
+        assert events[1]["reason"] == {"code": "vp_missing"} and events[1]["outcome"] == "denied"
+        assert events[3]["reason"] == {"code": "handler_error"} and events[3]["outcome"] == "failed"
+        assert all(e["tenantRef"] == public_did("did:web:tenant") and e["source"]["sourceId"] == "s" for e in events)
+
+    def test_begin_tool_call_scopes_the_context_an_explicit_member_wins(self) -> None:
+        memory = MemoryAuditSink()
+        audit = create_mcp_audit_trail(memory, "did:web:svc")
+        audit.tool("started", "unknown")
+        with audit.begin_tool_call("q", correlation_id="inside", actor=pairwise_did("did:key:a")):
+            audit.tool("started", "unknown")
+            audit.tool("started", "unknown", context={"correlationId": "explicit", "actor": pairwise_did("did:key:b")})
+        events = memory.events
+        assert "correlationId" not in events[0] and "actor" not in events[0]
+        assert events[2]["correlationId"] == "inside" and events[2]["actor"] == pairwise_did("did:key:a")
+        assert events[3]["correlationId"] == "explicit" and events[3]["actor"] == pairwise_did("did:key:b")
 
 def test_async_wrapper_runs_the_same_gate() -> None:
-    mw = async_helixid_mcp_middleware(MCPMiddlewareOptions(client=verifying_client(["read"]), tool_scopes={"q": ["read"]}))
-    assert asyncio.run(mw({"name": "q", "_meta": {"x-helix-vp": VP}}))["name"] == "q"
+    mw = async_helixid_mcp_middleware(MCPMiddlewareOptions(minimum_level="L1", verifier=verifying(["read"]), tool_scopes={"q": ["read"]}))
+    assert asyncio.run(mw({"name": "q", "_meta": PROOF_META}))["name"] == "q"
     with pytest.raises(HelixError) as excinfo:
-        asyncio.run(mw({"name": "nope", "_meta": {"x-helix-vp": VP}}))
+        asyncio.run(mw({"name": "nope", "_meta": PROOF_META}))
     assert excinfo.value.code == "TOOL_NOT_PERMITTED"
 
 
@@ -884,15 +1273,15 @@ class TestAsyncCallbacks:
             return {"sub": "u"}
 
         with pytest.raises(ValueError, match="async_helixid_mcp_middleware"):
-            gate(client=verifying_client([]), audit_sink=sink)
+            gate(verifier=verifying([]), audit_sink=sink)
         with pytest.raises(ValueError, match="async_helixid_mcp_middleware"):
             gate(validate_oauth_token=validate)
 
         # A sync callable that returns an awaitable is caught at call time: a sink
         # failure is reported, a validator is a configuration error (never a 401).
         errors: List[BaseException] = []
-        mw = gate(client=verifying_client([]), audit_sink=lambda e: sink(e), on_audit_error=errors.append)
-        assert mw({"name": "t", "_meta": {"x-helix-vp": VP}})
+        mw = gate(verifier=verifying([]), audit_sink=lambda e: sink(e), on_audit_error=errors.append)
+        assert mw({"name": "t", "_meta": PROOF_META})
         assert len(errors) == 1 and "awaitable" in str(errors[0])
         err = denied(lambda: gate(validate_oauth_token=lambda t: validate(t))({"name": "t", "headers": {"authorization": "Bearer x"}}))
         assert isinstance(err, TypeError) and to_http_error_response(err, META_URL) is None
@@ -912,38 +1301,35 @@ class TestAsyncCallbacks:
             await asyncio.sleep(0)
             events.append(event)
 
-        client = verifying_client(["read"])
-        client.verify_vp.side_effect = lambda vp, **kw: seen.update(verify_thread=threading.get_ident()) or {
-            "valid": True, "agentDid": "did:agent", "effectiveScopes": ["read"], "vpId": "v"}
+        verifier = verifying(["read"])
+        verifier.on_call = lambda: seen.update(verify_thread=threading.get_ident())
 
         async def run() -> None:
             seen["loop_thread"] = threading.get_ident()
-            mw = async_helixid_mcp_middleware(MCPMiddlewareOptions(client=client, validate_oauth_token=validate, audit_sink=sink, tool_scopes={"q": ["read"]}))
+            mw = async_helixid_mcp_middleware(MCPMiddlewareOptions(minimum_level="L1", verifier=verifier, validate_oauth_token=validate, audit_sink=sink, tool_scopes={"q": ["read"]}))
             await mw({"name": "q", "headers": {"authorization": "Bearer tok"}})
-            await mw({"name": "q", "_meta": {"x-helix-vp": VP}})
+            await mw({"name": "q", "_meta": PROOF_META})
 
         asyncio.run(run())
         assert [(e["event"], e.get("oauthSubject"), e.get("agentDid")) for e in events] == [("AUTHZ_GRANTED", "u-1", None), ("AUTHZ_GRANTED", None, "did:agent")]
         assert seen["validate_thread"] == seen["loop_thread"]  # the async callback ran on the loop
-        assert seen["verify_thread"] != seen["loop_thread"]  # the blocking API call did not
+        assert seen["verify_thread"] != seen["loop_thread"]  # the blocking verification did not
 
 
 class TestHostileInput:
     def test_absurdly_nested_json_is_a_bad_credential_not_a_crash(self) -> None:
         deep = base64.urlsafe_b64encode(b"[" * 100_000).rstrip(b"=").decode()
-        mw = gate(client=verifying_client([]), oauth=OAuthIssuerOptions(ISS_A, AUD, jwks_uri=f"{ISS_A}/jwks", http=FakeHttp()))
-        assert denied(lambda: mw({"name": "t", "headers": {"x-helix-vp": deep}})).code == "VP_INVALID_STRUCTURE"
-        assert denied(lambda: mw({"name": "t", "_meta": {"x-helix-vp": deep}})).code == "VP_INVALID_STRUCTURE"
+        mw = gate(verifier=verifying([]), oauth=OAuthIssuerOptions(ISS_A, AUD, jwks_uri=f"{ISS_A}/jwks", http=FakeHttp()))
         assert denied(lambda: mw({"name": "t", "headers": {"authorization": f"Bearer {deep}.{deep}.x"}})).code == "OAUTH_TOKEN_INVALID"
 
     def test_meta_that_is_not_a_mapping_is_treated_as_absent(self) -> None:
-        mw = gate(client=verifying_client([]))
+        mw = gate(verifier=verifying([]))
         for meta in ("x", [1], 5, object()):
-            assert denied(lambda meta=meta: mw({"name": "t", "_meta": meta})).code == "VP_MISSING"
+            assert denied(lambda meta=meta: mw({"name": "t", "_meta": meta})).code == "PROOF_MISSING"
 
         class Meta:  # the shape of the MCP Python SDK's RequestParams.Meta
             def model_dump(self, by_alias: bool = False) -> Dict[str, Any]:
-                return {"progressToken": None, "x-helix-vp": VP}
+                return {"progressToken": None, "org.kya-os/request-proof": PROOF}
 
         assert mw({"name": "t", "_meta": Meta()})["name"] == "t"
 
@@ -1014,21 +1400,3 @@ class TestOptionAndClaimEdges:
         raises_invalid(lambda: v("t0"), "Token expired")  # asked again: its entry is gone
         v("fresh")  # served from cache
         assert len(http.calls) == 1002
-
-
-class TestApiErrorClassification:
-    def test_any_error_carrying_a_credential_code_is_a_bad_credential(self) -> None:
-        class Odd(Exception):
-            code = "VC_REVOKED"
-
-        client = MagicMock()
-        client.verify_vp.side_effect = Odd("revoked upstream")
-        err = denied(lambda: gate(client=client)({"name": "t", "_meta": {"x-helix-vp": VP}}))
-        assert (err.code, str(err)) == ("VP_VERIFICATION_FAILED", "revoked upstream")
-
-    def test_an_api_refusal_of_this_servers_own_request_is_never_the_callers_403(self) -> None:
-        for code in ("INSUFFICIENT_SCOPE",):
-            client = MagicMock()
-            client.verify_vp.side_effect = HelixError(code, "your API key lacks vp:verify", 403)
-            err = denied(lambda client=client: gate(client=client)({"name": "t", "_meta": {"x-helix-vp": VP}}))
-            assert isinstance(err, RuntimeError) and to_http_error_response(err, META_URL) is None, code
