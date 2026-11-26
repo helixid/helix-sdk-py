@@ -19,7 +19,7 @@ fails after the handler ran returns the result marked degraded
 (``_meta["org.kya-os/audit"] = {"status": "degraded", "reason": ...}`` with
 ``isError``), the reference middleware's marker.
 
-``audit_tool_handlers`` (``auditToolHandlers``) wraps every tool a FastMCP
+``audit_tool_handlers`` (``auditToolHandlers``) wraps every tool an MCPServer (FastMCP in mcp 1.x)
 server registers in ``async_run_audited_tool``. Python servers are usually
 built once, not per request, so the call defaults to the tool call
 ``McpAuditTrail.begin_tool_call`` opened in the current context."""
@@ -132,7 +132,7 @@ def audit_tool_handlers(
     call: Optional[ToolCallAudit] = None,
     on_audit_error: Optional[Callable[[BaseException, str], None]] = None,
 ) -> _Server:
-    """Wraps every tool callback the FastMCP ``server`` registers from now on
+    """Wraps every tool callback the MCPServer ``server`` (FastMCP in mcp 1.x) registers from now on
     (``@server.tool(...)`` and ``server.add_tool(...)``) in
     ``async_run_audited_tool``, so the intent is recorded before the tool runs
     and the completion after. ``call`` defaults to the current context's tool
@@ -167,13 +167,13 @@ def audit_tool_handlers(
             result = await async_run_audited_tool(current, handler, on_audit_error)
             return CallToolResult.model_validate(result)
 
-        # FastMCP reads the parameters (resolved here, so string annotations
+        # MCPServer reads the parameters (resolved here, so string annotations
         # need not resolve in this module) and passes a CallToolResult through.
         tool.__signature__ = resolved  # type: ignore[attr-defined]
         tool.__annotations__ = {**hints, "return": CallToolResult}
         return tool
 
-    # FastMCP's @server.tool(...) registers through add_tool, so wrapping it covers both.
+    # MCPServer's @server.tool(...) registers through add_tool, so wrapping it covers both.
     add_tool = server.add_tool  # type: ignore[attr-defined]
     server.add_tool = lambda fn, *args, **kwargs: add_tool(audited(fn), *args, **kwargs)  # type: ignore[attr-defined]
     return server

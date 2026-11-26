@@ -51,7 +51,8 @@ from helix_sdk.entity_card import did_web_for
 ToolAuditEvent = Dict[str, Any]
 """One authorization decision for one tool call, as middleware.py reports it:
 event ('AUTHZ_GRANTED' | 'AUTHZ_DENIED'), result ('allowed' | 'denied'),
-timestamp, authMethod ('kyaos' | 'oauth'), effectiveScopes, and when known
+timestamp, authMethod ('kyaos' | 'oauth', or 'none' for a refusal of a caller
+the gate could not identify), effectiveScopes, and when known
 agentDid (the DID the request proof verified as), level and fresh (KYA-OS
 callers: the level the local verifier derived, story F-2, and whether every
 status was read live), oauthSubject (never recorded as such), toolName,
@@ -59,10 +60,15 @@ requiredScope, reason, serviceDid; ``correlationId`` defaults to the current
 ``begin_tool_call()``. Story C-C adds, for KYA-OS callers, proofAssurance
 ('L3' | 'L3-minus'), l3Minus (an L3 resting on an unfused proof),
 cnfDiagnostics (``cnf_present_but_token_unfused``) and, on a level refusal,
-requiredLevel; the typed events carry them only in the verification code."""
+requiredLevel; the typed events carry them only in the verification code.
+Every event carries method (the JSON-RPC method) and, when known,
+resourceUri / promptName, clientIp and userAgent; reasonCode names a refusal
+(``proof_missing``, ``oauth_token_invalid``, ``nonce_replayed``,
+``resource_not_permitted``, ...). An unidentified refusal ('none') may add
+oauthIssuer and claimedDid, what the caller claimed, with claimedVerified False."""
 
 AuditSink = Callable[[ToolAuditEvent], None]
-"""Receives every decision for an identified caller, before the tool runs."""
+"""Receives every decision (allowed or refused, identified or not), before the tool runs."""
 
 McpAuditContext = Dict[str, Any]
 """What every event of a tool call shares: ``actor``, ``responsibleParty``,
@@ -74,7 +80,7 @@ AuditContext = McpAuditContext
 OAUTH_SUBJECT_KEY_ID = "oauth-subject-v1"
 """The keyId of the keyed commitment an OAuth subject is recorded as."""
 
-_GUARD_REASONS = frozenset({"tool is not in toolScopes", "insufficient scope", "needs_authorization"})
+_GUARD_REASONS = frozenset({"tool is not in toolScopes", "resource is not in resourceScopes", "prompt is not in promptScopes", "insufficient scope", "needs_authorization"})
 """The guard's own denials of an identified caller; any other reason a KYA-OS caller is denied with is the local verifier's."""
 
 
@@ -391,6 +397,11 @@ class McpAuditTrail:
             kyaos = event.get("authMethod") == "kyaos"
             reason = event.get("reason") if isinstance(event.get("reason"), str) else None
             level_refused = kyaos and not allowed and event.get("requiredLevel") is not None
+            reason_code = event.get("reasonCode") if isinstance(event.get("reasonCode"), str) else None
+            if event.get("authMethod") == "none":
+                # A caller the gate could not identify: the refusal, with no actor (what it claimed stays in the sink's event only).
+                self.authorization("denied", "denied", reason_code=reason_code or "unidentified", context=base, tool_name=tool_name)
+                return
             if kyaos and not allowed and not level_refused and scope_id is None and reason is not None and reason not in _GUARD_REASONS:
                 # The local verifier refused the request proof: its reasons are codes, the first one names the refusal.
                 self.proof("rejected", "denied", reason_code=reason.split(",")[0].strip() or "proof_invalid", context=base)
@@ -412,6 +423,8 @@ class McpAuditTrail:
                     reason_code=(
                         LEVEL_INSUFFICIENT_REASON
                         if level_refused
+                        else reason_code
+                        if reason_code is not None
                         else "needs_authorization"
                         if event.get("reason") == "needs_authorization"
                         else "insufficient_scope" if scope_id is not None else "tool_not_permitted"

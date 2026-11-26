@@ -70,6 +70,8 @@ _MAPPED: Dict[str, Tuple[int, str]] = {
     _errors.CREDENTIAL_CONFLICT: (400, "invalid_request"),
     "INSUFFICIENT_SCOPE": (403, "insufficient_scope"),
     _errors.TOOL_NOT_PERMITTED: (403, "insufficient_scope"),
+    _errors.RESOURCE_NOT_PERMITTED: (403, "insufficient_scope"),
+    _errors.PROMPT_NOT_PERMITTED: (403, "insufficient_scope"),
     # KYA-OS session layer (story L2-A): a session id that is unknown, expired, malformed or another agent's.
     "KYAOS_REJECTED": (400, "invalid_request"),
     # KYA-OS story L3-E: the challenge (hosts without the signing runtime answer it here, unsigned) and a refused retry.

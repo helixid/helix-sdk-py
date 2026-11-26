@@ -23,8 +23,9 @@ dev = [
     "langchain-core>=0.3; python_version >= '3.10'",
     "crewai>=1.0; python_version >= '3.10'",
 ]
+# MCP Python SDK 2.x (MCPServer, formerly FastMCP); helix_mcp_middleware itself imports only mcp.types.
 mcp-middleware = [
-    "mcp>=1.9,<2; python_version >= '3.10'",
+    "mcp>=2.3,<3; python_version >= '3.10'",
     # /.well-known/mcp: the discovery document is validated against the KYA-OS schema (story L1-D).
     "jsonschema>=4.18",
 ]
@@ -42,7 +43,7 @@ crewai = [
     "crewai>=1.0; python_version >= '3.10'",
 ]
 all = [
-    "mcp>=1.9,<2; python_version >= '3.10'",
+    "mcp>=2.3,<3; python_version >= '3.10'",
     "jsonschema>=4.18",
     "redis>=5.0",
     "boto3>=1.28",

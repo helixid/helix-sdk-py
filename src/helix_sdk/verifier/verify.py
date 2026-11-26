@@ -100,6 +100,11 @@ class VerifierOptions:
     """Read every status list live, past the status cache (story L3-C with C-C's levels): a call to
     a tool whose minimum Card level is L3 needs fresh revocation status, which a cached read is not.
     Default False: the cache serves, and a cached read is not fresh, so at most L2."""
+    allow_own_authority: bool = False
+    """Own authority (the service's opt-in; default False): a call carrying no chain, from an agent
+    whose card names no ``responsibleParty``, acts on what the agent is attested for, intersected
+    with ``catalog`` (none without one). A card naming a ``responsibleParty`` still needs its chain
+    (SPEC-ENTITY-CARD section 11.1 step 6), so it gets no scopes this way."""
 
     @classmethod
     def from_dict(cls, options: Mapping[str, Any]) -> "VerifierOptions":
@@ -118,6 +123,7 @@ class VerifierOptions:
             "tokenCnfJkt": "token_cnf_jkt",
             "requireProof": "require_proof",
             "liveStatus": "live_status",
+            "allowOwnAuthority": "allow_own_authority",
         }
         return cls(**{names[key]: value for key, value in options.items() if key in names})
 
@@ -408,8 +414,14 @@ def verify(
         )
 
     # 8. Authority and level (story F-1 point 4; section 9.4): the proof floor holds only when a proof verified.
-    catalog = options.catalog if options.catalog is not None else leaf_allowed_action
-    effective_scopes = derive_effective_scopes(capabilities.verified, leaf_allowed_action, catalog)
+    # Own authority (allow_own_authority): no chain, a proven key and a card that names no responsible party.
+    own_authority = options.allow_own_authority and hops is None and proof_did is not None and entity_card is not None and entity_card.get("responsibleParty") is None
+    if own_authority:
+        offered = list(options.catalog) if options.catalog is not None else []
+        effective_scopes = derive_effective_scopes(capabilities.verified, offered, offered)
+    else:
+        catalog = options.catalog if options.catalog is not None else leaf_allowed_action
+        effective_scopes = derive_effective_scopes(capabilities.verified, leaf_allowed_action, catalog)
     fresh = chain_fresh and capabilities.fresh and card_fresh
     proof_floor = proof_did is not None
     level = derive_conformance_level({"verified": capabilities.verified, "unverified": capabilities.unverified}, proof_floor, fresh)

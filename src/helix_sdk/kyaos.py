@@ -10,7 +10,8 @@ canonical JSON and hashing (L1-B), EdDSA JWS and the Signer (L1-C), the
 session handshake and the detached response proof (L2-A), the per-request
 holder-of-key proof and the carried chain (C-C), the local verifier (F-2,
 C-C) as ``kyaos.verifier``, the signed needs_authorization challenge and the
-resume retry (L3-E), consent at Helix as ``kyaos.consent`` (L3-H), and reading a server's ``/.well-known/mcp`` discovery
+resume retry (L3-E), consent at Helix as ``kyaos.consent`` (L3-H), the Helix agent registry and the
+DID check of a service by its URL as ``kyaos.registry``, and reading a server's ``/.well-known/mcp`` discovery
 document (L1-D).
 
     from helix_sdk import kyaos
@@ -72,6 +73,7 @@ from .handshake import (
 )
 from . import verifier
 from . import consent
+from . import registry
 from .errors import ConsentFlowError
 from .request_proof import (
     DELEGATION_CHAIN_META_KEY,
@@ -165,6 +167,8 @@ __all__ = [
     "is_needs_authorization", "read_challenge", "retry_with_resume", "with_resume", "NeedsAuthorizationError",
     # consent at Helix: the user's did:key signs the root hop (L3-H)
     "consent", "ConsentFlowError",
+    # the Helix agent registry, and the DID check of a service by its URL (registry v3)
+    "registry",
     # discovery: /.well-known/mcp, client side (L1-D)
     "WELL_KNOWN_MCP_INVALID", "WELL_KNOWN_MCP_PATH", "WellKnownMcpError", "WellKnownMcpProblems",
     "fetch_well_known_mcp", "read_well_known_mcp", "well_known_mcp_url",

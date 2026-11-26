@@ -67,11 +67,14 @@ middleware has no shared replay store yet (story L2-A).
 
 ## How it is wired ([`app.py`](app.py))
 
-A small ASGI wrapper sits in front of the MCP SDK's Streamable HTTP app. For each `tools/call` in the request body it
-awaits `async_helixid_mcp_middleware` with the tool name, `params._meta`, the JSON-RPC request as received (the
-proof's `requestHash` covers it) and the request headers; a denial becomes a
-401 / 400 / 403 through `to_http_error_response()`, an unreachable authorization server a 503, and anything else is
-handed, body intact, to the transport. `initialize` and `tools/list` are not gated. The tools
+The gate is `helix_mcp_middleware`'s one-line `HelixMcpGate`, an ASGI middleware in front of the MCP SDK's (2.x)
+Streamable HTTP app: `HelixMcpGate(mcp_app, HelixMcpGateOptions(resource=..., **auth, tool_scopes=..., audit=..., kyaos=...))`.
+Every request goes through the gate, which decides: `initialize`, `notifications/initialized` and `tools/list` are open
+(the middleware's default, so clients can see what is offered), every other method needs a verified caller, and the
+middleware audits each refusal itself (the `_kyaos_handshake` tool is open to anonymous agents, so a handshake without a
+credential is not sent to the gate). A denial becomes a 401 / 400 / 403 through `to_http_error_response()`, an
+unreachable authorization server a 503, and anything else is
+handed, body intact, to the transport. The tools
 ([`orders.py`](orders.py)) contain no auth or audit code: with an audit trail, `audit_tool_handlers(server)` wraps
 each one before it is registered, so it runs under the tool call `begin_tool_call` opened for the request (the JS
 sample's `auditToolHandlers`).

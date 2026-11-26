@@ -25,7 +25,15 @@ carried in '_meta' (the MCP request's params._meta) under
 (`Authorization: Bearer <token>`); never in 'input'. 'request' is the
 JSON-RPC request as received ({"method", "params"}), when the host has it:
 the proof's requestHash is recomputed over exactly this, else the request is
-rebuilt from 'name', 'input' and '_meta'."""
+rebuilt from 'name', 'input' and '_meta'.
+
+'method' is the JSON-RPC method (``tools/call``, ``resources/read``,
+``prompts/get``, ``tools/list``, ...); default the received request's, else
+``tools/call``. Pass every request through the gate: it decides which methods
+are open (``open_methods``) and checks the rest. 'name' is what the call acts
+on: the tool, resource URI or prompt name (default from the request's params).
+'client_ip' is the caller's address as the host sees it, recorded in audit
+events only."""
 
 
 @dataclass
@@ -56,6 +64,19 @@ class MCPMiddlewareOptions:
     """Per-tool required scopes. Deny by default: when this map is set, a
     tool that is not a key in it is rejected before it runs (an empty list
     allows any authenticated caller). Takes precedence over `required_scopes`."""
+    open_methods: Optional[Sequence[str]] = None
+    """The JSON-RPC methods let through without a caller; default
+    ``DEFAULT_OPEN_METHODS`` (``initialize``, ``notifications/initialized``,
+    ``tools/list``), so clients can see what is available. Every other method
+    needs a verified caller. ``[]`` opens nothing."""
+    resource_scopes: Optional[Dict[str, List[str]]] = None
+    """Per-resource required scopes, keyed by URI, for ``resources/read``,
+    ``resources/subscribe`` and ``resources/unsubscribe``. Deny by default: a
+    URI that is not a key (or any URI when this is not set) is refused.
+    ``resources/list`` and ``resources/templates/list`` need a verified caller only."""
+    prompt_scopes: Optional[Dict[str, List[str]]] = None
+    """Per-prompt required scopes for ``prompts/get``, deny by default like
+    ``resource_scopes``. ``prompts/list`` needs a verified caller only."""
     oauth: Optional[Union[OAuthIssuerOptions, Sequence[OAuthIssuerOptions]]] = None
     """Accept `Authorization: Bearer` access tokens from one trusted
     authorization server, or a list of them (see helix_mcp_middleware.oauth
@@ -65,8 +86,10 @@ class MCPMiddlewareOptions:
     an AuthResult, or a dict with 'sub' and 'scopes'; raise to reject. May be
     async with async_helixid_mcp_middleware (as may `audit_sink`)."""
     audit_sink: Optional[Callable[[Dict[str, Any]], None]] = None
-    """Receives an event for every decision about an identified caller. See
-    create_helix_audit_sink."""
+    """Receives an event for every decision: allowed and refused, for an
+    identified caller and for one the gate could not identify (no credential,
+    a bad token, a refused proof naming no DID, a replay, ...). Open methods are
+    not audited. See create_helix_audit_sink."""
     on_audit_error: Optional[Callable[[BaseException], None]] = None
     """Called when `audit_sink` raises. Audit failures never block a tool call."""
     service_did: Optional[str] = None
@@ -75,7 +98,9 @@ class MCPMiddlewareOptions:
     """Story C-C: the Card level every tool demands, ``L1``, ``L2`` or ``L3``; default ``L3``.
     Checked after the scopes; a call below it raises LevelError (PROOF_LEVEL_INSUFFICIENT)."""
     tools: Optional[Dict[str, Any]] = None
-    """Story C-C: per-tool settings, ``{"lookup_order": {"minimum_level": "L2"}}``."""
+    """Story C-C: per-tool settings, ``{"lookup_order": {"minimum_level": "L2"}}``. ``"require_delegation": True``
+    keeps the tool out of an agent's own authority (``allow_own_authority``): the call needs a chain, such as
+    the user's consent, and with ``needs_authorization`` a call without one is answered with the consent challenge."""
     l3_minus_satisfies_l3: Optional[bool] = None
     """Story C-C: whether L3-minus (a proof with no token ``cnf`` to fuse) meets an ``L3`` minimum; default True."""
     needs_authorization: Optional["NeedsAuthorization"] = None

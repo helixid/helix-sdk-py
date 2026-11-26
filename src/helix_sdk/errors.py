@@ -15,7 +15,7 @@ caller already knows from the JS SDK or from helix-api's error responses.
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 from . import codes
 
@@ -394,9 +394,14 @@ class ConsentFlowError(HelixError):
     (``step_up_required`` among them), ``status`` the HTTP status Helix answered
     with, when it answered."""
 
-    def __init__(self, reason: str, message: str = "consent flow failed", status: int = 400) -> None:
-        super().__init__(codes.CONSENT_FLOW_FAILED, message, status, {"reason": reason})
+    def __init__(self, reason: str, message: str = "consent flow failed", status: int = 400, helix_code: Optional[str] = None) -> None:
+        details: Dict[str, Any] = {"reason": reason}
+        if helix_code is not None:
+            details["helixCode"] = helix_code
+        super().__init__(codes.CONSENT_FLOW_FAILED, message, status, details)
         self.reason = reason
+        #: The error code Helix answered with (``CONSENT_GRANT_SCOPE_NOT_ALLOWED``, say), when it answered with one.
+        self.helix_code = helix_code
 
 
 class JWTExpiredError(HelixError):

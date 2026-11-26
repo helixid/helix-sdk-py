@@ -16,8 +16,10 @@ from helix_sdk.errors import HelixError, InsufficientScopeError
 CREDENTIAL_CONFLICT = "CREDENTIAL_CONFLICT"
 OAUTH_TOKEN_INVALID = "OAUTH_TOKEN_INVALID"
 TOOL_NOT_PERMITTED = "TOOL_NOT_PERMITTED"
+RESOURCE_NOT_PERMITTED = "RESOURCE_NOT_PERMITTED"
+PROMPT_NOT_PERMITTED = "PROMPT_NOT_PERMITTED"
 
-_STATUS = {CREDENTIAL_CONFLICT: 400, OAUTH_TOKEN_INVALID: 401, TOOL_NOT_PERMITTED: 403}
+_STATUS = {CREDENTIAL_CONFLICT: 400, OAUTH_TOKEN_INVALID: 401, TOOL_NOT_PERMITTED: 403, RESOURCE_NOT_PERMITTED: 403, PROMPT_NOT_PERMITTED: 403}
 
 
 class MCPAuthError(HelixError):
@@ -68,10 +70,14 @@ class ToolScopeError(InsufficientScopeError):
     first one the caller lacked (what the audit row records);
     `required_scopes` is everything the tool requires."""
 
-    def __init__(self, required_scope: str, required_scopes: Optional[Sequence[str]] = None) -> None:
+    def __init__(self, required_scope: str, required_scopes: Optional[Sequence[str]] = None, message: Optional[str] = None) -> None:
         super().__init__(required_scope)
         self.required_scope = required_scope
         self.required_scopes = list(required_scopes) if required_scopes is not None else [required_scope]
+        if message is not None:
+            # Replaces the default "Required scope: …" (a refused consent request says why, say).
+            self.message = message
+            self.args = (message,)
 
 
 class AuthorizationServerUnavailableError(Exception):

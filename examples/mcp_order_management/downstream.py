@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Annotated, Any, Callable, Dict, List, Optional
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import Field
 
@@ -41,7 +41,7 @@ class DownstreamOptions:
     """Milliseconds since the epoch, for the proof's ``iat``."""
 
 
-def register_forward_tool(server: FastMCP, downstream: DownstreamOptions) -> None:
+def register_forward_tool(server: MCPServer, downstream: DownstreamOptions) -> None:
     @server.tool(
         name=FORWARD_TOOL,
         title="Look up an order at the downstream service",

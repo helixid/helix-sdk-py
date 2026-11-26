@@ -66,3 +66,32 @@ def challenge_for(
         level=caller.get("level"),
         fresh=caller.get("fresh"),
     )
+
+
+#: Helix error codes that refuse a consent request because of the caller, not
+#: the service: the agent is not attested for the scope (or for any scope the
+#: request names), or Helix does not know it as an agent it may ask consent for.
+CALLER_CONSENT_REFUSALS = frozenset({"CONSENT_GRANT_SCOPE_NOT_ALLOWED", "CONSENT_NO_GRANTABLE_SCOPES", "DID_NOT_FOUND"})
+
+
+def consent_failure_of(error: BaseException) -> Optional[Dict[str, str]]:
+    """Sorts an error raised while the challenge's consent request was made at
+    Helix (a ``ConsentFlowError``, matched by its code):
+    ``{"kind": "refused", "helixCode", "message"}`` when Helix refused it because
+    of the caller (CALLER_CONSENT_REFUSALS); ``{"kind": "unavailable", "message"}``
+    when Helix could not be reached or failed (5xx, 408, 429, or no usable
+    answer); None for anything else (the service's own setup, say), left to the
+    host as a server error."""
+    if getattr(error, "code", None) != "CONSENT_FLOW_FAILED":
+        return None
+    message = getattr(error, "message", None)
+    message = message if isinstance(message, str) else "consent flow failed"
+    status = getattr(error, "http_status", None)
+    status = status if isinstance(status, int) else 0
+    reason = getattr(error, "reason", None)
+    if reason == "consent_unreachable" or status >= 500 or status in (408, 429):
+        return {"kind": "unavailable", "message": message}
+    helix_code = getattr(error, "helix_code", None)
+    if reason == "consent_request_refused" and isinstance(helix_code, str) and helix_code in CALLER_CONSENT_REFUSALS:
+        return {"kind": "refused", "helixCode": helix_code, "message": message}
+    return None

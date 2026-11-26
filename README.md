@@ -149,6 +149,39 @@ signals.start()  # or mount signals.asgi_webhook() at the URL registered with He
   `create_local_verifier()`, story F-2; the Helix API is never asked), or an
   OAuth 2.1 bearer token. A bearer token sent with a proof is the proof's
   sender constraint (`cnf` fusion, L3). The Helix VP is no longer read.
+  **The one-line HTTP gate, `HelixMcpGate`** (same names and options as
+  helix-sdk-js's `helixMcpGate`), is an ASGI middleware in front of the MCP
+  Streamable HTTP app (`mcp` 2.x `MCPServer.streamable_http_app(stateless_http=True,
+  json_response=True)`):
+  `app = HelixMcpGate(mcp_app, resource=..., verifier=..., tool_scopes=..., audit=..., kyaos=...)`,
+  or `app.add_middleware(HelixMcpGate, resource=..., ...)` on Starlette/FastAPI.
+  It serves the RFC 9728 metadata and reads each POST to the MCP path. It
+  passes every request through the gate and answers refusals with 401 / 403 / 400
+  and `WWW-Authenticate` (503 with `Retry-After` when an authorization server is
+  down). It runs the KYA-OS handshake, sessions, `needs_authorization` and the
+  response proof, and runs the call in the caller's delegation context and
+  audit call. It builds the verifier's replay store from `KYAOS_NONCE_STORE`
+  when you give `LocalVerifierOptions` without one. Then it replays the body to
+  the app behind it. The handshake tool reads the agent its credential
+  identified at `request.state.helix_mcp_authenticated_agent_did`
+  (`AUTHENTICATED_AGENT_STATE_KEY`). The `[mcp-middleware]` extra installs
+  `mcp>=2.3,<3`.
+  Pass every JSON-RPC request through the gate (its `method`, or the
+  `request` as received, plus `headers` and `clientIp`); it decides which
+  need a caller. `DEFAULT_OPEN_METHODS` (`initialize`,
+  `notifications/initialized`, `tools/list`) pass unchecked and unaudited,
+  on purpose, so clients can see what the server offers; change them with
+  `open_methods` (`[]` opens nothing). Every other method needs a verified
+  caller: `resources/read` / `resources/subscribe` / `resources/unsubscribe`
+  are checked against `resource_scopes` (by URI) and `prompts/get` against
+  `prompt_scopes`, both deny by default (`RESOURCE_NOT_PERMITTED` /
+  `PROMPT_NOT_PERMITTED`, 403); list methods and `ping` need the caller only.
+  Every refusal is audited, including those of a caller the gate could not
+  identify (no credential, a bad bearer, a proof naming no verified DID, a
+  replay, `CREDENTIAL_CONFLICT`): `authMethod: 'none'`, no actor, with the
+  method and target, `reasonCode`, `clientIp`, `userAgent` and, marked
+  `claimedVerified: False`, `oauthIssuer` / `claimedDid`; in the typed trail
+  `authorization.denied` with that reason code.
   `tool_scopes` maps each tool to the scopes it needs and denies unlisted
   tools; then `minimum_level` (default `L3`), `tools[name]["minimum_level"]`
   and `l3_minus_satisfies_l3` set the Card level each tool demands (story

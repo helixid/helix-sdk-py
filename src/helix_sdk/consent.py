@@ -62,6 +62,8 @@ class ConsentReasons:
     RENEWAL_REFUSED = "consent_renewal_refused"
     WITHDRAWAL_REFUSED = "consent_withdrawal_refused"
     URL_INVALID = "consent_url_invalid"
+    #: Helix could not be reached (the request never got an answer).
+    UNREACHABLE = "consent_unreachable"
 
 
 Http = Any
@@ -123,14 +125,17 @@ def _body(response: Any) -> Any:
 
 
 def _post(http: Http, url: str, request: str) -> Any:
-    return _http(http).post(url, json={"request": request}, timeout=10)
+    try:
+        return _http(http).post(url, json={"request": request}, timeout=10)
+    except Exception as error:  # no answer at all: an outage, never a refusal
+        raise ConsentFlowError(ConsentReasons.UNREACHABLE, f"Helix could not be reached: {error}", 503) from error
 
 
 def _refusal(reason: str, what: str, status: int, body: Any) -> ConsentFlowError:
     error = body.get("error") if isinstance(body, Mapping) else None
     code = error.get("code") if isinstance(error, Mapping) else None
     message = error.get("message") if isinstance(error, Mapping) else None
-    return ConsentFlowError(reason, f"{what}: {code or status} {message or ''}".strip(), status)
+    return ConsentFlowError(reason, f"{what}: {code or status} {message or ''}".strip(), status, code if isinstance(code, str) else None)
 
 
 def _trim(url: str) -> str:

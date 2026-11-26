@@ -22,7 +22,7 @@ import inspect
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
 
 from helix_sdk.verifier import read_carried_chain, read_request_proof
 
@@ -33,8 +33,10 @@ from .delegation.verification_cache import VerificationCache
 from .errors import (
     CREDENTIAL_CONFLICT,
     OAUTH_TOKEN_INVALID,
+    PROMPT_NOT_PERMITTED,
     PROOF_INVALID,
     PROOF_MISSING,
+    RESOURCE_NOT_PERMITTED,
     TOOL_NOT_PERMITTED,
     AuthorizationServerUnavailableError,
     LevelError,
@@ -42,9 +44,10 @@ from .errors import (
     ProofError,
     ToolScopeError,
 )
+from .gate import DEFAULT_OPEN_METHODS, PROMPT_METHODS, RESOURCE_METHODS, claimed_did_of, claimed_issuer_of, header_of, method_of, refusal_code_of, target_of
 from .level import LevelPolicy, assert_level_policy, derived_level_of, meets_minimum_level, minimum_level_for
 from .oauth import AuthResult, cnf_jkt_of, create_oauth_validator
-from .needs_authorization_guard import challenge_for, resume_retry
+from .needs_authorization_guard import challenge_for, consent_failure_of, resume_retry
 from .types import MCPMiddlewareOptions, MCPToolCall
 from .verify_locally import LocalVerifier, LocalVerifierOptions, create_local_verifier
 
@@ -56,7 +59,7 @@ class AuthorizedCaller:
     ``clientDid`` comes from ``agent_did``). Mirrors helix-sdk-js's AuthorizedCaller."""
 
     auth_method: str
-    """'kyaos' or 'oauth'."""
+    """'kyaos' or 'oauth'; 'none' for an open method (``open_methods``), let through without checking anyone."""
     scopes: List[str] = field(default_factory=list)
     agent_did: Optional[str] = None
     oauth_subject: Optional[str] = None
@@ -168,7 +171,33 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
         else:
             inbound_cache = VerificationCache()
 
-    def audit(caller: Dict[str, Any], tool_name: Optional[str], denied: Optional[Dict[str, str]]) -> None:
+    open_methods = frozenset(options.open_methods if options.open_methods is not None else DEFAULT_OPEN_METHODS)
+    # Own authority: the agent's attested capabilities count as far as this service offers them, across its
+    # tools, resources and prompts (each gated method checks its own map below).
+    offered_scopes = [scopes for scopes in (options.tool_scopes, options.resource_scopes, options.prompt_scopes) if scopes is not None]
+    own_authority_catalog: Optional[List[str]] = (
+        list(dict.fromkeys(scope for scopes in offered_scopes for values in scopes.values() for scope in values)) if offered_scopes else None
+    )
+
+    def request_fields(ctx: Dict[str, Any]) -> Dict[str, Any]:
+        fields: Dict[str, Any] = {"method": ctx["method"]}
+        for key in ("resourceUri", "promptName", "clientIp", "userAgent"):
+            if ctx.get(key) is not None:
+                fields[key] = ctx[key]
+        return fields
+
+    def deliver(event: Dict[str, Any]) -> None:
+        if options.audit_sink is None:
+            return
+        try:
+            _refuse_awaitable(options.audit_sink(event), "audit_sink")
+        except Exception as exc:  # noqa: BLE001 - a failing sink never blocks a call
+            if options.on_audit_error is not None:
+                options.on_audit_error(exc)
+
+    def audit(ctx: Dict[str, Any], caller: Dict[str, Any], denied: Optional[Dict[str, str]]) -> None:
+        ctx["audited"] = True
+        tool_name = ctx["toolName"]
         if options.audit_sink is None:
             return
         event: Dict[str, Any] = {
@@ -195,11 +224,36 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
             event["reason"] = denied["reason"]
         if service_did is not None:
             event["serviceDid"] = service_did
-        try:
-            _refuse_awaitable(options.audit_sink(event), "audit_sink")
-        except Exception as exc:  # noqa: BLE001 - a failing sink never blocks a call
-            if options.on_audit_error is not None:
-                options.on_audit_error(exc)
+        if denied and denied.get("reasonCode") is not None:
+            event["reasonCode"] = denied["reasonCode"]
+        event.update(request_fields(ctx))
+        deliver(event)
+
+    def audit_unidentified(ctx: Dict[str, Any], tool_call: MCPToolCall, reason_code: str) -> None:
+        """A refusal of a caller the gate could not identify: what is known, the claims marked unverified, no actor."""
+        event: Dict[str, Any] = {
+            "event": "AUTHZ_DENIED",
+            "result": "denied",
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "authMethod": "none",
+            "effectiveScopes": [],
+            "reason": reason_code,
+            "reasonCode": reason_code,
+        }
+        if ctx["toolName"] is not None:
+            event["toolName"] = ctx["toolName"]
+        if service_did is not None:
+            event["serviceDid"] = service_did
+        event.update(request_fields(ctx))
+        oauth_issuer = claimed_issuer_of(tool_call.get("headers"))
+        claimed_did = claimed_did_of(meta_mapping(tool_call.get("_meta")), read_request_proof)
+        if oauth_issuer is not None:
+            event["oauthIssuer"] = oauth_issuer
+        if claimed_did is not None:
+            event["claimedDid"] = claimed_did
+        if oauth_issuer is not None or claimed_did is not None:
+            event["claimedVerified"] = False
+        deliver(event)
 
     def validate_bearer(token: str) -> AuthResult:
         if validate_oauth is None:
@@ -217,10 +271,45 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
         return auth
 
     def authorize(tool_call: MCPToolCall) -> AuthorizedCaller:
+        """Every request goes through here. An open method (``open_methods``)
+        passes unchecked; any other needs a verified caller, and every refusal is
+        audited, including those of a caller the gate could not identify."""
+        method = method_of(tool_call)
+        if method in open_methods:
+            return AuthorizedCaller(auth_method="none")
+        target = target_of(method, tool_call)
+        client_ip = tool_call.get("clientIp", tool_call.get("client_ip"))
+        ctx: Dict[str, Any] = {
+            "method": method,
+            "toolName": target if method == "tools/call" else None,
+            "resourceUri": target if method in RESOURCE_METHODS else None,
+            "promptName": target if method in PROMPT_METHODS else None,
+            "clientIp": client_ip if isinstance(client_ip, str) else None,
+            "userAgent": header_of(tool_call.get("headers"), "user-agent"),
+            "audited": False,
+        }
+        try:
+            return authorize_request(tool_call, ctx)
+        except Exception as error:
+            reason_code = None if ctx["audited"] else refusal_code_of(error)
+            if reason_code is not None:
+                audit_unidentified(ctx, tool_call, reason_code)
+            raise
+
+    def proof_request_of(tool_call: MCPToolCall, method: str) -> Any:
+        """The proof binds the JSON-RPC request: the one received, else rebuilt (``tools/call`` by the verifier; another method here)."""
+        if tool_call.get("request") is not None or method == "tools/call":
+            return tool_call.get("request")
+        params: Dict[str, Any] = dict(tool_call.get("input") or {})
+        if tool_call.get("_meta") is not None:
+            params["_meta"] = tool_call["_meta"]
+        return {"method": method, "params": params}
+
+    def authorize_request(tool_call: MCPToolCall, ctx: Dict[str, Any]) -> AuthorizedCaller:
         # Credentials come from Authorization or `_meta` only; tool arguments
         # are never consulted. Ambiguous credentials raise.
-        name = tool_call.get("name")
-        tool_name = name if isinstance(name, str) else None
+        tool_name = ctx["toolName"]
+        proof_request = proof_request_of(tool_call, ctx["method"])
         forwarded = inbound_on and has_delegation_headers(tool_call.get("headers"))
         if forwarded:
             meta = meta_mapping(tool_call.get("_meta"))
@@ -249,8 +338,8 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
             if not inbound_result.ok:
                 if inbound_result.agent_did is not None:
                     audit(
+                        ctx,
                         {"authMethod": "kyaos", "scopes": [], "agentDid": inbound_result.agent_did, "level": inbound_result.level, "fresh": inbound_result.fresh},
-                        tool_name,
                         {"reason": ",".join(inbound_result.reasons)},
                     )
                 raise ProofError(PROOF_INVALID, f"The delegation headers were refused: {', '.join(inbound_result.reasons)}", inbound_result.reasons)
@@ -277,10 +366,12 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
             # A tool that demands L3 needs fresh revocation status: its lists are read live, past the status cache (story L3-C).
             if minimum_level_for(level_policy, tool_name) == "L3":
                 call["live_status"] = True
-            if tool_call.get("request") is not None:
-                call["request"] = tool_call["request"]
+            if proof_request is not None:
+                call["request"] = proof_request
             if token_cnf_jkt is not None:
                 call["token_cnf_jkt"] = token_cnf_jkt
+            if getattr(local_verifier, "allow_own_authority", False) and own_authority_catalog is not None:
+                call["catalog"] = own_authority_catalog
             result = local_verifier.verify_call(call)
             if result is None:  # pragma: no cover - extract_credential found a proof, so verify_call reads one
                 raise ProofError(PROOF_MISSING, "The request carries no KYA-OS request proof")
@@ -288,8 +379,8 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
                 refused = ProofError(PROOF_INVALID, f"The request proof was refused: {', '.join(result.reasons)}", result.reasons)
                 if result.proof_did is not None:
                     audit(
+                        ctx,
                         {"authMethod": "kyaos", "scopes": [], "agentDid": result.proof_did, "level": result.level, "fresh": result.fresh},
-                        tool_name,
                         {"reason": ",".join(result.reasons)},
                     )
                 raise refused
@@ -312,17 +403,37 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
             auth = validate_bearer(credential.token)
             caller = {"authMethod": "oauth", "scopes": list(auth.scopes or []), "oauthSubject": auth.sub}
 
-        # Authorization. With a tool_scopes map the default is deny: an
-        # unlisted tool (or a call with no tool name) never runs.
+        # Authorization, by method. With a tool_scopes map the default is deny:
+        # an unlisted tool (or a call with no tool name) never runs. Resources and
+        # prompts are deny by default: only what resource_scopes / prompt_scopes list.
+        # Any other method (resources/list, prompts/list, ping, ...) needs the verified caller only.
         required: List[str]
-        if options.tool_scopes is not None:
-            if tool_name is None or tool_name not in options.tool_scopes:
-                audit(caller, tool_name, {"reason": "tool is not in toolScopes"})
-                raise MCPAuthError(TOOL_NOT_PERMITTED, "This tool is not permitted")
-            required = list(options.tool_scopes[tool_name] or [])
+        method = ctx["method"]
+        if method == "tools/call":
+            if options.tool_scopes is not None:
+                if tool_name is None or tool_name not in options.tool_scopes:
+                    audit(ctx, caller, {"reason": "tool is not in toolScopes"})
+                    raise MCPAuthError(TOOL_NOT_PERMITTED, "This tool is not permitted")
+                required = list(options.tool_scopes[tool_name] or [])
+            else:
+                required = list(options.required_scopes or [])
+        elif method in RESOURCE_METHODS or method in PROMPT_METHODS:
+            resource = method in RESOURCE_METHODS
+            scopes = options.resource_scopes if resource else options.prompt_scopes
+            target = ctx["resourceUri"] if resource else ctx["promptName"]
+            kind = "resource" if resource else "prompt"
+            if scopes is None or target is None or target not in scopes:
+                audit(ctx, caller, {"reason": f"{kind} is not in {kind}Scopes", "reasonCode": f"{kind}_not_permitted"})
+                raise MCPAuthError(RESOURCE_NOT_PERMITTED if resource else PROMPT_NOT_PERMITTED, f"This {kind} is not permitted")
+            required = list(scopes[target] or [])
         else:
-            required = list(options.required_scopes or [])
+            required = []
 
+        # A tool marked require_delegation is not covered by the agent's own authority: only what a chain grants
+        # (the user's consent, say) counts, so a call without one is challenged when needs_authorization is set.
+        tool_settings = (options.tools or {}).get(tool_name) if tool_name is not None else None
+        if isinstance(tool_settings, Mapping) and tool_settings.get("require_delegation") is True and caller["authMethod"] == "kyaos" and caller.get("chain") is None:
+            caller = {**caller, "scopes": []}
         # KYA-OS story L3-E: a retry after consent carries its resume token and credential (needs_authorization_guard.py).
         retry = resume_retry(options.needs_authorization, caller, tool_call, tool_name, required)
         if retry is not None:
@@ -330,10 +441,20 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
         missing = next((scope for scope in required if scope not in caller["scopes"]), None)
         if missing is not None:
             # KYA-OS story L3-E: an identified caller without the authority gets a signed challenge instead of the plain 403.
-            challenge = challenge_for(options.needs_authorization, caller, tool_name, required) if retry is None else None
+            try:
+                challenge = challenge_for(options.needs_authorization, caller, tool_name, required) if retry is None else None
+            except Exception as error:
+                # The consent request behind the challenge failed at Helix: the caller's refusal is a 403, Helix's outage a 503.
+                failure = consent_failure_of(error)
+                if failure is None:
+                    raise
+                if failure["kind"] == "unavailable":
+                    raise AuthorizationServerUnavailableError(f"Helix's consent service is unavailable: {failure['message']}") from error
+                audit(ctx, caller, {"scope": missing, "reason": f"consent_refused: {failure['helixCode']}"})
+                raise ToolScopeError(missing, required, f"Required scope: {' '.join(required)}. {failure['message']}") from error
             if challenge is not None:
                 raise challenge
-            audit(caller, tool_name, {"scope": missing, "reason": "insufficient scope"})
+            audit(ctx, caller, {"scope": missing, "reason": "insufficient scope"})
             raise ToolScopeError(missing, required)
 
         # The level, after the scopes (story C-C): how sure we are the caller is that agent right now.
@@ -341,10 +462,10 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
             required_level = minimum_level_for(level_policy, tool_name)
             derived = derived_level_of(caller.get("level") or "L1", caller.get("proofAssurance"))
             if not meets_minimum_level(derived, required_level, l3_minus_satisfies_l3):
-                audit(caller, tool_name, {"reason": f"level_insufficient: {derived} < {required_level}", "requiredLevel": required_level})
+                audit(ctx, caller, {"reason": f"level_insufficient: {derived} < {required_level}", "requiredLevel": required_level})
                 raise LevelError(derived, required_level)
 
-        audit(caller, tool_name, None)
+        audit(ctx, caller, None)
         return _caller_of(caller)
 
     def middleware(tool_call: MCPToolCall) -> MCPToolCall:

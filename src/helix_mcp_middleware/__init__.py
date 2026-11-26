@@ -105,6 +105,8 @@ from .metadata import (
     to_http_error_response,
 )
 from .middleware import AuthorizedCaller, async_helixid_mcp_middleware, helixid_mcp_middleware
+from .gate import DEFAULT_OPEN_METHODS, PROMPT_METHODS, RESOURCE_METHODS
+from .http_gate import AUTHENTICATED_AGENT_STATE_KEY, HelixMcpGate, HelixMcpGateOptions
 from .oauth import (
     AuthResult,
     OAuthIntrospectionOptions,
@@ -158,6 +160,12 @@ __all__ = [
     "mark_audit_degraded",
     "run_audited_tool",
     "helixid_mcp_middleware",
+    "DEFAULT_OPEN_METHODS",
+    "RESOURCE_METHODS",
+    "PROMPT_METHODS",
+    "HelixMcpGate",
+    "HelixMcpGateOptions",
+    "AUTHENTICATED_AGENT_STATE_KEY",
     "async_helixid_mcp_middleware",
     "MCPMiddlewareOptions",
     "MiddlewareVerifierOptions",

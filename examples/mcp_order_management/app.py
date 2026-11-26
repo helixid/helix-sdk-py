@@ -9,10 +9,13 @@ tool call gated by helix_mcp_middleware.
 The gate runs at the HTTP layer, in front of the MCP transport, so a missing
 or invalid credential gets a real HTTP 401 with `WWW-Authenticate` pointing
 at the RFC 9728 metadata (which is how OAuth clients discover the
-authorization server), and a scope failure gets a 403. Only `tools/call` is
-gated: `initialize` and `tools/list` stay open, and a KYA-OS request proof
-(in `params._meta`) is verified once per tool call, in-process, over the
-JSON-RPC request exactly as received (story F-2).
+authorization server), and a scope failure gets a 403. Every request goes
+through the gate, which decides: its open methods (``initialize``,
+``notifications/initialized`` and ``tools/list`` by default, so a client can
+see what is offered) pass, every other method needs a verified caller, and
+the middleware audits every refusal itself. A KYA-OS request proof (in
+`params._meta`) is verified once per call, in-process, over the JSON-RPC
+request exactly as received (story F-2).
 
 With an `audit` trail (McpAuditTrail), every gated tools/call is bracketed
 by typed KYA-OS audit events: `session.established` before the gate, the
@@ -41,48 +44,35 @@ verified through that layer before the tool runs."""
 
 from __future__ import annotations
 
-import json
-from contextlib import nullcontext
-from dataclasses import replace
-from typing import Annotated, Any, Awaitable, Callable, Dict, Optional, Sequence, Tuple
+from dataclasses import fields
+from typing import Annotated, Any, Callable, Dict, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, TextContent
 from pydantic import Field, StrictInt
-from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 
 from helix_mcp_middleware import (
-    AuthorizationServerUnavailableError,
-    KyaOsDenied,
-    KyaOsNeedsAuthorization,
+    AUTHENTICATED_AGENT_STATE_KEY,
+    HelixMcpGate,
+    HelixMcpGateOptions,
     KyaOsRuntime,
     McpAuditTrail,
     MCPMiddlewareOptions,
     ServeIdentityOptions,
     WellKnownMcp,
-    async_helixid_mcp_middleware,
-    delegation_context_of,
-    run_with_delegation,
     audit_tool_handlers,
-    build_protected_resource_metadata,
-    protected_resource_metadata_url,
     serve_identity,
-    to_http_error_response,
 )
 
 from .downstream import FORWARD_TOOL_SCOPES, DownstreamOptions, register_forward_tool
 from .orders import TOOL_SCOPES, OrderStore, create_order_store, register_order_tools
 
-MAX_BODY_BYTES = 1_000_000
-
-# Where the ASGI layer leaves the agent the handshake call's credentials identified, for the handshake tool to read.
-_AUTHENTICATED_AGENT = "kyaos_authenticated_agent_did"
 
 
-def _register_handshake(server: FastMCP, kyaos: KyaOsRuntime) -> None:
+def _register_handshake(server: MCPServer, kyaos: KyaOsRuntime) -> None:
     @server.tool(
         name=kyaos.handshake_tool_name,
         title="KYA-OS handshake",
@@ -103,49 +93,13 @@ def _register_handshake(server: FastMCP, kyaos: KyaOsRuntime) -> None:
             "clientInfo": clientInfo, "clientProtocolVersion": clientProtocolVersion, "clientCapabilities": clientCapabilities,
         }
         request = ctx.request_context.request
-        verified = getattr(request.state, _AUTHENTICATED_AGENT, None) if request is not None else None
+        verified = getattr(request.state, AUTHENTICATED_AGENT_STATE_KEY, None) if request is not None else None
         result = await kyaos.handshake_tool_result({k: v for k, v in args.items() if v is not None}, authenticated_agent_did=verified)
         return CallToolResult(
             content=[TextContent(type="text", text=result["content"][0]["text"])],
             structuredContent=result["structuredContent"],
             isError=bool(result.get("isError", False)),
         )
-
-
-async def _send_with_proof(
-    send: Callable[[Any], Awaitable[None]],
-    finish: Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]],
-    on_error: Callable[[BaseException], Awaitable[None]],
-) -> Callable[[Any], Awaitable[None]]:
-    """A `send` that holds the MCP transport's JSON response, signs the proof
-    over its `result` and sends the result with the proof in `_meta`."""
-    start: Dict[str, Any] = {}
-    parts: list = []
-
-    async def proven(message: Any) -> None:
-        if message["type"] == "http.response.start":
-            start.update(message)
-            return
-        if message["type"] != "http.response.body":  # pragma: no cover - nothing else comes on a JSON response
-            await send(message)
-            return
-        parts.append(message.get("body", b""))
-        if message.get("more_body", False):
-            return
-        body = b"".join(parts)
-        try:
-            payload = json.loads(body.decode("utf-8")) if body else None
-            if isinstance(payload, dict) and isinstance(payload.get("result"), dict):
-                payload["result"] = await finish(payload["result"])
-                body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        except Exception as error:  # noqa: BLE001 - an unproven result is never sent
-            await on_error(error)
-            return
-        headers = [(k, v) for k, v in start.get("headers", []) if k.lower() != b"content-length"]
-        await send({**start, "headers": headers + [(b"content-length", str(len(body)).encode())]})
-        await send({"type": "http.response.body", "body": body, "more_body": False})
-
-    return proven
 
 
 def create_order_app(
@@ -180,24 +134,21 @@ def create_order_app(
         raise ValueError(f"resource must be an http(s) URL, got {resource!r}")
     host = f"[{url.hostname}]" if ":" in url.hostname else url.hostname  # lower-cased, no port or userinfo
     mcp_path = url.path or "/"
-    metadata_url = protected_resource_metadata_url(resource)
-    metadata_path = urlsplit(metadata_url).path
-    metadata = build_protected_resource_metadata(
-        resource,
-        authorization_servers=authorization_servers,
-        scopes_supported=list(dict.fromkeys(s for scopes in {**TOOL_SCOPES, **(FORWARD_TOOL_SCOPES if downstream else {})}.values() for s in scopes)),
-        resource_name="Order Management (HelixID sample)",
-    )
     served_identity = serve_identity(identity) if identity is not None else None
-    # The handshake needs an identified caller, not a scope: it is listed with none (story F-2).
-    base_scopes = {**TOOL_SCOPES, **FORWARD_TOOL_SCOPES} if downstream is not None else TOOL_SCOPES
-    tool_scopes = {**base_scopes, kyaos.handshake_tool_name: []} if kyaos is not None else base_scopes
-    # The handshake opens a session for any identified caller: it accepts every Card level (story C-C).
-    tools = {**(auth.tools or {}), kyaos.handshake_tool_name: {"minimum_level": "L1"}} if kyaos is not None else auth.tools
-    gate = async_helixid_mcp_middleware(replace(auth, tool_scopes=tool_scopes, required_scopes=[], tools=tools))
+    tool_scopes = {**TOOL_SCOPES, **FORWARD_TOOL_SCOPES} if downstream is not None else TOOL_SCOPES
 
-    server = FastMCP(
-        "order-management",
+    # MCP Python SDK 2.x: MCPServer (FastMCP in 1.x); the HTTP settings go to streamable_http_app() below.
+    server = MCPServer("order-management")
+    if audit is not None:
+        # A-2: each tool runs audited, under the tool call the gate opens per request
+        # (the handshake, opened without one, runs unaudited).
+        audit_tool_handlers(server)
+    register_order_tools(server, store if store is not None else create_order_store())
+    if downstream is not None:
+        register_forward_tool(server, downstream)
+    if kyaos is not None:
+        _register_handshake(server, kyaos)
+    mcp_app = server.streamable_http_app(
         stateless_http=True,
         json_response=True,
         streamable_http_path=mcp_path,
@@ -213,238 +164,35 @@ def create_order_app(
             ],
         ),
     )
-    if audit is not None:
-        # A-2: each tool runs audited, under the tool call begin_tool_call opens per request
-        # (the handshake, opened without one, runs unaudited).
-        audit_tool_handlers(server)
-    register_order_tools(server, store if store is not None else create_order_store())
-    if downstream is not None:
-        register_forward_tool(server, downstream)
-    if kyaos is not None:
-        _register_handshake(server, kyaos)
-    mcp_app = server.streamable_http_app()
 
-    async def app(scope: Any, receive: Any, raw_send: Any) -> None:
-        if scope["type"] != "http":  # lifespan: the MCP session manager starts and stops with the app
-            await mcp_app(scope, receive, raw_send)
-            return
-        started = False
+    # The one line: everything HTTP-side of the HelixID check (helix_mcp_middleware.HelixMcpGate).
+    auth_options = {f.name: getattr(auth, f.name) for f in fields(MCPMiddlewareOptions)}
+    gate = HelixMcpGate(
+        mcp_app,
+        HelixMcpGateOptions(
+            **{**auth_options, "tool_scopes": tool_scopes, "required_scopes": []},
+            resource=resource,
+            authorization_servers=authorization_servers,
+            resource_name="Order Management (HelixID sample)",
+            audit=audit,
+            kyaos=kyaos,
+            on_server_error=on_server_error,
+        ),
+    )
 
-        async def send(message: Any) -> None:
-            nonlocal started
-            if message["type"] == "http.response.start":
-                started = True
-            await raw_send(message)
-
-        async def respond(status: int, body: Any, headers: Optional[dict] = None) -> None:
-            await JSONResponse(body, status_code=status, headers=headers)(scope, receive, send)
-
-        if well_known is not None and await well_known.handle(scope, receive, send):
-            return
-        path, method = scope["path"], scope["method"]
-        if path == metadata_path and method == "GET":
-            await respond(200, metadata)
-            return
-        if revocation_webhook is not None and path == revocation_webhook[0]:
-            await revocation_webhook[1](scope, receive, send)
-            return
-        if served_identity is not None and await served_identity.handle(scope, receive, send):
-            return
-        if path != mcp_path:
-            await respond(404, {"error": "not_found"})
-            return
-        if method != "POST":
-            # Stateless server: no SSE stream to open (GET) and no session to end (DELETE).
-            await respond(405, {"error": "method_not_allowed"}, {"allow": "POST"})
-            return
-
-        chunks, size, more = [], 0, True
-        while more:
-            message = await receive()
-            if message["type"] != "http.request":
-                return  # client went away
-            chunk = message.get("body", b"")
-            size += len(chunk)
-            if size > MAX_BODY_BYTES:
-                await respond(413, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Request body too large"}})
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        """The routes that are not the gate's (discovery, the revocation webhook, identity), then the gate."""
+        if scope["type"] == "http":
+            if well_known is not None and await well_known.handle(scope, receive, send):
                 return
-            chunks.append(chunk)
-            more = message.get("more_body", False)
-        raw = b"".join(chunks)
-        try:
-            body = json.loads(raw.decode("utf-8"))
-        except (ValueError, RecursionError):  # RecursionError: absurdly nested JSON
-            await respond(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Request body is not valid JSON"}})
-            return
-        if isinstance(body, list):
-            # The MCP Python transport refuses batches. Answer before the gate, or
-            # every entry would be verified and audited as granted for calls that never run.
-            await respond(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Batch requests are not supported"}})
-            return
-
-        headers = Headers(scope=scope)
-        is_tool_call = isinstance(body, dict) and body.get("method") == "tools/call"
-        first_params = body.get("params") if is_tool_call and isinstance(body.get("params"), dict) else {}
-        first_name = first_params.get("name") if isinstance(first_params.get("name"), str) else None
-        # One audited call per tools/call; the KYA-OS handshake is no gated tool call, so it is not audited as one.
-        audited = audit is not None and is_tool_call and not (kyaos is not None and kyaos.is_handshake(first_name))
-        try:
-            audit_scope = (
-                audit.begin_tool_call(first_name)  # type: ignore[union-attr]
-                if audited
-                else nullcontext()
-            )
-            with audit_scope as call_audit:
-
-                async def server_error(error: BaseException) -> None:
-                    if on_server_error is not None:
-                        on_server_error(error)
-                    if isinstance(error, AuthorizationServerUnavailableError):
-                        # The caller's token was not shown to be bad; its authorization
-                        # server could not be asked. Say so, and invite a retry.
-                        await respond(
-                            503,
-                            {"error": "temporarily_unavailable", "error_description": "The authorization server could not be reached"},
-                            {"retry-after": "5"},
-                        )
-                    else:
-                        await respond(500, {"error": "server_error"})
-
-                async def refuse(error: BaseException, proof: Optional[Dict[str, Any]] = None) -> None:
-                    # Audited by its code (never its message): denied when the caller
-                    # is answered 401/403, failed when it is a server fault.
-                    denial = to_http_error_response(error, metadata_url, proof=proof)
-                    if denial is None:
-                        if call_audit is not None:
-                            call_audit.failed(_reason_code(error))
-                        await server_error(error)
-                        return
-                    if call_audit is not None:
-                        call_audit.denied(_reason_code(error))
-                    await respond(denial.status, denial.body, {"www-authenticate": denial.headers["WWW-Authenticate"]})
-
-                # KYA-OS: the proof of an allowed call is signed over the result on its way out.
-                finish: Optional[Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None
-                # Story L3-D: the delegation the allowed call carries, current while its tool runs (forwarded downstream).
-                delegation: Any = None
-                for message in [body]:
-                    if not isinstance(message, dict) or message.get("method") != "tools/call":
-                        continue
-                    params = message.get("params") if isinstance(message.get("params"), dict) else {}
-                    name = params.get("name")
-                    arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
-                    meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else None
-                    # The proof's requestHash covers the request as sent (story F-2).
-                    tool_call = {"name": name, "input": arguments, "_meta": meta, "headers": headers, "request": {"method": message["method"], "params": params}}
-
-                    if kyaos is not None and kyaos.is_handshake(name):
-                        # The handshake is open to anonymous agents; a credential, when
-                        # sent, must be good and makes the session an authenticated one.
-                        try:
-                            caller = await gate.authorize(tool_call)  # type: ignore[attr-defined]
-                        except Exception as error:  # noqa: BLE001
-                            if getattr(error, "code", None) != "PROOF_MISSING":
-                                await refuse(error)
-                                return
-                        else:
-                            scope = {**scope, "state": {**scope.get("state", {}), _AUTHENTICATED_AGENT: caller.agent_did}}
-                        continue
-
-                    if kyaos is None:
-                        try:
-                            caller = await gate.authorize(tool_call)  # type: ignore[attr-defined]
-                        except Exception as error:  # noqa: BLE001
-                            await refuse(error)
-                            return
-                        delegation = delegation_context_of(caller, correlation_id=call_audit.correlation_id if call_audit is not None else None)
-                        continue
-
-                    callers: list = []
-
-                    async def authorize_and_keep(call: Dict[str, Any] = tool_call) -> Any:
-                        caller = await gate.authorize(call)  # type: ignore[attr-defined]
-                        callers.append(caller)
-                        return caller
-
-
-                    try:
-                        started_call = await kyaos.start(
-                            {"name": name, "arguments": arguments, "_meta": meta},
-                            authorize=authorize_and_keep,
-                        )
-                    except Exception as error:  # noqa: BLE001 - the proof could not be signed (its nonce store is down, say)
-                        if call_audit is not None:
-                            call_audit.failed(_reason_code(error))
-                        await server_error(error)
-                        return
-                    if isinstance(started_call, KyaOsDenied):
-                        await refuse(started_call.error, started_call.proof)
-                        return
-                    if isinstance(started_call, KyaOsNeedsAuthorization):
-                        # KYA-OS story L3-E: the signed challenge is the call's result (a tool error result with the
-                        # proof in _meta), answered here since the tool itself never runs: audited as a denied call.
-                        if call_audit is not None:
-                            call_audit.denied(_reason_code(started_call.error))
-                        await respond(200, {"jsonrpc": "2.0", "id": message.get("id"), "result": started_call.result})
-                        return
-                    # Control arguments (`_kyaos*`) never reach the tool.
-                    message["params"] = {**params, "arguments": started_call.arguments}
-                    raw = json.dumps(body).encode("utf-8")
-                    finish = started_call.finish
-                    if callers:
-                        session = started_call.session
-                        delegation = delegation_context_of(
-                            callers[-1],
-                            session_id=session.id if session is not None else None,
-                            correlation_id=call_audit.correlation_id if call_audit is not None else None,
-                        )
-
-                with run_with_delegation(delegation):
-                    await handle(scope, raw, receive, send, finish, server_error)
-        except Exception as error:  # noqa: BLE001 - not the caller's fault: a 500 (or 503), reported
-            if on_server_error is not None:
-                on_server_error(error)
-            if started:
+            if revocation_webhook is not None and scope["path"] == revocation_webhook[0]:
+                await revocation_webhook[1](scope, receive, send)
                 return
-            if isinstance(error, AuthorizationServerUnavailableError):
-                await respond(
-                    503,
-                    {"error": "temporarily_unavailable", "error_description": "The authorization server could not be reached"},
-                    {"retry-after": "5"},
-                )
-            else:
-                await respond(500, {"error": "server_error"})
-
-    async def handle(
-        scope: Any,
-        raw: bytes,
-        receive: Any,
-        send: Any,
-        finish: Optional[Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
-        server_error: Optional[Callable[[BaseException], Awaitable[None]]] = None,
-    ) -> None:
-        """Hands the request (its control arguments stripped) to the MCP
-        transport: with KYA-OS the result is signed on its way out, over the
-        tool's final answer (a degraded audit marker included). A tool call's
-        audit events come from the tools themselves (audit_tool_handlers)."""
-        replayed = False
-
-        async def replay() -> Any:
-            nonlocal replayed
-            if not replayed:
-                replayed = True
-                return {"type": "http.request", "body": raw, "more_body": False}
-            return await receive()
-
-        target = send
-        if finish is not None:
-            target = await _send_with_proof(target, finish, server_error)
-        await mcp_app(scope, replay, target)
+            if served_identity is not None and await served_identity.handle(scope, receive, send):
+                return
+            if scope["path"] not in (mcp_path, urlsplit(gate.metadata_url).path):
+                await JSONResponse({"error": "not_found"}, status_code=404)(scope, receive, send)
+                return
+        await gate(scope, receive, send)
 
     return app
-
-
-def _reason_code(error: BaseException) -> str:
-    """The code a refused or failed call is audited with: the error's code (never its message), lower-cased, else `server_error`."""
-    code = getattr(error, "code", None)
-    return code.lower() if isinstance(code, str) and code else "server_error"
