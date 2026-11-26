@@ -288,7 +288,7 @@ class TestSendWithProof:
     """The response wrapper on its own: a body in several chunks, and a JSON-RPC error (no result, so nothing to prove)."""
 
     def test_chunked_bodies_and_error_responses(self) -> None:
-        from mcp_order_management.app import _send_with_proof
+        from helix_mcp_middleware.http_gate import _send_with_proof
 
         sent: List[Dict[str, Any]] = []
         finished: List[Dict[str, Any]] = []
@@ -411,9 +411,10 @@ class TestWithTheTypedAuditTrail:
             res = instance.call("lookup_order", args, None, meta)
         assert res.status_code == 401
         sink = instance.audit_sink
-        assert sink.event_types == ["session.established", "tool.call.denied"]
-        assert sink.events[1]["outcome"] == "denied" and sink.events[1]["reason"] == {"code": "proof_invalid"}
-        assert "actor" not in sink.events[1]
+        assert sink.event_types == ["session.established", "authorization.denied", "tool.call.denied"]
+        assert sink.events[1]["outcome"] == "denied" and sink.events[1]["reason"] == {"code": "nonce_replayed"}
+        assert sink.events[2]["outcome"] == "denied" and sink.events[2]["reason"] == {"code": "proof_invalid"}
+        assert "actor" not in sink.events[1] and "actor" not in sink.events[2]
 
     def test_records_a_denied_call_by_its_code_and_still_answers_with_the_denied_proof(self) -> None:
         instance = App(audited=True)

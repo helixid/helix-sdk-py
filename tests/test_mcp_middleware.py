@@ -297,11 +297,13 @@ class TestKyaOsProof:
         res = to_http_error_response(err, META_URL)
         assert (res.status, res.body["error"]) == (401, "invalid_token")
 
-    def test_a_refusal_with_no_principal_is_not_audited(self) -> None:
+    def test_a_refusal_with_no_principal_is_audited_anonymously(self) -> None:
         events: List[Dict[str, Any]] = []
         mw = gate(verifier=verifying([], agent=None, reasons=["malformed_proof"]), audit_sink=events.append)
         assert denied(lambda: mw({"name": "t", "_meta": PROOF_META})).code == "PROOF_INVALID"
-        assert events == []
+        # Gap 2: audited with what is known, no actor.
+        assert [(e["event"], e["authMethod"], e["reasonCode"], e["method"], e["toolName"]) for e in events] == [("AUTHZ_DENIED", "none", "malformed_proof", "tools/call", "t")]
+        assert "agentDid" not in events[0]
 
     def test_a_proof_without_a_verifier_is_a_configuration_error(self) -> None:
         mw = gate(validate_oauth_token=lambda t: {"sub": "u"})
@@ -762,7 +764,7 @@ class TestAudit:
         assert all("vpId" not in e for e in events)
         assert events[0]["timestamp"].endswith("Z")
 
-    def test_unidentified_callers_are_not_logged_and_a_failing_sink_never_blocks(self) -> None:
+    def test_unidentified_callers_are_logged_anonymously_and_a_failing_sink_never_blocks(self) -> None:
         events: List[Any] = []
         errors: List[BaseException] = []
 
@@ -772,9 +774,9 @@ class TestAudit:
 
         mw = gate(verifier=verifying([]), audit_sink=failing, on_audit_error=errors.append)
         denied(lambda: mw({"name": "t"}))
-        assert events == []
+        assert [(e["authMethod"], e["reasonCode"]) for e in events] == [("none", "proof_missing")]
         assert mw({"name": "t", "_meta": PROOF_META})
-        assert len(events) == 1 and str(errors[0]) == "sink down"
+        assert len(events) == 2 and len(errors) == 2 and str(errors[0]) == "sink down"
 
     # -- create_helix_audit_reporter (JS: createHelixAuditReporter) -------------
 

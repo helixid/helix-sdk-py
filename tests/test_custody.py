@@ -205,6 +205,9 @@ def test_create_agent_sends_requested_domains_and_max_delegation_depth() -> None
     client = HelixCustodyClient("https://helix.example", admin_api_key="admin", http=api)
     client.create_agent(name="Router", keyCustody="helix", requestedDomains=["orders.example"], maxDelegationDepth=2)
     assert json.loads(api.calls[0]["body"]) == {"name": "Router", "keyCustody": "helix", "requestedDomains": ["orders.example"], "maxDelegationDepth": 2}
+    # Registry v3: "Make discoverable" (default true on the server) is sent only when given.
+    client.create_agent(name="Hidden", discoverable=False)
+    assert json.loads(api.calls[1]["body"]) == {"name": "Hidden", "discoverable": False}
 
 
 def test_client_reaches_every_endpoint() -> None:

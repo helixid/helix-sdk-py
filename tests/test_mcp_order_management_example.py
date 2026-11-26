@@ -139,15 +139,33 @@ def test_initialize_and_tools_list_are_open(app: App) -> None:
     assert sorted(t["name"] for t in listed.json()["result"]["tools"]) == ["lookup_order", "refund_order"]
 
 
+def test_every_other_method_is_gated_and_refusals_are_audited_by_the_gate(app: App) -> None:
+    """Gap 1: resources, prompts and ping need a caller; initialize and tools/list stay open (the default open list)."""
+    assert app.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}).status_code == 200
+    assert app.rpc("tools/list", {}).status_code == 200
+    assert app.event_types == []
+    for method in ("resources/list", "prompts/list", "ping"):
+        res = app.rpc(method, {})
+        assert res.status_code == 401, method
+        assert "resource_metadata=" in res.headers["www-authenticate"]
+    assert app.event_types == ["authorization.denied"] * 3
+    assert all(event["reason"] == {"code": "proof_missing"} and "actor" not in event for event in app.audit)
+    # A verified caller gets through the gate; this sample serves no resources, so MCPServer lists none.
+    listed = app.rpc("resources/list", {}, bearer("reader"))
+    assert listed.status_code == 200 and listed.json()["result"]["resources"] == []
+    assert app.event_types[3:] == ["authorization.approved"]
+
+
 def test_no_credentials_is_401_with_both_challenges(app: App) -> None:
     res = app.call("lookup_order", {"orderId": "ORD-1001"})
     assert res.status_code == 401
     challenge = res.headers["www-authenticate"]
     assert f'Bearer resource_metadata="{METADATA}"' in challenge and "KyaOS resource_metadata=" in challenge
-    # No identified caller, so the gate reports nothing; the call itself is still recorded as denied.
-    assert app.event_types == ["session.established", "tool.call.denied"]
-    assert app.audit[1]["reason"] == {"code": "proof_missing"} and app.audit[1]["action"] == {"category": "tool.call", "name": "lookup_order"}
-    assert app.audit[0]["correlationId"] == app.audit[1]["correlationId"]
+    # Gap 2: the gate audits the refusal itself, anonymously; the call itself is still recorded as denied.
+    assert app.event_types == ["session.established", "authorization.denied", "tool.call.denied"]
+    assert app.audit[1]["reason"] == {"code": "proof_missing"} and "actor" not in app.audit[1]
+    assert app.audit[2]["reason"] == {"code": "proof_missing"} and app.audit[2]["action"] == {"category": "tool.call", "name": "lookup_order"}
+    assert app.audit[0]["correlationId"] == app.audit[1]["correlationId"] == app.audit[2]["correlationId"]
 
 
 def test_unknown_bearer_is_401_invalid_token(app: App) -> None:

@@ -147,13 +147,25 @@ def test_create_consent_request_refusals() -> None:
     with pytest.raises(ConsentFlowError) as error:
         create_consent_request(HELIX, SERVICE_SIGNER, "u", grant, http=refused)
     assert error.value.reason == "consent_request_refused" and error.value.http_status == 403 and "CONSENT_SERVICE_UNKNOWN" in str(error.value)
+    assert error.value.helix_code == "CONSENT_SERVICE_UNKNOWN" and error.value.details == {"reason": "consent_request_refused", "helixCode": "CONSENT_SERVICE_UNKNOWN"}
     odd = FakeHelix({f"POST {HELIX}/v1/consent/requests": lambda body: Response(201, {})})
     with pytest.raises(ConsentFlowError) as error:
         create_consent_request(HELIX, SERVICE_SIGNER, "u", grant, http=odd)
     assert error.value.http_status == 502
     broken = FakeHelix({f"POST {HELIX}/v1/consent/requests": lambda body: Response(500, ValueError("not json"))})
-    with pytest.raises(ConsentFlowError, match="500"):
+    with pytest.raises(ConsentFlowError, match="500") as error:
         create_consent_request(HELIX, SERVICE_SIGNER, "u", grant, http=broken)
+    assert error.value.helix_code is None
+
+    class Down:
+        def post(self, url: str, json: Any = None, timeout: float = 0) -> Response:
+            raise ConnectionError("connection refused")
+
+    # No answer at all: an outage (503, consent_unreachable), whatever the transport raised.
+    with pytest.raises(ConsentFlowError) as error:
+        create_consent_request(HELIX, SERVICE_SIGNER, "u", grant, http=Down())
+    assert error.value.reason == "consent_unreachable" and error.value.http_status == 503
+    assert str(error.value) == "Helix could not be reached: connection refused"
 
 
 def test_withdraw_consent_signs_as_the_service() -> None:

@@ -297,12 +297,16 @@ def test_audits_a_granted_proof_and_a_refused_one_whose_signer_was_identified() 
     mw = gate(verifier=own_verifier(), audit_sink=events.append, service_did=SERVICE)
     meta = proof_meta(AGENT_OWN["signer"], SERVICE, "t")
     mw({"name": "t", "_meta": meta})
-    # Section 11.2 refuses a replay before the signature (story C-C): no principal is proven, so it is not audited.
+    # Section 11.2 refuses a replay before the signature (story C-C): no principal is proven, so it is audited
+    # anonymously (gap 2), with the DID the proof claims marked unverified.
     assert refusal(lambda: mw({"name": "t", "_meta": meta})).reasons == ("nonce_replayed",)
     # A proof that verified, under a chain that does not: the refusal names the proven signer.
     broken_chain = proof_meta(AGENT_OWN["signer"], SERVICE, "t", chain=[{"type": ["VerifiableCredential"]}])
     refusal(lambda: mw({"name": "t", "_meta": broken_chain}))
-    assert len(events) == 2
+    assert len(events) == 3
+    assert (events[1]["authMethod"], events[1]["reasonCode"], events[1]["claimedDid"], events[1]["claimedVerified"]) == ("none", "nonce_replayed", AGENT_OWN["did"], False)
+    assert "agentDid" not in events[1]
+    events.pop(1)
     assert {k: events[0][k] for k in ("event", "authMethod", "agentDid", "level", "fresh", "serviceDid", "proofAssurance", "l3Minus")} == {
         "event": "AUTHZ_GRANTED", "authMethod": "kyaos", "agentDid": AGENT_OWN["did"], "level": "L1", "fresh": True, "serviceDid": SERVICE,
         "proofAssurance": "L3-minus", "l3Minus": False,
