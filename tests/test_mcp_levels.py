@@ -272,3 +272,23 @@ class TestAuditSink:
         for body in posted:
             text = json.dumps(body)
             assert not any(key in text for key in ("proofAssurance", "l3Minus", "cnfDiagnostics", "requiredLevel"))
+
+
+@needs_fixtures
+def test_own_authority_is_on_by_default() -> None:
+    """No chain and a card naming no responsibleParty: the agent's attested scopes the service offers. Parity with helix-sdk-js."""
+    assert ENV is not None
+    own_card = {key: value for key, value in ENV["cards"]["attested"].items() if key != "responsibleParty"}
+
+    def own(card: Any = own_card, **settings: Any) -> Any:
+        verifier = create_local_verifier(fixture_verifier_options(SERVICE, env=ENV, cards={AGENT: card}, **settings))
+        return helixid_mcp_middleware(MCPMiddlewareOptions(verifier=verifier, service_did=SERVICE, tool_scopes={"lookup": ["read:orders"]}))
+
+    caller = own().authorize({"name": "lookup", "_meta": signed_meta(chain=False)})
+    assert caller.agent_did == AGENT and caller.level == "L3" and caller.scopes == ["read:orders"]
+    # Opted out: a scoped call needs a chain.
+    assert getattr(refusal(lambda: own(allow_own_authority=False)({"name": "lookup", "_meta": signed_meta(chain=False)})), "code", None) == "INSUFFICIENT_SCOPE"
+    # A card naming a responsibleParty still needs its chain.
+    assert getattr(refusal(lambda: own(ENV["cards"]["attested"])({"name": "lookup", "_meta": signed_meta(chain=False)})), "code", None) == "INSUFFICIENT_SCOPE"
+    # A chain call is not narrowed to the service's scopes by own authority.
+    assert own().authorize({"name": "lookup", "_meta": signed_meta()}).scopes == ["read:orders", "write:orders"]

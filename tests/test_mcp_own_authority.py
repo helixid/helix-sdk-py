@@ -29,7 +29,7 @@ class StubVerifier:
 
     def verify_call(self, call: Dict[str, Any]) -> Any:
         self.calls.append(call)
-        catalog: Optional[List[str]] = call.get("catalog")
+        catalog: Optional[List[str]] = call.get("own_authority_catalog")
         scopes = [scope for scope in self.attested if catalog is not None and scope in catalog]
         return SimpleNamespace(
             ok=True, reasons=[], warnings=[], agent_did=AGENT, effective_scopes=scopes, level="L3",
@@ -54,7 +54,7 @@ def test_hands_the_verifier_every_scope_the_service_offers_once_each() -> None:
         prompt_scopes={"summarize": ["prompts:use"]},
     )
     mw.authorize({"method": "tools/call", "name": "lookup_order", "_meta": META})
-    assert verifier.calls[0]["catalog"] == ["orders:read", "ledger:read", "prompts:use"]
+    assert verifier.calls[0]["own_authority_catalog"] == ["orders:read", "ledger:read", "prompts:use"]
 
 
 def test_resource_and_prompt_on_attested_capabilities_alone() -> None:
@@ -80,10 +80,10 @@ def test_resources_only_and_no_catalog_without_any_scope_map() -> None:
     gate(only_resources, resource_scopes={"orders://ledger": ["ledger:read"]}).authorize(
         {"method": "resources/read", "name": "orders://ledger", "_meta": META}
     )
-    assert only_resources.calls[0]["catalog"] == ["ledger:read"]
+    assert only_resources.calls[0]["own_authority_catalog"] == ["ledger:read"]
     none = StubVerifier([])
     gate(none).authorize({"method": "ping", "_meta": META})
-    assert "catalog" not in none.calls[0]
+    assert "own_authority_catalog" not in none.calls[0]
 
 
 def test_no_catalog_when_the_service_did_not_opt_in() -> None:
@@ -92,7 +92,7 @@ def test_no_catalog_when_the_service_did_not_opt_in() -> None:
     with pytest.raises(Exception) as refused:
         mw.authorize({"method": "tools/call", "name": "lookup_order", "_meta": META})
     assert code_of(refused.value) == "INSUFFICIENT_SCOPE"
-    assert "catalog" not in verifier.calls[0]
+    assert "own_authority_catalog" not in verifier.calls[0]
 
 
 def test_require_delegation_tool_stays_out_of_own_authority() -> None:

@@ -101,10 +101,12 @@ class LocalVerifierOptions:
     """Clock tolerance on credential and status-list windows, ms; default 120,000."""
     catalog: Optional[Sequence[str]] = None
     """The scopes this service offers; ``effectiveScopes`` is intersected with it."""
-    allow_own_authority: bool = False
-    """Own authority (default False): a call with no chain, from an agent whose card names no
+    allow_own_authority: bool = True
+    """Own authority (default True): a call with no chain, from an agent whose card names no
     ``responsibleParty``, gets its attested capabilities that are in ``catalog``. The middleware
-    passes the scopes its ``tool_scopes``, ``resource_scopes`` and ``prompt_scopes`` name as the catalog."""
+    passes the scopes its ``tool_scopes``, ``resource_scopes`` and ``prompt_scopes`` name as the catalog.
+    A tool that needs the user's consent sets ``require_delegation``; ``False`` here makes every scoped
+    call need a chain."""
     nonce_store: Any = None
     """The middleware's replay store, a :class:`helix_mcp_middleware.NonceStore`
     (``insert(nonce, agent_did, expires_at)``, Unix seconds, answering a bool
@@ -349,6 +351,8 @@ class LocalVerifier:
             overrides["live_status"] = True
         if call.get("catalog") is not None and not self._has_catalog:
             overrides["catalog"] = list(call["catalog"])
+        if call.get("own_authority_catalog") is not None and not self._has_catalog:
+            overrides["own_authority_catalog"] = list(call["own_authority_catalog"])
         result = self.verify(proof, chain=chain, request=request_of(call), **overrides)
         entry: VerificationReport = {
             "timestamp": datetime.fromtimestamp(self._clock() / 1000, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),

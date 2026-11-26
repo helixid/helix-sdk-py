@@ -105,6 +105,8 @@ class VerifierOptions:
     whose card names no ``responsibleParty``, acts on what the agent is attested for, intersected
     with ``catalog`` (none without one). A card naming a ``responsibleParty`` still needs its chain
     (SPEC-ENTITY-CARD section 11.1 step 6), so it gets no scopes this way."""
+    own_authority_catalog: Optional[Sequence[str]] = None
+    """The scopes own authority may grant, in place of ``catalog``; a call with a chain still uses ``catalog``."""
 
     @classmethod
     def from_dict(cls, options: Mapping[str, Any]) -> "VerifierOptions":
@@ -124,6 +126,7 @@ class VerifierOptions:
             "requireProof": "require_proof",
             "liveStatus": "live_status",
             "allowOwnAuthority": "allow_own_authority",
+            "ownAuthorityCatalog": "own_authority_catalog",
         }
         return cls(**{names[key]: value for key, value in options.items() if key in names})
 
@@ -417,7 +420,8 @@ def verify(
     # Own authority (allow_own_authority): no chain, a proven key and a card that names no responsible party.
     own_authority = options.allow_own_authority and hops is None and proof_did is not None and entity_card is not None and entity_card.get("responsibleParty") is None
     if own_authority:
-        offered = list(options.catalog) if options.catalog is not None else []
+        offered_scopes = options.own_authority_catalog if options.own_authority_catalog is not None else options.catalog
+        offered = list(offered_scopes) if offered_scopes is not None else []
         effective_scopes = derive_effective_scopes(capabilities.verified, offered, offered)
     else:
         catalog = options.catalog if options.catalog is not None else leaf_allowed_action

@@ -371,7 +371,7 @@ def helixid_mcp_middleware(options: MCPMiddlewareOptions) -> Callable[[MCPToolCa
             if token_cnf_jkt is not None:
                 call["token_cnf_jkt"] = token_cnf_jkt
             if getattr(local_verifier, "allow_own_authority", False) and own_authority_catalog is not None:
-                call["catalog"] = own_authority_catalog
+                call["own_authority_catalog"] = own_authority_catalog
             result = local_verifier.verify_call(call)
             if result is None:  # pragma: no cover - extract_credential found a proof, so verify_call reads one
                 raise ProofError(PROOF_MISSING, "The request carries no KYA-OS request proof")
